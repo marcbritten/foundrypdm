@@ -1,0 +1,129 @@
+# TASK: Native SolidCraft PDM Integration
+
+Implement optional PDM connectivity inside SolidCraft.
+
+SolidCraft source:
+https://github.com/bherbruck/solidcraft
+
+PDM is a separate server. SolidCraft must remain fully usable without it.
+
+## Connection Setup
+
+Add a PDM integration setting accessible from Preferences.
+
+The user must be able to enter:
+- PDM server URL
+- Connection name
+- Authentication credentials through a secure login flow
+- Optional default organization and project
+
+Support HTTPS, certificate validation, secure credential storage and token refresh.
+
+Do not store passwords or access tokens in CAD design files.
+
+Do not disable TLS validation.
+
+Provide connection testing and clear error messages.
+
+## Home Screen
+
+Preserve:
+- New Design
+- Open Local
+- Recent Designs
+- Samples
+
+Add:
+- Open from PDM
+- Team Projects
+- Recent PDM Documents
+- Connection Status
+- Signed-in User
+
+The PDM section should disappear or show a setup action when the integration is disabled.
+
+## Dockable PDM Panel
+
+Add a collapsible panel dockable to the left or right side.
+
+Panel sections:
+- Project Browser
+- Current Document
+- Versions
+- Branches
+- Collaborators
+- Comments
+- BOM
+- Manufacturing
+- Activity
+
+Allow resizing and remember the user's layout preferences.
+
+## Document Workflow
+
+Implement:
+- Open PDM document
+- Create PDM document
+- Save new version
+- View version history
+- Switch workspace branch
+- Add version description
+- View active collaborators
+- Detect remote changes
+- Resolve version conflicts
+- Open a specific historical version read-only
+
+Use stable PDM document IDs rather than filenames as identity.
+
+Implement local caching and offline draft support.
+
+Never silently overwrite remote changes.
+
+## SolidCraft Architecture
+
+Read the actual SolidCraft source before changing it.
+
+Respect:
+- Engine command architecture
+- Crate dependency layering
+- Native document serialization
+- Existing UI patterns
+- Cross-platform builds
+- WebAssembly compatibility
+- Repository agent instructions
+
+Keep PDM networking in an appropriate adapter layer.
+
+Do not introduce HTTP, authentication or database dependencies into low-level geometry or document crates.
+
+## Server Integration
+
+Implement versioned APIs for:
+- Connection capabilities
+- Projects
+- Documents
+- Versions
+- Branches
+- Upload/download
+- Presence
+- Comments
+- Events
+
+Provide clear API compatibility negotiation between client and server versions.
+
+## Acceptance Criteria
+
+Two users on separate computers can:
+
+1. Connect to the same PDM server.
+2. Browse the same project.
+3. Open a shared SolidCraft design.
+4. See who else has the document open.
+5. Save a new version.
+6. Receive notification of remote changes.
+7. Inspect the history.
+8. Resolve concurrent save conflicts without losing either user's work.
+
+This milestone does not require simultaneous editing of the same feature. That belongs to the real-time collaboration milestone.
+
+Provide automated tests and a manual two-client test procedure.

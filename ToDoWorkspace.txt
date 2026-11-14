@@ -1,0 +1,109 @@
+# TASK: Collaborative Engineering Workspaces and Parametric Editing
+
+Build multi-user collaboration for the Rust PDM, with SolidCraft as the first CAD system capable of native operation-level collaboration.
+
+## Phase A — Presence and Safe Concurrent Work
+
+Implement:
+- Live user presence
+- Document viewers and active editors
+- Real-time comments
+- Project activity notifications
+- Optimistic concurrency checks
+- Server-authoritative version history
+- Non-destructive conflict handling
+- Explicit edit leases for file-based CAD formats where needed
+
+## Phase B — Branches and Merging
+
+Implement:
+- Named workspaces
+- Branches from immutable versions
+- Commit history
+- Branch comparison
+- Merge requests
+- Conflict detection
+- Merge approvals
+- Release branches
+
+Use an immutable commit graph with explicit parent relationships.
+
+Do not treat a file version number as a substitute for a commit graph.
+
+## Phase C — SolidCraft Operation-Level Collaboration
+
+Research SolidCraft's engine commands, document model, persistent object identities, parametric feature dependencies and serialization.
+
+Design a canonical operation format containing:
+- Operation ID
+- Document ID
+- Branch ID
+- Actor ID
+- Base revision
+- Target entity IDs
+- Command type
+- Typed command parameters
+- Ordering metadata
+- Schema version
+
+Build a server-authoritative operation sequencer.
+
+Validate operations against permissions, expected revisions, entity identity and document invariants.
+
+Support:
+- Two users editing independent features
+- Live operation broadcasts
+- Deterministic document reconstruction
+- Reconnection and missed-operation replay
+- Concurrent parameter changes
+- Conflict detection
+- Operation rejection with useful feedback
+- Undo as a new validated operation
+
+Use conflict-aware transactions and semantic operation transformations only where proven safe.
+
+Do not assume that arbitrary CAD commands commute.
+
+Do not implement a generic text CRDT over serialized CAD JSON and claim that it provides safe parametric merging.
+
+## Geometry and Conflict Rules
+
+Preserve:
+- Parametric dependencies
+- Stable feature identity
+- Valid references to faces and edges
+- Sketch constraints
+- Assembly relationships
+- Units and coordinate systems
+- Feature timeline consistency
+
+Detect conflicts such as:
+- Two users changing the same parameter
+- Deleting a feature another user is editing
+- Changing geometry referenced by another operation
+- Concurrent incompatible timeline changes
+
+Offer explicit conflict resolution when automatic merging is unsafe.
+
+## Testing
+
+Build deterministic multi-client simulations.
+
+Test:
+- Simultaneous independent edits
+- Same-feature conflicts
+- Network disconnects
+- Duplicate operations
+- Out-of-order messages
+- Server restart and recovery
+- Undo and redo
+- Permission changes during editing
+- Geometry rebuild equivalence
+
+## Acceptance Criteria
+
+Two SolidCraft users can edit compatible independent features in one shared workspace, see accepted changes appear, and recover safely from conflicts.
+
+No acknowledged operation may be lost after a server restart.
+
+Do not declare full collaboration complete until these tests pass.

@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Foundry PDM</title>
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); }
+  #app { padding:12px; font-size:13px; }
+  .brand { font-weight:700; margin-bottom:8px; }
+  #send { width:100%; padding:12px; font-weight:600; }
+  .ok { color:var(--ok); margin-top:10px; }
+  .err { color:var(--err); margin-top:10px; }
+  .pick-list { max-height:45vh; overflow:auto; border:1px solid rgba(128,128,128,.35); border-radius:6px; margin:8px 0; }
+  .pick-row { padding:6px 10px; cursor:pointer; display:flex; gap:6px; }
+  .pick-row:hover { background:rgba(255,255,255,.07); }
+  .pick-sub { padding-left:26px; font-size:12px; }
+  .pick-tag { margin-left:auto; opacity:.6; font-size:11px; }
+  .selection-preview { margin:8px 0; text-align:center; }
+  .selection-preview img { max-width:100%; max-height:220px; border-radius:6px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="brand">⬢ Send to manufacturing</div>
+  <div id="view"></div>
+</div>
+<script>
+/** Onshape element right-panel extension (see onshape-public docs: App Development). */
+const params = new URLSearchParams(location.search);
+const documentId = params.get("documentId") || "";
+const workspaceId = params.get("workspaceId") || params.get("workspaceOrVersionId") || "";
+const elementId = params.get("elementId") || "";
+const server = params.get("server") || "";
+const elementType = params.get("elementType") || params.get("type") || "partstudio";
+const TOKEN_KEY = "pdm_token";
+
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+
+function postToOnshape(messageName, extra){
+  const msg = Object.assign({
+    documentId: documentId,
+    workspaceId: workspaceId,
+    elementId: elementId,
+    messageName: messageName
+  }, extra || {});
+  if (window.parent && window.parent !== window) {
+    window.parent.postMessage(msg, "*");
+  }
+}
+
+let selectedPart = (params.get("partId") || params.get("partNumber")) ? {
+  partId: params.get("partId") || "",
+  partName: params.get("partNumber") || params.get("partId") || "",
+  sourceElementId: params.get("tabElementId") || "",
+  elementType: "partstudio"
+} : null;
+let ctx = null;
+let viewportPicker = null;
+let viewportRequest = null;
+
+function originOk(origin){
+  if (!origin) return false;
+  if (origin.indexOf("onshape.com") !== -1) return true;
+  if (server && origin === server.replace(/\/$/, "")) return true;
+  return false;
+}
+function parseSelection(data){
+  if (!data || typeof data !== "object") return null;
+  const list = [].concat(data.selections || [], data.selection ? [data.selection] : [], [data]);
+  for (let i = 0; i < list.length; i++) {
+    const s = list[i];
+    if (!s || typeof s !== "object") continue;
+    const partId = s.partId || s.partid || s.idTag || s.bodyId || (s.btType ? s.id : "") || "";
+    if (partId) {
+      return {
+        partId: String(partId),
+        partName: String(s.partName || s.name || s.instanceName || ""),
+        sourceElementId: String(s.elementId || s.sourceElementId || elementId),
+        elementType: "partstudio"
+      };
+    }
+    const el = (s.element && typeof s.element === "object") ? s.element : s;
+    const elId = el.id || s.elementId || s.id || "";
+    const elName = el.name || s.name || s.instanceName || s.elementName || "";
+    const elType = String(el.type || el.elementType || s.elementType || s.type || "").toLowerCase();
+    if (elId && elId !== "SELECTION") {
+      return {
+        partId: "",
+        partName: String(elName || ""),
+        sourceElementId: String(elId),
+        elementType: elType.indexOf("assembl") !== -1 ? "assembly" : "partstudio"
+      };
+    }
+  }
+  return null;
+}
+function showSelected(){
+  const el = $("sel");
+  if (!el) return;
+  el.textContent = selectedPart
+    ? ("Selected: " + (selectedPart.partName || selectedPart.sourceElementId || selectedPart.partId))
+    : "No part picked yet — Send exports the current tab. Click Choose part to pick one.";
+}
+window.addEventListener("message", function(e){
+  if (!originOk(e.origin)) return;
+  const data = e.data || {};
+  const name = String(data.messageName || data.event || "");
+  const dbg = $("dbg");
+  if (dbg) dbg.textContent = name || "(message)";
+  if (viewportRequest && (name === "SELECTION" || data.messageId === viewportRequest)) {
+    const selections = Array.isArray(data.selections) ? data.selections : (data.selection ? [data.selection] : []);
+    const studio = (viewportPicker.elements || []).find(el => el.id === elementId && el.type === "partstudio");
+    for (const s of selections) {
+      if (!s || typeof s !== "object") continue;
+      const id = s.partId || s.idTag || s.selectionId;
+      const part = studio && (studio.parts || []).find(p => p.id === id);
+      if (!part) continue;
+      selectedPart = { partId: part.id, partName: part.name, sourceElementId: studio.id, elementType: "partstudio" };
+      viewportRequest = null;
+      postToOnshape("stopRequest");
+      if (ctx) renderForm();
+      return;
+    }
+  }
+  if (name === "itemSelectedInSelectItemDialog") {
+    const got = parseSelection(data);
+    if (got) { selectedPart = got; showSelected(); }
+  }
+});
+
+postToOnshape("applicationInit");
+postToOnshape("keepAlive");
+
+async function api(method, path, body){
+  const token = localStorage.getItem(TOKEN_KEY) || "";
+  const r = await fetch(path, {
+    method,
+    headers: { "Content-Type":"application/json", ...(token ? { Authorization:"Bearer "+token } : {}) },
+    body: body == null ? undefined : JSON.stringify(body)
+  });
+  const t = await r.text();
+  let d = {};
+  try { d = t ? JSON.parse(t) : {}; } catch(err){ d = { error:{ message:t } }; }
+  if (!r.ok) throw new Error((d.error && d.error.message) || r.statusText || "request failed");
+  return d;
+}
+
+function loginView(){
+  $("view").innerHTML =
+    "<p class='dim'>Sign in to PDM once. Then sending is one click.</p>" +
+    "<div class='modal-field'><label>Email</label><input id='email' autocomplete='username'></div>" +
+    "<div class='modal-field'><label>Password</label><input id='pw' type='password' autocomplete='current-password'></div>" +
+    "<button class='primary' id='go' style='width:100%'>Sign in</button>" +
+    "<p class='err' id='stat'></p>";
+  $("go").onclick = async () => {
+    try {
+      const d = await api("POST", "/auth/login", { username: $("email").value.trim(), password: $("pw").value });
+      localStorage.setItem(TOKEN_KEY, d.token);
+      main();
+    } catch(e){ $("stat").textContent = e.message; }
+  };
+}
+
+async function main(){
+  if (!documentId || !elementId) {
+    $("view").innerHTML = "<p class='dim'>Open this as an Onshape <b>element right panel</b> extension so the document ids are passed in.</p>";
+    return;
+  }
+  if (!localStorage.getItem(TOKEN_KEY)) { loginView(); return; }
+  try { await api("GET", "/me"); } catch(e){ localStorage.removeItem(TOKEN_KEY); loginView(); return; }
+  $("view").innerHTML = "<p class='dim'>Loading…</p>";
+  const [found, cfg, proj] = await Promise.all([
+    api("GET", "/integrations/onshape/lookup?document_id="+encodeURIComponent(documentId)+"&element_id="+encodeURIComponent(elementId)).catch(() => ({})),
+    api("GET", "/integrations/onshape/config").catch(() => ({})),
+    api("GET", "/projects").catch(() => ({ projects: [] }))
+  ]);
+  ctx = { item: found.item, cfg: cfg, projects: proj.projects || [] };
+  renderForm();
+}
+
+function renderForm(){
+  const item = ctx.item;
+  const cfg = ctx.cfg;
+  const projects = ctx.projects;
+  const pref = localStorage.getItem("pdm_onshape_project") || cfg.default_project_id || (projects[0] && projects[0].id) || "";
+  $("view").innerHTML =
+    "<p class='dim' id='sel'>" + (selectedPart
+      ? ("Selected: " + esc(selectedPart.partName || selectedPart.sourceElementId || selectedPart.partId))
+      : "Choose a part or assembly to send.") + "</p>" +
+    "<button id='viewport-pick' style='width:100%;margin-bottom:8px'>Select body in Onshape</button>" +
+    "<button id='pick' style='width:100%;margin-bottom:10px'>Choose part or assembly from list</button>" +
+    "<p class='dim' id='pick-status'></p>" +
+    (selectedPart ? "<div class='selection-preview' id='preview'><span class='dim'>Loading preview…</span></div>" : "") +
+    "<p class='dim'>First send creates an item; later sends update the matching item.</p>" +
+    "<div class='modal-field'><label>PDM project</label><select id='proj'>" +
+      projects.map(p => "<option value='"+p.id+"'"+(String(p.id)===String(pref)?" selected":"")+">"+esc(p.name)+"</option>").join("") +
+    "</select></div>" +
+    "<div class='modal-field'><label>Part number (blank = auto)</label><input id='pn'></div>" +
+    "<div class='modal-field'><label>Format</label><select id='fmt'><option>STEP</option><option>STL</option></select></div>" +
+    "<button class='primary' id='send'>Send to manufacturing</button>" +
+    "<p class='dim' id='stat'></p>" +
+    "<p class='dim' id='dbg'></p>" +
+    "<p class='dim' style='font-size:11px'>PDM build: " + esc(cfg.build || "dev") + "</p>" +
+    "<p><a class='dim' href='#' id='out'>Sign out of PDM</a></p>";
+  $("out").onclick = (e) => { e.preventDefault(); localStorage.removeItem(TOKEN_KEY); loginView(); };
+  $("pick").onclick = loadPicker;
+  $("viewport-pick").onclick = selectInOnshape;
+  if (selectedPart) showPreview(selectedPart);
+  $("send").onclick = async () => {
+    const project_id = $("proj").value;
+    if (!project_id) { $("stat").className = "err"; $("stat").textContent = "Pick a PDM project."; return; }
+    if (!selectedPart) { $("stat").className = "err"; $("stat").textContent = "Choose a part or assembly first."; return; }
+    const pick = selectedPart;
+    localStorage.setItem("pdm_onshape_project", project_id);
+    $("send").disabled = true;
+    $("stat").className = "dim";
+    $("stat").textContent = "Exporting " + (pick.partName || "current tab") + "…";
+    try {
+      const d = await api("POST", "/integrations/onshape/send", {
+        document_id: documentId,
+        workspace_id: workspaceId,
+        element_id: elementId,
+        element_type: pick.elementType || elementType,
+        project_id: project_id,
+        part_number: ($("pn") && $("pn").value.trim()) || pick.partName || null,
+        part_name: pick.partName || null,
+        part_id: pick.partId || null,
+        source_element_id: pick.sourceElementId || null,
+        source_document_id: pick.sourceDocumentId || null,
+        source_workspace_id: pick.sourceWorkspaceId || null,
+        source_workspace_type: pick.sourceWorkspaceType || null,
+        source_configuration: pick.sourceConfiguration || null,
+        format: $("fmt").value
+      });
+      $("stat").className = "ok";
+      $("stat").innerHTML = "Manufacturing has <b>" + esc(d.part_number || "the part") + "</b>";
+      postToOnshape("showMessageBubble", { message: "Sent " + (d.part_number || "model") + " to manufacturing" });
+    } catch(e){
+      $("stat").className = "err";
+      $("stat").textContent = e.message;
+      $("send").disabled = false;
+    }
+  };
+}
+
+async function selectInOnshape(){
+  const status = $("pick-status");
+  status.textContent = "Loading selectable bodies…";
+  try {
+    const data = await api("GET", "/integrations/onshape/picker?document_id="+encodeURIComponent(documentId)+"&workspace_id="+encodeURIComponent(workspaceId));
+    const studio = (data.elements || []).find(el => el.id === elementId && el.type === "partstudio");
+    if (!studio) {
+      status.textContent = "Open the Part Studio tab to select a body in the model. For assemblies, use the list.";
+      return;
+    }
+    viewportPicker = data;
+    viewportRequest = "pdm-body-" + Date.now();
+    status.textContent = "Click a body in the Onshape model or parts list.";
+    postToOnshape("requestSelection", { messageId: viewportRequest, entityTypeSpecifier: ["BODY"], requiredSelectionCount: 1 });
+  } catch(e) { status.textContent = "Could not start selection: " + e.message; }
+}
+
+async function showPreview(pick){
+  const container = $("preview");
+  if (!container) return;
+  const query = new URLSearchParams({
+    document_id: pick.sourceDocumentId || documentId,
+    context: pick.sourceWorkspaceType || "w",
+    context_id: pick.sourceWorkspaceId || workspaceId,
+    element_id: pick.sourceElementId || elementId,
+    element_type: pick.elementType || elementType
+  });
+  if (pick.partId) query.set("part_id", pick.partId);
+  if (pick.sourceConfiguration) query.set("configuration", pick.sourceConfiguration);
+  try {
+    const result = await api("GET", "/integrations/onshape/preview?" + query);
+    if (!container.isConnected) return;
+    const image = document.createElement("img");
+    image.alt = "Preview of " + (pick.partName || "selected item");
+    image.src = "data:image/png;base64," + result.image;
+    container.replaceChildren(image);
+  } catch(e) {
+    if (container.isConnected) container.textContent = "Preview unavailable: " + e.message;
+  }
+}
+
+async function loadPicker(){
+  $("view").innerHTML = "<p class='dim'>Loading document contents…</p>";
+  try {
+    const d = await api("GET", "/integrations/onshape/picker?document_id="+encodeURIComponent(documentId)+"&workspace_id="+encodeURIComponent(workspaceId));
+    renderPicker(d);
+  } catch(e){
+    $("view").innerHTML = "<p class='err'>" + esc(e.message) + "</p><button id='back' style='width:100%'>← Back</button>";
+    $("back").onclick = renderForm;
+  }
+}
+
+function renderPicker(d){
+  const elements = d.elements || [];
+  let rows = "";
+  elements.forEach(el => {
+    const label = el.type === "assembly" ? "Assembly" : el.type === "partstudio" ? "Part Studio" : el.type;
+    const glyph = el.type === "assembly" ? "⚙" : "◧";
+    rows += "<div class='pick-row' data-eid='" + esc(el.id) + "' data-ename='" + esc(el.name) + "' data-etype='" + esc(el.type) + "'>" +
+      glyph + " <span>" + esc(el.name) + "</span><span class='pick-tag'>" + label + "</span></div>";
+    (el.parts || []).forEach(p => {
+      rows += "<div class='pick-row pick-sub' data-pid='" + esc(p.id) + "' data-pname='" + esc(p.name) + "' data-eid='" + esc(el.id) + "'>• " + esc(p.name) + "</div>";
+    });
+    (el.subassemblies || []).forEach(s => {
+      rows += "<div class='pick-row pick-sub' data-sid='" + esc(s.element_id) + "' data-sname='" + esc(s.name) + "' data-sdoc='" + esc(s.document_id) + "' data-swvm='" + esc(s.wvm_id) + "' data-swsegt='" + esc(s.wvm_type) + "' data-spart='" + esc(s.part_id) + "' data-sconfig='" + esc(s.configuration) + "'>↳ " + esc(s.name) + " <span class='pick-tag'>" + (s.part_id ? "part" : "sub-assembly") + "</span></div>";
+    });
+  });
+  if (!elements.length) rows = "<div class='pick-row'><span class='dim'>No assemblies or Part Studios found in this workspace.</span></div>";
+  $("view").innerHTML =
+    "<button id='back' style='width:100%;margin-bottom:6px'>← Back</button>" +
+    "<p class='dim'>Picking from this document's tabs:</p>" +
+    "<div class='pick-list'>" + rows + "</div>" +
+    "<p class='dim' style='font-size:11px'>A tab sends the whole element; a body sends just that part; ↳ rows are the assembly's top-level sub-assemblies.</p>";
+  $("back").onclick = renderForm;
+  document.querySelectorAll(".pick-row[data-sid]").forEach(r => {
+    r.onclick = () => {
+      selectedPart = {
+        partId: r.dataset.spart || "",
+        partName: r.dataset.sname,
+        sourceElementId: r.dataset.sid,
+        sourceDocumentId: r.dataset.sdoc,
+        sourceWorkspaceId: r.dataset.swvm,
+        sourceWorkspaceType: r.dataset.swsegt,
+        sourceConfiguration: r.dataset.sconfig,
+        elementType: r.dataset.spart ? "partstudio" : "assembly"
+      };
+      renderForm();
+    };
+  });
+  document.querySelectorAll(".pick-row[data-pid]").forEach(r => {
+    r.onclick = () => {
+      selectedPart = { partId: r.dataset.pid, partName: r.dataset.pname, sourceElementId: r.dataset.eid, elementType: "partstudio" };
+      if (r.dataset.eid === elementId) {
+        postToOnshape("requestSelectionHighlight", {
+          messageId: "pdm-highlight-" + Date.now(),
+          selections: [{ selectionType: "ENTITY", selectionId: r.dataset.pid, entityType: "BODY" }]
+        });
+      }
+      renderForm();
+    };
+  });
+  document.querySelectorAll(".pick-row[data-etype]").forEach(r => {
+    if (r.dataset.pid || r.dataset.sid) return;
+    r.onclick = () => {
+      selectedPart = { partId: "", partName: r.dataset.ename, sourceElementId: r.dataset.eid, elementType: r.dataset.etype };
+      renderForm();
+    };
+  });
+}
+
+main();
+</script>
+</body>
+</html>

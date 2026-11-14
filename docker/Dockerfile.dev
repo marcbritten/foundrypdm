@@ -1,0 +1,66 @@
+# Local dev image for the PDM server. Builds pdm-server + pdm-cli from the PDM
+# workspace and bundles a CAD CLI so the in-process worker can render previews
+# and measurements for uploaded files (see Dockerfile for the multi-arch
+# production image).
+#
+# Build context is the directory that holds the CAD checkout and this repo
+# (sibling layout, as RUNNING.md documents): the compose file's
+# `build.context: ../..` and CAD_DIR / CAD_CLI_PKG select the CAD repo and the
+# CLI package to build from it (default: solidCraft-WPDM / solidcraft-cli; an
+# older `solidcraft` checkout builds `-p solvecraft-cli` instead — the alias
+# binary is what the worker's PDM_SOLVECRAFT_CLI path names in either case).
+#
+#   PDM_GIT_COMMIT bakes the host checkout's commit into `GET /version` (the
+#   .git dir is not in the build context; see docker/build-dev.sh).
+
+FROM debian:trixie-slim AS web-editors
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+COPY solidcraft-pdm/docker/install-web-editors.sh /install-web-editors.sh
+RUN sh /install-web-editors.sh /portal
+
+FROM rust:1.99-slim AS builder
+ARG PDM_GIT_COMMIT
+ARG CAD_DIR=solidCraft-WPDM
+ARG CAD_CLI_PKG=solidcraft-cli
+WORKDIR /src
+COPY $CAD_DIR/ /cad/
+COPY solidcraft-pdm/ /src/
+# CAD CLI: invoked by the PDM worker for measurements (eval), previews
+# (snapshot) and CAD restatement (convert). Its target dir is build-local
+# (.target-tmp, a cache mount) so the checkout's own target/ is not needed.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/cad/.target-tmp \
+    cd /cad \
+    && CARGO_TARGET_DIR=/cad/.target-tmp cargo build --release -p $CAD_CLI_PKG \
+    && cp .target-tmp/release/solvecraft-cli /dist-solvecraft-cli \
+    # The renamed fork ships a `solvecraft-cli` alias that execs `solidcraft-cli`,
+    # so both binaries must land in the image (older checkouts: same binary twice).
+    && (cp .target-tmp/release/solidcraft-cli /dist-solidcraft-cli 2>/dev/null || cp /dist-solvecraft-cli /dist-solidcraft-cli)
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p pdm-server -p pdm-cli \
+    && cp target/release/pdm-server /dist-pdm-server \
+    && cp target/release/pdm-cli /dist-pdm-cli
+
+# rust:1.99-slim is Debian 13 (glibc 2.41); the final stage must provide at
+# least that glibc, so bookworm (glibc 2.36) is too old.
+FROM debian:trixie-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl mesa-vulkan-drivers libvulkan1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /dist-pdm-server /usr/local/bin/pdm-server
+COPY --from=builder /dist-pdm-cli /usr/local/bin/pdm-cli
+COPY --from=builder /dist-solidcraft-cli /usr/local/bin/solidcraft-cli
+COPY --from=builder /dist-solvecraft-cli /usr/local/bin/solvecraft-cli
+# Web-workspace portal (index.html + app.js + style.css). lib.rs serves / from
+# PDM_PORTAL_DIR when set, falling back to the embedded portal page.
+COPY --from=builder /src/crates/pdm-api/static /opt/pdm/portal
+COPY --from=web-editors /portal/editors /opt/pdm/portal/editors
+ENV PDM_PORTAL_DIR=/opt/pdm/portal \
+    PDM_SOLVECRAFT_CLI=/usr/local/bin/solidcraft-cli
+EXPOSE 8080
+# Server runs migrations on boot, then serves the API + in-process worker.
+CMD ["pdm-server"]

@@ -1,0 +1,12 @@
+# Keeps the /workspace build context small. BuildKit only reads this file
+# from the context ROOT, so docker/build.sh and docker/build-dev.sh copy it
+# there before building.
+.git
+.idea
+target
+__MACOSX
+erp-free
+odoo17
+*/target
+*/.git
+*/.target-tmp

@@ -1,0 +1,108 @@
+# PDM server image — bundles pdm-server, pdm-cli and a matching-arch
+# solvecraft-cli so design.analyze + preview.render work out of the box.
+#
+# Build context MUST be the parent directory that contains both repos,
+# i.e. the directory holding `solidcraft/` and `solidcraft-pdm/`:
+#
+#   docker buildx build --platform linux/arm64,linux/amd64 \
+#     -f solidcraft-pdm/docker/Dockerfile -t solvecraft-pdm:latest .
+#
+# (A .dockerignore at the context root skips .git and target/ dirs;
+#  docker/.dockerignore in this repo is copied there by build.sh.)
+#
+# Cross-compilation: the builder stage always runs natively
+# (--platform=$BUILDPLATFORM) and cross-compiles with cargo --target,
+# so qemu emulation is only needed for the tiny final-stage apt install.
+
+ARG BUILDPLATFORM
+
+FROM --platform=$BUILDPLATFORM debian:trixie-slim AS web-editors
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+COPY solidcraft-pdm/docker/install-web-editors.sh /install-web-editors.sh
+RUN sh /install-web-editors.sh /portal
+
+FROM --platform=$BUILDPLATFORM rust:1.99-slim AS builder
+ARG TARGETARCH
+# The CAD workspace's CLI package (the PDM line names it solvecraft-cli; the
+# SolidCraft-WPDM line names it solidcraft-cli): --build-arg CAD_PKG=solidcraft-cli.
+ARG CAD_PKG=solidcraft-cli
+WORKDIR /src
+
+# CAD workspace (kernel + solvecraft-cli).
+COPY solidcraft/ /solidcraft/
+# PDM workspace (server + ops CLI).
+COPY solidcraft-pdm/ /solidcraft-pdm/
+
+# Install the cross C toolchain for the target arch (needed by cc crates
+# like ring when compiling for a foreign target; harmless for native).
+RUN apt-get update \
+    && if [ "$TARGETARCH" = "amd64" ]; then \
+         apt-get install -y --no-install-recommends \
+           gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils-x86-64-linux-gnu; \
+       elif [ "$TARGETARCH" = "arm64" ]; then \
+         apt-get install -y --no-install-recommends \
+           gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu; \
+       fi \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cross-compile env vars understood by the cc crate / rustc.
+ENV CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+    CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+
+# solvecraft-cli: invoked by the PDM worker for measurement/analysis and
+# thumbnail rendering. Note: cache mounts are not part of the stage
+# snapshot, so finished binaries are copied out of the cached target dir
+# into /dist.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/solidcraft/target \
+    case "$TARGETARCH" in \
+      amd64) TRIPLET=x86_64-unknown-linux-gnu;; \
+      arm64) TRIPLET=aarch64-unknown-linux-gnu;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH"; exit 1;; \
+    esac \
+    && rustup target add "$TRIPLET" \
+    && cd /solidcraft \
+    && cargo build --release --target "$TRIPLET" -p "$CAD_PKG" \
+    && cp target/"$TRIPLET"/release/"$CAD_PKG" /dist-solidcraft-cli \
+    && cp target/"$TRIPLET"/release/solvecraft-cli /dist-solvecraft-cli
+
+# PDM server + ops CLI.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/solidcraft-pdm/target \
+    case "$TARGETARCH" in \
+      amd64) TRIPLET=x86_64-unknown-linux-gnu;; \
+      arm64) TRIPLET=aarch64-unknown-linux-gnu;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH"; exit 1;; \
+    esac \
+    && rustup target add "$TRIPLET" \
+    && cd /solidcraft-pdm \
+    && cargo build --release --target "$TRIPLET" -p pdm-server -p pdm-cli \
+    && cp target/"$TRIPLET"/release/pdm-server /dist-pdm-server \
+    && cp target/"$TRIPLET"/release/pdm-cli /dist-pdm-cli
+
+# rust:1.99-slim is Debian 13 (glibc 2.41); the final stage must provide
+# at least that glibc, so bookworm (glibc 2.36) is too old.
+FROM debian:trixie-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /dist-solvecraft-cli /usr/local/bin/solvecraft-cli
+COPY --from=builder /dist-solidcraft-cli /usr/local/bin/solidcraft-cli
+COPY --from=builder /dist-pdm-server /usr/local/bin/pdm-server
+COPY --from=builder /dist-pdm-cli /usr/local/bin/pdm-cli
+# Web-workspace portal (index.html + app.js + style.css). lib.rs serves / from
+# PDM_PORTAL_DIR when set, falling back to the embedded portal page.
+COPY --from=builder /solidcraft-pdm/crates/pdm-api/static /opt/pdm/portal
+COPY --from=web-editors /portal/editors /opt/pdm/portal/editors
+ENV PDM_PORTAL_DIR=/opt/pdm/portal
+ENV PDM_SOLVECRAFT_CLI=/usr/local/bin/solidcraft-cli
+EXPOSE 8080
+# Server runs migrations on boot, then serves the API + in-process worker.
+CMD ["pdm-server"]

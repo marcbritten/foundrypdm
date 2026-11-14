@@ -1,0 +1,128 @@
+# TASK: Audit Existing Rust PDM and Plan Full SolidCraft Integration
+
+You are the lead architect and senior Rust engineer for an existing open-source Product Data Management (PDM) system.
+
+This is an existing codebase, not a greenfield project. It already has a basic web UI and some backend functionality. Your job is to understand it, preserve working features, identify missing capabilities, and prepare an executable implementation plan.
+
+## Product Vision
+
+Build a self-hosted, Docker-deployable PDM platform for mechanical engineering, robotics teams, and manufacturing.
+
+Supported CAD applications:
+- SolidCraft (primary native integration)
+- Autodesk Inventor
+- Autodesk Fusion
+- Onshape
+- Generic CAD through STEP, IGES, STL, DXF and other supported formats
+
+Reference:
+https://github.com/bherbruck/solidcraft
+
+Design inspirations:
+- Autodesk Vault
+- Onshape PDM and branching
+- Autodesk Fusion Manage
+- Modern Git-style revision control
+
+Do not copy proprietary implementations, branding, icons or code.
+
+## Step 1 — Inspect the repository
+
+Read all relevant project documentation, agent instructions, Cargo workspaces, database migrations, Docker configuration, frontend implementation, tests and API definitions.
+
+Identify:
+1. Existing Rust services and crate architecture.
+2. Current frontend framework and design system.
+3. Existing API routes and WebSocket capabilities.
+4. Authentication, authorization and user management.
+5. Database schema, migrations and data integrity.
+6. File storage, uploads, downloads and versioning.
+7. Existing SolidCraft integration.
+8. Existing preview, thumbnail and model-processing capabilities.
+9. Docker deployment and configuration.
+10. Current tests, CI, broken features and security concerns.
+
+Do not assume a feature is missing without checking.
+
+## Step 2 — Research SolidCraft compatibility
+
+Inspect the checked-out SolidCraft source and its current documentation.
+
+Pay particular attention to:
+- Native design file structure and compatibility
+- Parametric feature history
+- Document serialization
+- Engine command registry
+- Headless CLI
+- MCP server
+- STEP, DXF, STL and other exports
+- Rendering and thumbnails
+- Desktop egui architecture
+- WebAssembly support
+- Existing extension or integration mechanisms
+
+Respect SolidCraft's dependency layering and licensing constraints.
+
+## Step 3 — Define architecture
+
+Prefer Rust, Axum, SQLx, PostgreSQL, S3-compatible storage and WebSockets where appropriate, but retain compatible existing infrastructure unless migration has a clear benefit.
+
+Design for:
+- Multiple organizations and projects
+- Secure project membership
+- Versioned engineering documents
+- Immutable file blobs
+- Content-addressed storage
+- Part and assembly relationships
+- BOM and revision management
+- CAD-neutral metadata
+- CAD-specific adapters
+- Asynchronous processing workers
+- Collaborative workspaces
+- Manufacturing assets and tool libraries
+- Horizontal scaling
+
+Clearly distinguish file-level collaboration from true simultaneous parametric editing.
+
+## Step 4 — Produce planning artifacts
+
+Create or update:
+
+docs/architecture.md
+docs/data-model.md
+docs/api-specification.md
+docs/solidcraft-integration.md
+docs/cad-connectors.md
+docs/manufacturing.md
+docs/security.md
+docs/development-roadmap.md
+docs/implementation-status.md
+
+Include database migration plans, API contracts, dependency diagrams, milestones, test requirements and acceptance criteria.
+
+Create a prioritized implementation backlog with small, independently testable tasks and explicit dependencies.
+
+## Step 5 — Execution requirements
+
+- Preserve existing data and functionality.
+- Never delete or reset production data.
+- Do not rewrite working components unnecessarily.
+- Use migrations for database changes.
+- Prefer incremental, reviewable changes.
+- Document architectural decisions.
+- Keep the application deployable with Docker Compose.
+- Use tests for all important backend behavior.
+- Do not claim functionality is complete unless verified.
+
+## Deliverable
+
+Return:
+1. Current implementation inventory.
+2. Architecture and security risks.
+3. Missing capabilities.
+4. Proposed system architecture.
+5. Ordered implementation milestones.
+6. First ten actionable coding tasks.
+7. Exact commands for building and testing the existing application.
+
+Complete the audit and planning documents before beginning major implementation.

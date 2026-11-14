@@ -1,0 +1,10 @@
+# Update the API/in-process worker executable while retaining the deployed
+# portal and prepared CAD CLI. Context: the PDM build's target/release directory.
+ARG PDM_BASE_IMAGE=docker-pdm:V.01-31
+FROM ${PDM_BASE_IMAGE}
+COPY pdm-server /usr/local/bin/pdm-server
+ARG PDM_BUILD_TAG=V.01-31
+ENV PDM_BUILD_TAG=${PDM_BUILD_TAG}
+LABEL org.opencontainers.image.version="${PDM_BUILD_TAG}" \
+    io.solidcraft.pdm.worker-fix="step-conversion-temp-path-and-derived-download"
+RUN /usr/local/bin/pdm-server --help >/dev/null

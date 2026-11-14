@@ -1,0 +1,83 @@
+# TASK: Multi-CAD Connector Architecture
+
+Build a CAD-neutral integration framework for the existing Rust PDM.
+
+## Supported Systems
+
+1. SolidCraft — native integration
+2. Autodesk Inventor — desktop connector
+3. Autodesk Fusion — cloud integration where authorized APIs permit
+4. Onshape — cloud integration through supported APIs
+5. Generic CAD — file-based import and export
+
+## Connector Interface
+
+Define a versioned capability-based connector interface.
+
+Potential capabilities:
+- Authentication
+- List projects
+- List documents
+- Download native file
+- Upload native file
+- Read document metadata
+- Extract assembly references
+- Extract BOM
+- Export STEP
+- Export DXF
+- Generate thumbnails
+- Track revisions
+- Receive change notifications
+- Publish manufacturing artifacts
+
+Connectors must explicitly report unsupported capabilities.
+
+## Inventor
+
+Investigate a Windows desktop connector using supported Inventor APIs.
+
+Provide secure communication with the Rust PDM server.
+
+Preserve native assembly references, part files, drawings and related dependencies.
+
+## Fusion
+
+Investigate current Autodesk Platform Services and Fusion API capabilities.
+
+Implement only supported workflows.
+
+Document authentication, licensing, cloud dependencies and limitations.
+
+## Onshape
+
+Investigate supported Onshape REST APIs, webhooks and document/version/workspace concepts.
+
+Map Onshape document identifiers to stable PDM external references.
+
+Avoid copying Onshape's internal version history or pretending the PDM can directly control its native simultaneous editing.
+
+## Generic CAD
+
+Support upload and version control for arbitrary files.
+
+Provide previews and metadata extraction where parsers or conversion workers exist.
+
+Never discard native files after conversion.
+
+## Common Requirements
+
+- Idempotent synchronization
+- External ID mappings
+- Retry handling
+- Rate-limit handling
+- Credential security
+- Dependency tracking
+- Conflict reporting
+- Audit logs
+- Connector health monitoring
+
+## Acceptance Criteria
+
+Demonstrate importing a project containing files from at least two CAD formats, preserving native files and associating generated neutral-format artifacts with their original revisions.
+
+Document which integrations are fully functional, partially functional, or blocked by third-party API limitations.

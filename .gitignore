@@ -1,0 +1,15 @@
+/target/
+
+docker/.build-tag
+/crates/pdm-api/static/editors/
+.env
+.env.*
+!.env.example
+/docs/qwen-project-operations.md
+/docs/qwen-pdm-addon-handoff.md
+/docs/qwen-pdm-addon-tasks.md
+*.deb
+*.pem
+*.key
+*.p12
+*.pfx

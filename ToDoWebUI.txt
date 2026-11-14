@@ -1,0 +1,129 @@
+# TASK: Implement the Complete PDM Web Workspace
+
+Use the existing PDM repository and the architecture documents produced by the audit.
+
+Do not create a replacement frontend. Improve the existing application and reuse its framework, components, API conventions and authentication.
+
+## Goal
+
+Create a modern engineering PDM workspace inspired by the usability of Onshape and Autodesk Vault, but with original visual design and implementation.
+
+## Main Navigation
+
+Implement:
+- Dashboard
+- Organizations and Teams
+- Projects
+- Files and Documents
+- Parts and Assemblies
+- Bills of Materials
+- Manufacturing
+- Machines and Tools
+- Tasks and Approvals
+- Search
+- Administration
+
+## Project Explorer
+
+Provide a tree view and table view with:
+- Nested folders
+- Parts, assemblies and documents
+- File type icons
+- Search, sorting and filtering
+- File upload and drag-and-drop
+- Revision and version information
+- Last modified date
+- Owner and active editors
+- Lifecycle state
+- Context menus
+- Bulk actions
+
+## Engineering File Detail Page
+
+Implement tabs for:
+- Overview
+- 3D Preview
+- Versions
+- Revisions
+- Dependencies
+- BOM
+- Manufacturing
+- Comments
+- Activity
+- Permissions
+
+The preview must support orbit, pan, zoom, fit-to-view and an orientation indicator when a supported preview is available.
+
+Provide 2D previews for supported DXF, PDF and image artifacts.
+
+Show processing status and errors instead of broken or empty previews.
+
+## Version Control
+
+Implement:
+- File history
+- Commit messages
+- Named revisions
+- Comparison of metadata and supported model properties
+- Restore as a new version
+- Workspace branches
+- Branch history
+- Conflict notifications
+- Approval and release workflow
+
+Never overwrite an immutable historical version.
+
+## Dashboard
+
+Display:
+- Recent projects
+- Recently modified documents
+- Assigned tasks
+- Pending approvals
+- Active collaborators
+- Processing jobs
+- Released manufacturing packages
+
+## UI Requirements
+
+- Responsive desktop and tablet layouts
+- Dark and light themes
+- Resizable panels
+- Collapsible project tree
+- Keyboard shortcuts
+- Loading, empty and error states
+- Accessible controls
+- Real API integration, not mock-only UI
+- Optimistic updates only where safe
+- WebSocket updates for live changes
+- Clear permission-based action availability
+
+## Engineering Requirements
+
+Build reusable frontend components.
+
+Keep API contracts typed and documented.
+
+Implement pagination and server-side filtering for large datasets.
+
+Provide integration tests for major user workflows.
+
+Do not expose object storage credentials to the browser.
+
+## Acceptance Tests
+
+A user must be able to:
+
+1. Sign in.
+2. Create a project.
+3. Create a folder.
+4. Upload a SolidCraft design.
+5. View the file and its metadata.
+6. Create a new file version.
+7. Inspect version history.
+8. Preview a supported model.
+9. Add a comment.
+10. Invite another user with appropriate permissions.
+11. See changes made by another user without refreshing.
+
+Finish with a working UI, passing tests and a list of any incomplete features.

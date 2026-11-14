@@ -1,0 +1,123 @@
+# TASK: Manufacturing and CAM Management
+
+Extend the existing Rust PDM with a complete manufacturing data-management subsystem.
+
+## Core Requirements
+
+Every manufactured part must support relationships between:
+
+Part → Revision → CAD Model → Manufacturing Setup → CAM Project → NC Program → Machine → Production Job → Inspection
+
+## Machine Registry
+
+Implement records for:
+- CNC mills
+- CNC lathes
+- CNC routers
+- Laser cutters
+- Plasma cutters
+- Waterjets
+- 3D printers
+- Manual machines
+
+Track machine identity, manufacturer, model, controller, capabilities, work envelope, axes, materials, supported post-processors and maintenance status.
+
+## Tool Library
+
+Implement reusable tooling records for:
+- End mills
+- Drills
+- Taps
+- Reamers
+- Face mills
+- Chamfer tools
+- Turning tools
+- Tool holders
+- Inserts
+
+Track tool dimensions, cutting parameters, tool assemblies, feeds, speeds, material compatibility, inventory and tool life.
+
+## CAM and G-code
+
+Store native CAM projects when available.
+
+Track:
+- CAD revision used
+- Manufacturing setup
+- Stock dimensions
+- Workholding
+- Work coordinate systems
+- Toolpaths
+- Tool selections
+- Feeds and speeds
+- Post-processor identity and version
+- Machine target
+- G-code program
+- Simulation and verification results
+
+Implement G-code parsing and read-only visualization for supported dialects.
+
+Do not assume that G-code is portable between machines.
+
+Never automatically transmit or execute machine programs. Require explicit authorization and machine-specific validation.
+
+## Sheet Metal
+
+Support:
+- Flat pattern DXF
+- Material
+- Thickness
+- Bend radius
+- K-factor or bend allowance
+- Bend table
+- Cutting operation
+- Forming operation
+- Manufacturing revision
+
+Use SolidCraft headless capabilities to generate flat patterns when supported.
+
+## 3D Printing
+
+Track:
+- STL and 3MF files
+- Printer
+- Material
+- Slicer profile
+- Orientation
+- Supports
+- Layer height
+- Print time estimates
+- Resulting machine file
+- Print job status
+
+## Robotics Workflow
+
+Provide a project manufacturing dashboard where students can see:
+
+- Parts needing fabrication
+- Parts in CAM
+- Parts ready for machining
+- Parts being machined
+- Parts awaiting inspection
+- Completed parts
+- Rejected or rework parts
+
+Support a simple Kanban workflow and permission-based approvals.
+
+## Critical Data Integrity
+
+Released manufacturing packages must be immutable.
+
+Every NC program must reference the exact source CAD revision, CAM setup, tool configuration and post-processor version used to create it.
+
+Changing the source design must flag dependent manufacturing outputs as potentially outdated.
+
+## Deliverables
+
+Implement database migrations, Rust domain models, APIs, UI pages, background jobs, tests and documentation.
+
+Demonstrate one complete workflow:
+
+SolidCraft bracket → released CAD revision → STEP/DXF → manufacturing setup → tool selection → NC program record → approved job → completed part.
+
+Do not fake unsupported CAM generation. Store and manage externally generated CAM files until actual toolpath generation is implemented.

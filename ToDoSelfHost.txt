@@ -1,0 +1,93 @@
+# TASK: Production-Ready Self-Hosted PDM Deployment
+
+Package the Rust PDM as a portable, secure, self-hosted platform.
+
+## Deployment Targets
+
+- Single Linux server with Docker Compose
+- Multiple Docker hosts
+- Docker Swarm
+- Future Kubernetes support
+
+## Services
+
+Use existing compatible services where available.
+
+Expected logical components:
+- Rust API server
+- Web frontend
+- PostgreSQL
+- S3-compatible object storage
+- Background job queue
+- SolidCraft processing workers
+- Optional Redis if justified
+- Reverse proxy and TLS termination
+
+## SolidCraft Worker
+
+Create a containerized worker using the compatible SolidCraft headless CLI.
+
+Worker jobs:
+- Render model thumbnails
+- Produce isometric previews
+- Export STEP
+- Export STL
+- Export DXF flat patterns
+- Extract model properties
+- Extract supported assembly metadata
+- Generate derived artifacts
+- Report processing failures
+
+Record the source revision, worker version, application version, job parameters and output hashes.
+
+Workers must not modify original uploaded files.
+
+Use resource limits, job timeouts, isolated temporary directories and restricted network/file access for untrusted CAD input.
+
+## Infrastructure
+
+Implement:
+- Persistent volumes
+- Health checks
+- Graceful shutdown
+- Structured logs
+- Metrics
+- Backup and restore procedures
+- Database migrations
+- Object storage backup strategy
+- Secure secrets configuration
+- Multi-instance API support
+- Worker scaling
+- Durable job retries
+- Dead-letter handling
+
+Avoid dependence on local container filesystems for shared persistent data.
+
+## Deliverables
+
+Provide:
+- Production Dockerfiles
+- docker-compose.yml
+- Example environment configuration
+- Swarm-compatible deployment example
+- Deployment documentation
+- Upgrade documentation
+- Backup and restore scripts
+- End-to-end smoke tests
+
+## Acceptance Criteria
+
+A fresh installation must support:
+
+1. Start all services.
+2. Create the first administrator.
+3. Create a project.
+4. Upload a SolidCraft file.
+5. Queue a thumbnail-generation job.
+6. Run the job in a separate container.
+7. View the generated thumbnail.
+8. Restart the stack without losing data.
+9. Scale the worker service to multiple replicas.
+10. Recover from a worker failure without corrupting artifacts.
+
+Verify these behaviors rather than relying only on successful container startup.

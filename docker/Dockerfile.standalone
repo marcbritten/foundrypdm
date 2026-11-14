@@ -1,0 +1,20 @@
+# Self-contained build: no sibling CAD checkout or GPU is required.
+FROM rust:1.99-slim AS builder
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --locked --release -p pdm-server -p pdm-cli \
+    && cp target/release/pdm-server target/release/pdm-cli /usr/local/bin/
+
+FROM debian:trixie-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /usr/local/bin/pdm-server /usr/local/bin/pdm-server
+COPY --from=builder /usr/local/bin/pdm-cli /usr/local/bin/pdm-cli
+COPY crates/pdm-api/static /opt/pdm/portal
+ENV PDM_PORTAL_DIR=/opt/pdm/portal
+EXPOSE 8080
+CMD ["pdm-server"]

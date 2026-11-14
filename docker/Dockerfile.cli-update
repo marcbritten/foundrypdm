@@ -1,0 +1,17 @@
+# CLI-only update: keep the deployed PDM API and portal and replace its CAD tools.
+# Build context: the CAD checkout's target/release directory, after cargo build.
+ARG PDM_BASE_IMAGE=docker-pdm:V.01-36
+FROM ${PDM_BASE_IMAGE}
+COPY solidcraft-cli solvecraft-cli /usr/local/bin/
+ARG PDM_BUILD_TAG=V.01-37
+ARG SOLIDCRAFT_VERSION=0.27.1
+ARG SOLIDCRAFT_FORK_REV=0cd3f9a29
+ARG SOLIDCRAFT_UPSTREAM_REV=aa1fe28ddff42cac2990a312765a1a6c50d97dfe
+ENV PDM_BUILD_TAG=${PDM_BUILD_TAG} \
+    PDM_SOLVECRAFT_CLI=/usr/local/bin/solidcraft-cli
+LABEL org.opencontainers.image.version="${PDM_BUILD_TAG}" \
+    io.solidcraft.cli.version="${SOLIDCRAFT_VERSION}" \
+    io.solidcraft.cli.fork-revision="${SOLIDCRAFT_FORK_REV}" \
+    io.solidcraft.cli.upstream-revision="${SOLIDCRAFT_UPSTREAM_REV}"
+RUN test "$(/usr/local/bin/solidcraft-cli --version)" = "solidcraft-cli ${SOLIDCRAFT_VERSION}" \
+    && test "$(/usr/local/bin/solvecraft-cli --version)" = "solidcraft-cli ${SOLIDCRAFT_VERSION}"

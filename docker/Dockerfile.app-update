@@ -1,0 +1,10 @@
+# Reuse the deployed CAD runtime and update only the PDM executables/portal.
+# Context: PDM target/release. Named context `portal`: crates/pdm-api/static.
+ARG PDM_BASE_IMAGE=docker-pdm:V.01-37
+FROM ${PDM_BASE_IMAGE}
+COPY pdm-server pdm-cli /usr/local/bin/
+COPY --from=portal /app.js /editors.css /editors.js /index.html /onshape-icon.svg /onshape.html /style.css /opt/pdm/portal/
+ARG PDM_BUILD_TAG=V.01-38
+ENV PDM_BUILD_TAG=${PDM_BUILD_TAG}
+LABEL org.opencontainers.image.version="${PDM_BUILD_TAG}"
+RUN /usr/local/bin/pdm-server --help >/dev/null

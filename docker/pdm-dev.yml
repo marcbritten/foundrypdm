@@ -1,0 +1,117 @@
+# Development compose stack for the PDM platform.
+#   docker compose -f apps/pdm/docker/pdm-dev.yml up -d
+# Then run `pdm-cli` ops through the container:
+#   docker compose -f apps/pdm/docker/pdm-dev.yml run --rm pdm pdm-cli create-org --name "Acme"
+#
+# The PDM server runs migrations on boot and serves the in-process worker.
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pdm
+      POSTGRES_USER: pdm
+      POSTGRES_PASSWORD: pdm
+    ports:
+      - "15432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pdm -d pdm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: alpine/minio:latest-release   # minio/minio no longer published on Docker Hub
+    restart: unless-stopped
+    user: root                           # alpine/minio defaults to the minio user; volume is root-owned
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: pdm
+      MINIO_ROOT_PASSWORD: pdmsecret
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    volumes:
+      - miniodata:/data
+
+  minio-init:
+    image: alpine/minio:latest-release
+    user: "0"
+    depends_on:
+      - minio
+    entrypoint: /bin/sh
+    command: -c "apk add --no-cache minio-client >/dev/null 2>&1; sleep 3; mcli alias set local http://minio:9000 pdm pdmsecret; mcli mb --ignore-existing local/pdm"
+    restart: "no"
+
+  pdm:
+    image: docker-pdm:${PDM_BUILD_TAG:-V.01-01}   # versioned test-build tag
+    restart: unless-stopped
+    build:
+      # Parent of both the CAD checkout and this repo (sibling layout, see
+      # RUNNING.md). CAD_DIR/CAD_CLI_PKG select which CAD builds the bundled
+      # worker CLI (default: solidcraft/solvecraft-cli).
+      context: ../..
+      dockerfile: solidcraft-pdm/docker/Dockerfile.dev
+      args:
+        PDM_GIT_COMMIT: ${PDM_GIT_COMMIT:-unknown}   # set it via docker/build-dev.sh
+        CAD_DIR: ${CAD_DIR:-solidCraft-WPDM}   # sibling CAD checkout the worker CLI comes from
+        CAD_CLI_PKG: ${CAD_CLI_PKG:-solidcraft-cli}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    environment:
+      PDM_DATABASE_URL: postgresql://pdm:pdm@postgres:5432/pdm
+      PDM_S3_ENDPOINT: http://minio:9000
+      PDM_S3_BUCKET: pdm
+      PDM_S3_ACCESS_KEY: pdm
+      PDM_S3_SECRET_KEY: pdmsecret
+      PDM_BUILD_TAG: ${PDM_BUILD_TAG:-V.01-01}   # shown in GET /version
+      PDM_SOLVECRAFT_CLI: /usr/local/bin/solidcraft-cli
+      PDM_WORKER: "0"   # jobs run in the pdm-worker service below
+      PDM_LOCK_LEASE_HOURS: "24"
+      PDM_MAX_UPLOAD_BYTES: "2147483648"   # 2 GiB: native CAD files with their history exceed 256 MB
+      SOLIDCRAFT_GPU: ${SOLIDCRAFT_GPU:-auto}
+    devices:
+      - /dev/dri
+    group_add:
+      - "44"
+      - "105"
+    ports:
+      - "8080:8080"
+
+  # Dedicated worker: claims jobs from the same Postgres queue (FOR UPDATE
+  # SKIP LOCKED), so scaling it out is adding replicas of this service.
+  # Bundles the CAD CLI (solvecraft-cli) for eval / snapshot / convert.
+  pdm-worker:
+    image: docker-pdm:${PDM_BUILD_TAG:-V.01-01}
+    restart: unless-stopped
+    command: pdm-server --listen 0.0.0.0:8081
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    environment:
+      PDM_DATABASE_URL: postgresql://pdm:pdm@postgres:5432/pdm
+      PDM_S3_ENDPOINT: http://minio:9000
+      PDM_S3_BUCKET: pdm
+      PDM_S3_ACCESS_KEY: pdm
+      PDM_S3_SECRET_KEY: pdmsecret
+      PDM_BUILD_TAG: ${PDM_BUILD_TAG:-V.01-01}
+      PDM_SOLVECRAFT_CLI: /usr/local/bin/solidcraft-cli
+      PDM_WORKER: "1"
+      PDM_WORKER_CONCURRENCY: ${PDM_WORKER_CONCURRENCY:-4}
+      SOLIDCRAFT_GPU: ${SOLIDCRAFT_GPU:-auto}
+    devices:
+      - /dev/dri
+    group_add:
+      - "44"
+      - "105"
+
+volumes:
+  pgdata:
+  miniodata:
