@@ -31,9 +31,11 @@ UUID PKs; `org_id` on every tenant-scoped table. Postgres 13+.
 ## Files & versions (the core)
 - **files** — one per item: `item_id`, `filename`, `mime_type`.
 - **file_blobs** — content-addressed: `org_id`, `sha256`, `size_bytes`, storage key.
-- **file_versions** — `file_id`, `seq` (monotonic), `blob_id`, `author_id`, `commit_message`,
-  `base_version_id` (for conflict detection), `native_format`, `measurements` (jsonb, from the worker),
-  `thumbnail_sha256`/`thumbnail_size_bytes` (a blob, PNG preview), `committed_at`.
+- **file_versions** — `file_id`, `seq` (monotonic per-save counter), `version` (major version,
+  bumped only on an explicit "save as new version"), `revision` (per-save counter within the
+  major version; e.g. V2 - R5 is the fifth save inside version 2), `blob_id`, `author_id`,
+  `commit_message`, `base_version_id` (for conflict detection), `native_format`, `measurements`
+  (jsonb, from the worker), `thumbnail_sha256`/`thumbnail_size_bytes` (a blob, PNG preview), `committed_at`.
 - **file_revisions** — named labels onto versions (`label`, e.g. `A`, `B`, `REL-1`).
 - **file_references** — cross-document refs (`pdm://`), where-used.
 - **file_locks** — exclusive checkout: `item_id`, `user_id`, `workstation`, `lease_expires_at`.
@@ -49,8 +51,12 @@ UUID PKs; `org_id` on every tenant-scoped table. Postgres 13+.
 - **Integration:** `integration_outbox` (event outbox for fan-out / webhooks).
 
 ## Invariants
-- A version is **immutable** once created; the head version per item = max `seq`.
-- Check-in is rejected (409) if `base_version` is stale or the blob's stored SHA doesn't verify.
+- A version row is **immutable** once created; the head per item = max `seq`.
+- Every check-in creates a new `file_versions` row: a plain save is the next `revision` of the
+  current `version`; "save as new version" bumps `version` and resets `revision` to 1.
+- Check-in is rejected (409) if `base_version` (a `seq`) is stale or the blob's stored SHA doesn't verify.
+- NC programs are flagged `outdated` only when a new major version is checked in; revisions
+  within a version stay compatible with the same manufacturing chain.
 - Part numbers are unique within their classification; allocation is atomic.
 - Org isolation: every read/write is filtered by the caller's `org_id`.
 

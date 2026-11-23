@@ -43,7 +43,10 @@ impl OnshapeSettings {
                 .get("default_project_id")
                 .and_then(Value::as_str)
                 .and_then(|s| Uuid::parse_str(s).ok()),
-            folder_sync_enabled: v.get("folder_sync_enabled").and_then(Value::as_bool).unwrap_or(false),
+            folder_sync_enabled: v
+                .get("folder_sync_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         }
     }
 
@@ -502,13 +505,26 @@ pub async fn picker(
 }
 
 pub async fn folder_name(settings: &OnshapeSettings, folder: &str) -> Result<String, PdmError> {
-    if !settings.configured() || folder.is_empty() || !folder.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(PdmError::Validation("Configure Onshape and enter a valid folder ID".into()));
+    if !settings.configured() || folder.is_empty() || !folder.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(PdmError::Validation(
+            "Configure Onshape and enter a valid folder ID".into(),
+        ));
     }
     let client = reqwest::Client::new();
-    let data = onshape_json(&client, settings, reqwest::Method::GET,
-        &format!("{}/api/folders/{folder}", settings.base_url), None).await?;
-    Ok(data.get("name").and_then(Value::as_str).unwrap_or(folder).to_string())
+    let data = onshape_json(
+        &client,
+        settings,
+        reqwest::Method::GET,
+        &format!("{}/api/folders/{folder}", settings.base_url),
+        None,
+    )
+    .await?;
+    Ok(data
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(folder)
+        .to_string())
 }
 
 fn is_direct_folder_document(document: &Value, folder: &str) -> bool {
@@ -518,57 +534,163 @@ fn is_direct_folder_document(document: &Value, folder: &str) -> bool {
 
 /// Import direct child documents; a document's parentId is checked explicitly
 /// because Onshape's search can include unrelated results.
-pub async fn sync_folder(state: &AppState, org: Uuid, user: Uuid, project: Uuid, folder: &str) -> Result<Value, PdmError> {
-    let settings = OnshapeSettings::from_json(&pdm_db::get_onshape_settings(&state.pool, org).await?);
-    if !settings.folder_sync_enabled { return Err(PdmError::BadRequest("Onshape folder sync is disabled".into())); }
+pub async fn sync_folder(
+    state: &AppState,
+    org: Uuid,
+    user: Uuid,
+    project: Uuid,
+    folder: &str,
+) -> Result<Value, PdmError> {
+    let settings =
+        OnshapeSettings::from_json(&pdm_db::get_onshape_settings(&state.pool, org).await?);
+    if !settings.folder_sync_enabled {
+        return Err(PdmError::BadRequest(
+            "Onshape folder sync is disabled".into(),
+        ));
+    }
     folder_name(&settings, folder).await?;
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build().map_err(http_err)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(http_err)?;
     let mut documents = Vec::new();
     let mut offset = 0;
     loop {
-        let url = format!("{}/api/documents?filter=5&parentId={folder}&limit=20&offset={offset}", settings.base_url);
+        let url = format!(
+            "{}/api/documents?filter=5&parentId={folder}&limit=20&offset={offset}",
+            settings.base_url
+        );
         let page = onshape_json(&client, &settings, reqwest::Method::GET, &url, None).await?;
-        let entries = page.get("items").and_then(Value::as_array).ok_or_else(|| PdmError::Internal("Onshape document listing has no items".into()))?;
-        documents.extend(entries.iter().filter(|d| is_direct_folder_document(d, folder)).cloned());
-        if page.get("next").and_then(Value::as_str).filter(|s| !s.is_empty()).is_none() { break; }
+        let entries = page
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| PdmError::Internal("Onshape document listing has no items".into()))?;
+        documents.extend(
+            entries
+                .iter()
+                .filter(|d| is_direct_folder_document(d, folder))
+                .cloned(),
+        );
+        if page
+            .get("next")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            break;
+        }
         offset += 20;
-        if offset > 20000 { return Err(PdmError::Internal("Onshape folder listing exceeds the sync limit".into())); }
+        if offset > 20000 {
+            return Err(PdmError::Internal(
+                "Onshape folder listing exceeds the sync limit".into(),
+            ));
+        }
     }
     let mut imported = 0usize;
     let mut errors = Vec::new();
     let mut conflicts = Vec::new();
     for doc in &documents {
-        let Some(did) = doc.get("id").and_then(Value::as_str) else { continue };
-        let full = match onshape_json(&client, &settings, reqwest::Method::GET, &format!("{}/api/documents/{did}", settings.base_url), None).await {
-            Ok(v) => v, Err(e) => { errors.push(format!("{did}: {e}")); continue; }
+        let Some(did) = doc.get("id").and_then(Value::as_str) else {
+            continue;
         };
-        let Some(wid) = full.get("defaultWorkspace").and_then(|x| x.get("id")).and_then(Value::as_str) else {
-            errors.push(format!("{did}: no default workspace")); continue;
+        let full = match onshape_json(
+            &client,
+            &settings,
+            reqwest::Method::GET,
+            &format!("{}/api/documents/{did}", settings.base_url),
+            None,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(format!("{did}: {e}"));
+                continue;
+            }
+        };
+        let Some(wid) = full
+            .get("defaultWorkspace")
+            .and_then(|x| x.get("id"))
+            .and_then(Value::as_str)
+        else {
+            errors.push(format!("{did}: no default workspace"));
+            continue;
         };
         let entries = match picker(state, org, did, wid).await {
-            Ok(v) => v, Err(e) => { errors.push(format!("{did}: {e}")); continue; }
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(format!("{did}: {e}"));
+                continue;
+            }
         };
-        for el in entries.get("elements").and_then(Value::as_array).into_iter().flatten() {
+        for el in entries
+            .get("elements")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let eid = el.get("id").and_then(Value::as_str).unwrap_or("");
             let typ = el.get("type").and_then(Value::as_str).unwrap_or("");
             let mut targets: Vec<(Option<&str>, &str)> = Vec::new();
-            if typ == "assembly" { targets.push((None, el.get("name").and_then(Value::as_str).unwrap_or("Assembly"))); }
+            if typ == "assembly" {
+                targets.push((
+                    None,
+                    el.get("name").and_then(Value::as_str).unwrap_or("Assembly"),
+                ));
+            }
             if typ == "partstudio" {
-                for p in el.get("parts").and_then(Value::as_array).into_iter().flatten() {
-                    if let Some(id) = p.get("id").and_then(Value::as_str) { targets.push((Some(id), p.get("name").and_then(Value::as_str).unwrap_or(id))); }
+                for p in el
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(id) = p.get("id").and_then(Value::as_str) {
+                        targets.push((
+                            Some(id),
+                            p.get("name").and_then(Value::as_str).unwrap_or(id),
+                        ));
+                    }
                 }
             }
             for (part, name) in targets {
-                let current = OnshapeSettings::from_json(&pdm_db::get_onshape_settings(&state.pool, org).await?);
-                if !current.folder_sync_enabled { return Err(PdmError::BadRequest("Onshape folder sync was disabled".into())); }
-                let existing = pdm_db::find_item_by_onshape(&state.pool, org, did, eid, part).await?;
-                if let Some(item) = &existing {
-                    if item.project_id != project { conflicts.push(format!("{name}: already in another project ({})", item.part_number)); continue; }
+                let current = OnshapeSettings::from_json(
+                    &pdm_db::get_onshape_settings(&state.pool, org).await?,
+                );
+                if !current.folder_sync_enabled {
+                    return Err(PdmError::BadRequest(
+                        "Onshape folder sync was disabled".into(),
+                    ));
                 }
-                let request = SendReq { document_id: did.into(), workspace_id: wid.into(), element_id: eid.into(), element_type: typ.into(),
-                    project_id: Some(project), item_id: existing.map(|i| i.id), part_number: None, description: Some(name.into()),
-                    format: "STEP".into(), part_id: part.map(str::to_string), part_name: None, source_element_id: None,
-                    source_document_id: None, source_workspace_id: None, source_workspace_type: None, source_configuration: None };
+                let existing =
+                    pdm_db::find_item_by_onshape(&state.pool, org, did, eid, part).await?;
+                if let Some(item) = &existing
+                    && item.project_id != project
+                {
+                    conflicts.push(format!(
+                        "{name}: already in another project ({})",
+                        item.part_number
+                    ));
+                    continue;
+                }
+                let request = SendReq {
+                    document_id: did.into(),
+                    workspace_id: wid.into(),
+                    element_id: eid.into(),
+                    element_type: typ.into(),
+                    project_id: Some(project),
+                    item_id: existing.map(|i| i.id),
+                    part_number: None,
+                    description: Some(name.into()),
+                    format: "STEP".into(),
+                    part_id: part.map(str::to_string),
+                    part_name: None,
+                    source_element_id: None,
+                    source_document_id: None,
+                    source_workspace_id: None,
+                    source_workspace_type: None,
+                    source_configuration: None,
+                };
                 match send_to_pdm(state, org, user, &settings, request).await {
                     Ok(_) => imported += 1,
                     Err(e) => errors.push(format!("{name}: {e}")),
@@ -576,7 +698,9 @@ pub async fn sync_folder(state: &AppState, org: Uuid, user: Uuid, project: Uuid,
             }
         }
     }
-    Ok(json!({"documents": documents.len(), "imported": imported, "conflicts": conflicts, "errors": errors}))
+    Ok(
+        json!({"documents": documents.len(), "imported": imported, "conflicts": conflicts, "errors": errors}),
+    )
 }
 
 /// Export the Onshape element and check it in as a PDM version.
@@ -726,6 +850,7 @@ pub async fn send_to_pdm(
         &format!("Onshape {} {}/{}", format, req.document_id, req.element_id),
         head.as_ref().map(|v| v.id),
         "",
+        false,
     )
     .await?;
     let job_payload = json!({ "version_id": version.id, "item_id": item_id });
@@ -764,15 +889,27 @@ pub async fn send_to_pdm(
 
 #[cfg(test)]
 mod tests {
-    use super::{translation_url, is_direct_folder_document};
+    use super::{is_direct_folder_document, translation_url};
     use serde_json::json;
 
     #[test]
     fn folder_membership_excludes_unrelated_documents_and_folders() {
-        assert!(is_direct_folder_document(&json!({"jsonType":"document-summary","parentId":"folder"}), "folder"));
-        assert!(!is_direct_folder_document(&json!({"jsonType":"document-summary","parentId":"nested"}), "folder"));
-        assert!(!is_direct_folder_document(&json!({"jsonType":"folder","parentId":"folder"}), "folder"));
-        assert!(!is_direct_folder_document(&json!({"jsonType":"document-summary"}), "folder"));
+        assert!(is_direct_folder_document(
+            &json!({"jsonType":"document-summary","parentId":"folder"}),
+            "folder"
+        ));
+        assert!(!is_direct_folder_document(
+            &json!({"jsonType":"document-summary","parentId":"nested"}),
+            "folder"
+        ));
+        assert!(!is_direct_folder_document(
+            &json!({"jsonType":"folder","parentId":"folder"}),
+            "folder"
+        ));
+        assert!(!is_direct_folder_document(
+            &json!({"jsonType":"document-summary"}),
+            "folder"
+        ));
     }
 
     #[test]

@@ -23,6 +23,7 @@ repository = "https://github.com/ocpistol-bec/foundrypdm"
 # internal
 pdm-core = { path = "crates/pdm-core" }
 pdm-db = { path = "crates/pdm-db" }
+pdm-nesting = { path = "crates/pdm-nesting" }
 pdm-storage = { path = "crates/pdm-storage" }
 pdm-api = { path = "crates/pdm-api" }
 pdm-worker = { path = "crates/pdm-worker" }

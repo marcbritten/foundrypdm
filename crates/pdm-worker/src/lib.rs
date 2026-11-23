@@ -14,6 +14,18 @@
 //!   (`thumbnail_error`) instead of dead-lettering; non-CAD files keep a clean
 //!   "no preview" state.
 //! - `cad.convert` restates convertible CAD as a stored STEP (see `convert_cad`).
+//! - `cad.solidcraft` saves a native `.sc` design beside its source version:
+//!   Dutchman (the release the org's settings reference — newest stable,
+//!   nightly or a pinned tag such as the Onshape-preview builds — pulled on
+//!   demand when the binary is missing or stale) decodes the native formats —
+//!   Fusion, Inventor, SolidWorks, FreeCAD, CATIA, Rhino, Creo View, ACIS,
+//!   STEP, Onshape bundles — into a design with editable feature history where
+//!   it maps; the SolidCraft CLI restates the remainder (meshes, IGES) without
+//!   history (see `convert_to_solidcraft`).
+//! - `onshape.import` fetches an Onshape Part Studio into the vault as an
+//!   `.onshape-bundle` version via `dutchman onshape fetch` with the org's
+//!   Onshape keys, then enqueues the `cad.solidcraft` conversion (see
+//!   `onshape_import`).
 //!
 //! Unknown job kinds are marked done (stub) so enqueued follow-up work cannot
 //! jam the queue.
@@ -50,6 +62,16 @@ pub struct WorkerConfig {
     /// `preview.render` jobs are marked done with a `skipped` note instead of
     /// failing.
     pub solve_cli: Option<String>,
+    /// Path to the `dutchman` binary (native CAD → SolidCraft with feature
+    /// history); unset → `PDM_DUTCHMAN_CLI`'s default location, which the PDM
+    /// pulls from the newest GitHub release on demand when missing.
+    pub dutchman_cli: Option<String>,
+    /// Wall-clock limit for one Dutchman conversion (feature-tree rebuilds and
+    /// history verification are slower than a CLI restate).
+    pub dutchman_timeout: Duration,
+    /// Path to the pinned `sparrow` nesting binary; unset → laser.nest jobs
+    /// fail explicitly (an absent engine must not fake a layout).
+    pub sparrow_cli: Option<String>,
 }
 
 impl WorkerConfig {
@@ -65,6 +87,13 @@ impl WorkerConfig {
             batch_size: parse("PDM_WORKER_BATCH", 5) as i64,
             concurrency: parse("PDM_WORKER_CONCURRENCY", 2) as usize,
             solve_cli: std::env::var("PDM_SOLVECRAFT_CLI")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            dutchman_cli: std::env::var("PDM_DUTCHMAN_CLI")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            dutchman_timeout: Duration::from_secs(parse("PDM_DUTCHMAN_TIMEOUT_SECS", 1800)),
+            sparrow_cli: std::env::var("PDM_SPARROW_CLI")
                 .ok()
                 .filter(|s| !s.is_empty()),
         }
@@ -158,6 +187,18 @@ async fn run_job_kind(
             convert_to_solidcraft(pool, store, cfg, job).await?;
             Ok(Outcome::Done)
         }
+        "sheet.flat-pattern" => {
+            generate_flat_pattern(pool, store, cfg, job).await?;
+            Ok(Outcome::Done)
+        }
+        "onshape.import" => {
+            onshape_import(pool, store, cfg, job).await?;
+            Ok(Outcome::Done)
+        }
+        "laser.nest" => {
+            run_laser_nest(pool, store, cfg, job).await?;
+            Ok(Outcome::Done)
+        }
         other => {
             debug!(kind = other, "unknown job kind; marking done");
             Ok(Outcome::Done)
@@ -167,7 +208,7 @@ async fn run_job_kind(
 
 async fn run_job(pool: &PgPool, store: &Arc<BlobStore>, cfg: &WorkerConfig, job: &Job) {
     let result = match run_job_kind(pool, store, cfg, job).await {
-        Ok(Outcome::Measurements(m)) => store_measurements(pool, job, m).await,
+        Ok(Outcome::Measurements(m)) => persist_measurements(pool, job, m).await,
         Ok(Outcome::Thumbnail { sha256, size_bytes }) => {
             persist_thumbnail(pool, job, &sha256, size_bytes).await
         }
@@ -208,6 +249,13 @@ async fn run_job(pool: &PgPool, store: &Arc<BlobStore>, cfg: &WorkerConfig, job:
             .execute(pool)
             .await;
         warn!(job = %job.id, error = %err, "job dead-lettered");
+        // A terminally failed laser.nest job leaves the nest "running" otherwise.
+        if job.kind == "laser.nest"
+            && let Some(nest_id) = nest_id_from_job(job)
+        {
+            let _ = pdm_db::set_laser_nest_status(pool, job.org_id, nest_id, "failed", Some(&err))
+                .await;
+        }
     }
 }
 
@@ -216,6 +264,48 @@ fn version_id_from_job(job: &Job) -> Option<Uuid> {
         .get("version_id")
         .and_then(|v| v.as_str())
         .and_then(|s| Uuid::parse_str(s).ok())
+}
+
+fn nest_id_from_job(job: &Job) -> Option<Uuid> {
+    job.payload
+        .get("nest_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+}
+
+/// Persist analysis results; when the design's timeline contains sheet-metal
+/// features, flag the item as a sheet-metal part (unless a spec exists).
+async fn persist_measurements(
+    pool: &PgPool,
+    job: &Job,
+    measurements: serde_json::Value,
+) -> Result<(), PdmError> {
+    if let (Some(item_id), true) = (
+        item_id_from_job(job),
+        pdm_core::measurements_have_sheet_metal_features(&measurements),
+    ) {
+        let flagged = pdm_db::auto_flag_sheet_metal(pool, job.org_id, item_id).await?;
+        if flagged {
+            info!(item = %item_id, "sheet-metal features in design timeline; item flagged as sheet metal");
+        }
+        // Generate the flat pattern for this version too; a failed generation
+        // is retried by the job's normal attempts and can be re-requested from
+        // the item's Sheet metal tab.
+        if let Some(version_id) = version_id_from_job(job) {
+            let _ = pdm_db::enqueue_job(
+                pool,
+                job.org_id,
+                "sheet.flat-pattern",
+                &serde_json::json!({
+                    "version_id": version_id,
+                    "item_id": item_id,
+                    "filename": job.payload.get("filename").and_then(|v| v.as_str()).unwrap_or_default(),
+                }),
+            )
+            .await;
+        }
+    }
+    store_measurements(pool, job, measurements).await
 }
 
 async fn store_measurements(
@@ -378,9 +468,527 @@ async fn analyze_design(
     serde_json::from_str(&stdout).map_err(|e| PdmError::Internal(format!("bad eval output: {e}")))
 }
 
+/// `sheet.flat-pattern`: generate the flat-pattern DXF for a version's design
+/// via `solidcraft-cli run <script> --in <design>` (`sheet.export_dxf`) and
+/// store the result on the item's sheet-metal spec.
+async fn generate_flat_pattern(
+    pool: &PgPool,
+    store: &Arc<BlobStore>,
+    cfg: &WorkerConfig,
+    job: &Job,
+) -> Result<(), PdmError> {
+    let version_id = version_id_from_job(job)
+        .ok_or_else(|| PdmError::Validation("missing version_id".into()))?;
+    let Some(cli) = cfg.solve_cli.as_deref() else {
+        debug!(
+            version = %version_id,
+            "sheet.flat-pattern skipped: solvecraft-cli not configured"
+        );
+        return Ok(());
+    };
+    let source = pdm_db::version_source(pool, job.org_id, version_id)
+        .await?
+        .ok_or_else(|| PdmError::NotFound("source version".into()))?;
+    let file = committed_file(pool, job).await?;
+    let version = pdm_db::get_version(pool, version_id)
+        .await?
+        .ok_or_else(|| PdmError::NotFound("version".into()))?;
+    let blob = pdm_db::get_blob_by_id(pool, version.blob_id)
+        .await?
+        .ok_or_else(|| PdmError::NotFound("source blob".into()))?;
+
+    // Design source: a native SolidCraft design checked in directly, otherwise
+    // this version's converted `.sc` artifact (imported CAD and the like).
+    let design_data: Vec<u8> = if matches!(file.ext.as_str(), "sc" | "solidcraft" | "solvecraft") {
+        store
+            .get_by_sha(&blob.sha256)
+            .await
+            .map_err(|e| PdmError::Storage(e.to_string()))?
+    } else {
+        let artifact = pdm_db::get_solidcraft_artifact(pool, version_id).await?;
+        let sha = artifact.sha256.ok_or_else(|| {
+            PdmError::Validation(format!(
+                "flat-pattern generation needs a SolidCraft design: .{} has no converted .sc \
+                 artifact — run Convert to SolidCraft first, or attach the DXF manually",
+                file.ext
+            ))
+        })?;
+        store
+            .get_by_sha(&sha)
+            .await
+            .map_err(|e| PdmError::Storage(e.to_string()))?
+    };
+
+    let work = tempfile::Builder::new()
+        .prefix("pdm-flat-")
+        .tempdir()
+        .map_err(|e| PdmError::Storage(e.to_string()))?;
+    let design = work.path().join("design.sc");
+    let script = work.path().join("export.json");
+    let out = work.path().join("flat.dxf");
+    let script_text = serde_json::json!({
+        "commands": [{
+            "command": "sheet.export_dxf",
+            "params": { "path": out.to_str().unwrap_or_default() }
+        }]
+    })
+    .to_string();
+    tokio::fs::write(&design, &design_data)
+        .await
+        .map_err(|e| PdmError::Storage(e.to_string()))?;
+    tokio::fs::write(&script, script_text)
+        .await
+        .map_err(|e| PdmError::Storage(e.to_string()))?;
+
+    let cmd = tokio::process::Command::new(cli)
+        .arg("run")
+        .arg(&script)
+        .arg("--in")
+        .arg(&design)
+        .output()
+        .await
+        .map_err(|e| PdmError::Internal(e.to_string()))?;
+    if !cmd.status.success() {
+        let stderr = String::from_utf8_lossy(&cmd.stderr);
+        return Err(PdmError::Internal(format!(
+            "solidcraft-cli run (sheet.export_dxf) failed: {}",
+            stderr.trim()
+        )));
+    }
+    let dxf = tokio::fs::read(&out)
+        .await
+        .map_err(|e| PdmError::Storage(format!("flat pattern not written: {e}")))?;
+    if dxf.is_empty() {
+        return Err(PdmError::Internal("flat pattern DXF is empty".into()));
+    }
+    let (sha, size) = store
+        .put_content_addressed(&dxf)
+        .await
+        .map_err(|e| PdmError::Storage(e.to_string()))?;
+    let size_i64 =
+        i64::try_from(size).map_err(|_| PdmError::Validation("flat pattern too large".into()))?;
+    pdm_db::upload_blob(pool, job.org_id, &sha, size_i64, &sha).await?;
+    pdm_db::set_item_flat_pattern(pool, job.org_id, source.item_id, &sha).await?;
+    // Record a revision-bound artifact so laser nests can pin this exact version.
+    let _ = pdm_db::create_flat_pattern_artifact(
+        pool,
+        job.org_id,
+        source.item_id,
+        version_id,
+        &sha,
+        size_i64,
+        "generated",
+        "solidcraft-cli sheet.export_dxf",
+        "mm",
+        "generated flat pattern",
+    )
+    .await;
+    info!(item = %source.item_id, version = %version_id, "flat pattern generated and attached");
+    Ok(())
+}
+
+/// `laser.nest`: run the pinned Sparrow engine to nest a stored laser nest,
+/// validate the layout, and persist per-sheet DXF + preview + manifest blobs and
+/// the placement rows. Idempotent: a terminal nest is not re-run.
+async fn run_laser_nest(
+    pool: &PgPool,
+    store: &Arc<BlobStore>,
+    cfg: &WorkerConfig,
+    job: &Job,
+) -> Result<(), PdmError> {
+    let nest_id = job
+        .payload
+        .get("nest_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| PdmError::Validation("missing nest_id".into()))?;
+    let org = job.org_id;
+    let nest = pdm_db::get_laser_nest(pool, nest_id, org)
+        .await?
+        .ok_or_else(|| PdmError::NotFound("laser nest".into()))?;
+    if matches!(nest.status.as_str(), "completed" | "cancelled") {
+        debug!(nest = %nest_id, "laser.nest skipped: already {}", nest.status);
+        return Ok(());
+    }
+    let _ = pdm_db::set_laser_nest_status(pool, org, nest_id, "running", None).await;
+    let sparrow_bin = cfg
+        .sparrow_cli
+        .clone()
+        .ok_or_else(|| PdmError::Internal("laser.nest: PDM_SPARROW_CLI not configured".into()))?;
+
+    let part_rows = pdm_db::list_laser_nest_parts(pool, nest_id, org).await?;
+    let mut geom_parts: Vec<pdm_nesting::part::Part> = Vec::new();
+    let mut lines: Vec<pdm_nesting::batch::NestLine> = Vec::new();
+    let mut item_by_index: Vec<(Uuid, Uuid)> = Vec::new();
+    let mut resolved_layers: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
+    for row in &part_rows {
+        let blob = pdm_db::get_blob_by_sha(pool, org, &row.dxf_sha)
+            .await?
+            .ok_or_else(|| {
+                PdmError::NotFound(format!("flat-pattern blob for {}", row.part_number))
+            })?;
+        let data = store
+            .get_by_sha(&blob.sha256)
+            .await
+            .map_err(|e| PdmError::Storage(e.to_string()))?;
+        let text = String::from_utf8(data).map_err(|e| {
+            PdmError::Validation(format!(
+                "{}: flat pattern is not UTF-8: {e}",
+                row.part_number
+            ))
+        })?;
+        let dxf = pdm_nesting::dxf::parse(&text)
+            .map_err(|e| PdmError::Validation(format!("{}: {e}", row.part_number)))?;
+        let prims = pdm_nesting::dxf::to_mm(&dxf, &row.unit, &nest.default_part_unit);
+        // Resolve layers: "auto" follows flat-pattern conventions (CUT/OUTLINE
+        // -> cut, BEND_*/mark/etch -> marking); otherwise the explicit layer.
+        let (cut_layers, mark_layers) = if row
+            .layer_cut
+            .eq_ignore_ascii_case(pdm_nesting::part::LAYER_CUT_AUTO)
+        {
+            pdm_nesting::part::auto_layers(&dxf, &row.layers_mark.0)
+        } else {
+            (vec![row.layer_cut.clone()], row.layers_mark.0.clone())
+        };
+        resolved_layers.push((
+            row.part_number.clone(),
+            cut_layers.clone(),
+            mark_layers.clone(),
+        ));
+        let mut assembled = pdm_nesting::part::assemble(
+            &prims,
+            &cut_layers,
+            &mark_layers,
+            nest.chord_tol_mm,
+            nest.join_tol_mm,
+        )
+        .map_err(|e| PdmError::Validation(format!("{}: {:?}", row.part_number, e)))?;
+        if assembled.parts.len() != 1 {
+            return Err(PdmError::Validation(format!(
+                "{}: expected exactly one outer island per part, found {}",
+                row.part_number,
+                assembled.parts.len()
+            )));
+        }
+        item_by_index.push((row.item_id, row.file_version_id));
+        let grain = match row.part_grain.as_str() {
+            "along_length" => pdm_nesting::GrainDir::AlongLength,
+            "along_width" => pdm_nesting::GrainDir::AlongWidth,
+            _ => pdm_nesting::GrainDir::Any,
+        };
+        lines.push(pdm_nesting::batch::NestLine {
+            part: geom_parts.len(),
+            quantity: row.quantity.max(1) as u64,
+            allow_mirror: row.allow_mirror,
+            grain,
+        });
+        // "mirror of the original" lines bake the reflection into the geometry.
+        let part = assembled
+            .parts
+            .pop()
+            .ok_or_else(|| PdmError::Validation("no part to nest".into()))?;
+        let part = if row.mirror {
+            pdm_nesting::part::mirror_part(&part)
+        } else {
+            part
+        };
+        geom_parts.push(part);
+    }
+
+    let sheet_grain = match nest.grain_direction.as_str() {
+        "along_width" => pdm_nesting::GrainDir::AlongWidth,
+        "any" => pdm_nesting::GrainDir::Any,
+        _ => pdm_nesting::GrainDir::AlongLength,
+    };
+    // Spacing: the new directional values win; legacy nests (0023 backfill)
+    // fall back to the uniform part_gap.
+    let (gap_x, gap_y) = if nest.spacing_x_mm > 0.0 || nest.spacing_y_mm > 0.0 {
+        (nest.spacing_x_mm, nest.spacing_y_mm)
+    } else {
+        (nest.part_gap_mm, nest.part_gap_mm)
+    };
+    let ncfg = pdm_nesting::NestConfig {
+        stock_width: nest.stock_width_mm,
+        stock_height: nest.stock_height_mm,
+        edge_margin: nest.edge_margin_mm,
+        gap_x,
+        gap_y,
+        sheet_grain,
+        chord_tol: nest.chord_tol_mm,
+        join_tol: nest.join_tol_mm,
+        time_budget_sec: nest.time_budget_sec.max(0) as u32,
+        attempt_limit_sec: nest.attempt_limit_sec.max(0) as u32,
+        max_sheets: nest.max_sheets.max(0) as u32,
+        allowed_rotations: nest.allowed_rotations.0.clone(),
+        ..Default::default()
+    };
+
+    let bin = sparrow_bin.clone();
+    let seed = nest.seed;
+    let parts = std::mem::take(&mut geom_parts);
+    let lines = std::mem::take(&mut lines);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4)
+        .min(8);
+    let solve_parts = parts.clone();
+    let solve_lines = lines.clone();
+    let solve_cfg = ncfg.clone();
+    let solve_bin = bin.clone();
+    let solve = tokio::task::spawn_blocking(move || {
+        let oracle = |inst: &pdm_nesting::solver::SolverInstance| {
+            run_sparrow_blocking(&solve_bin, inst, seed, solve_cfg.attempt_limit_sec, workers)
+        };
+        pdm_nesting::batch::run_batch(&solve_lines, &solve_parts, &solve_cfg, oracle)
+    })
+    .await
+    .map_err(|e| PdmError::Internal(format!("nest spawn_blocking: {e}")))?
+    .map_err(|e| PdmError::Internal(e.to_string()))?;
+
+    let mut sheet_rows = Vec::new();
+    for (idx, sheet) in solve.iter().enumerate() {
+        let nsheet = pdm_db::create_laser_nest_sheet(pool, org, nest_id, idx as i32).await?;
+        let dxf_text = pdm_nesting::sheet::export_sheet_dxf(&sheet.layout, &parts, &ncfg);
+        let (dxf_sha, dxf_size) = put_bytes(store, pool, org, dxf_text.as_bytes()).await?;
+        let svg_text = pdm_nesting::sheet::export_sheet_svg(&sheet.layout, &parts, &ncfg);
+        let (svg_sha, _) = put_bytes(store, pool, org, svg_text.as_bytes()).await?;
+        for pl in &sheet.layout.placements {
+            let (item_id, file_version_id) = item_by_index[pl.part_index];
+            pdm_db::insert_laser_nest_placement(
+                pool,
+                org,
+                nsheet.id,
+                nest_id,
+                pl.part_index as i32,
+                pl.copy_index as i32,
+                item_id,
+                file_version_id,
+                pl.transform.reflected,
+                pl.transform.rotation_deg,
+                pl.transform.tx,
+                pl.transform.ty,
+            )
+            .await?;
+        }
+        pdm_db::set_laser_nest_sheet_output(
+            pool,
+            org,
+            nsheet.id,
+            &dxf_sha,
+            dxf_size,
+            Some(&svg_sha),
+            Some(sheet.strip_width),
+            Some(sheet.layout.utilization),
+            None,
+            None,
+            sheet.layout.placements.len() as i32,
+        )
+        .await?;
+        sheet_rows.push(nsheet);
+    }
+
+    // Manifest (provenance + full settings + outputs).
+    let manifest = nest_manifest(
+        &nest,
+        &part_rows,
+        &resolved_layers,
+        &sheet_rows,
+        &solve,
+        seed,
+        &bin,
+    );
+    let manifest_bytes =
+        serde_json::to_vec_pretty(&manifest).map_err(|e| PdmError::Internal(e.to_string()))?;
+    let _ = put_bytes(store, pool, org, &manifest_bytes).await?;
+
+    // Recheck staleness: a source version that is no longer the head invalidates
+    // the result (without rewriting it).
+    let stale = stale_versions(pool, org, &part_rows).await?;
+    let _ = pdm_db::set_laser_nest_status(pool, org, nest_id, "completed", None).await;
+    for (version_id, reason) in &stale {
+        let _ = pdm_db::mark_laser_nests_stale_for_version(pool, org, *version_id, reason).await;
+    }
+    info!(
+        nest = %nest_id,
+        sheets = solve.len(),
+        stale = !stale.is_empty(),
+        "laser nest completed"
+    );
+    Ok(())
+}
+
+/// Store a content-addressed byte blob and record it in the DB.
+async fn put_bytes(
+    store: &Arc<BlobStore>,
+    pool: &PgPool,
+    org: Uuid,
+    bytes: &[u8],
+) -> Result<(String, i64), PdmError> {
+    let (sha, size) = store
+        .put_content_addressed(bytes)
+        .await
+        .map_err(|e| PdmError::Storage(e.to_string()))?;
+    let size_i64 =
+        i64::try_from(size).map_err(|_| PdmError::Validation("artifact too large".into()))?;
+    pdm_db::upload_blob(pool, org, &sha, size_i64, &sha).await?;
+    Ok((sha, size_i64))
+}
+
+/// Run the pinned sparrow binary on one instance, synchronously (called inside
+/// `spawn_blocking`). Returns the parsed solution.
+fn run_sparrow_blocking(
+    bin: &str,
+    inst: &pdm_nesting::solver::SolverInstance,
+    seed: Option<i64>,
+    attempt_limit: u32,
+    workers: u32,
+) -> Result<pdm_nesting::solver::SolverSolution, pdm_nesting::solver::SolverError> {
+    use pdm_nesting::solver::SolverError;
+    let work = tempfile::TempDir::new().map_err(|e| SolverError::Malformed(e.to_string()))?;
+    std::fs::create_dir_all(work.path().join("output"))
+        .map_err(|e| SolverError::Malformed(e.to_string()))?;
+    let input = work.path().join("inst.json");
+    std::fs::write(&input, inst.to_json()).map_err(|e| SolverError::Malformed(e.to_string()))?;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("-i")
+        .arg(&input)
+        .arg("-t")
+        .arg(attempt_limit.to_string());
+    if let Some(s) = seed {
+        cmd.arg("-s").arg(s.to_string());
+    }
+    if workers > 0 {
+        cmd.arg("--workers").arg(workers.to_string());
+    }
+    cmd.current_dir(work.path());
+    let out = cmd
+        .output()
+        .map_err(|e| SolverError::Malformed(format!("spawn sparrow: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let line = stderr
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("no stderr");
+        return Err(SolverError::Malformed(format!("sparrow failed: {line}")));
+    }
+    let json_path = work
+        .path()
+        .join("output")
+        .join(format!("final_{}.json", inst.name));
+    let text = std::fs::read_to_string(&json_path)
+        .map_err(|e| SolverError::Malformed(format!("no final json: {e}")))?;
+    pdm_nesting::solver::parse_solution(&text)
+}
+
+/// For each part, the referenced version is stale if it is no longer the item's
+/// head version. Returns (version_id, reason) for every stale part.
+async fn stale_versions(
+    pool: &PgPool,
+    org: Uuid,
+    part_rows: &[pdm_core::LaserNestPart],
+) -> Result<Vec<(Uuid, String)>, PdmError> {
+    let mut out = Vec::new();
+    for row in part_rows {
+        let file = match pdm_db::get_file(pool, row.item_id).await? {
+            Some(f) => f,
+            None => continue,
+        };
+        let head = match pdm_db::get_head_version(pool, file.id).await? {
+            Some(h) => h,
+            None => continue,
+        };
+        if head.id != row.file_version_id {
+            out.push((
+                row.file_version_id,
+                format!(
+                    "source version for {} is no longer the head (now V{}-R{})",
+                    row.part_number, head.version, head.revision
+                ),
+            ));
+        }
+    }
+    let _ = org;
+    Ok(out)
+}
+
+fn nest_manifest(
+    nest: &pdm_core::LaserNest,
+    part_rows: &[pdm_core::LaserNestPart],
+    resolved_layers: &[(String, Vec<String>, Vec<String>)],
+    sheet_rows: &[pdm_core::LaserNestSheet],
+    solve: &[pdm_nesting::batch::BatchSheet],
+    seed: Option<i64>,
+    bin: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "pdm.laserNestManifest",
+        "version": 1,
+        "nest": {
+            "id": nest.id,
+            "name": nest.name,
+            "status": nest.status,
+            "material": nest.material,
+            "thickness_mm": nest.thickness_mm,
+            "stock_mm": { "width": nest.stock_width_mm, "length": nest.stock_height_mm },
+            "edge_margin_mm": nest.edge_margin_mm,
+            "part_gap_mm": nest.part_gap_mm,
+            "spacing_x_mm": nest.spacing_x_mm,
+            "spacing_y_mm": nest.spacing_y_mm,
+            "grain_direction": nest.grain_direction,
+            "chord_tol_mm": nest.chord_tol_mm,
+            "join_tol_mm": nest.join_tol_mm,
+            "default_part_unit": nest.default_part_unit,
+            "allowed_rotations": nest.allowed_rotations,
+            "seed": seed,
+            "solver_version": nest.solver_version,
+            "engine_build": nest.engine_build,
+        },
+        "parts": part_rows.iter().enumerate().map(|(i, p)| {
+            let (rl_cut, rl_mark) = resolved_layers
+                .get(i)
+                .map(|(_, c, m)| (c.clone(), m.clone()))
+                .unwrap_or_else(|| (vec![p.layer_cut.clone()], p.layers_mark.0.clone()));
+            serde_json::json!({
+                "item_id": p.item_id,
+                "file_version_id": p.file_version_id,
+                "part_number": p.part_number,
+                "revision": p.revision_label,
+                "dxf_sha": p.dxf_sha,
+                "quantity": p.quantity,
+                "layer_cut": p.layer_cut,
+                "layers_mark": p.layers_mark,
+                "resolved_cut_layers": rl_cut,
+                "resolved_mark_layers": rl_mark,
+                "unit": p.unit,
+                "mirror": p.mirror,
+                "allow_mirror": p.allow_mirror,
+                "part_grain": p.part_grain,
+            })
+        }).collect::<Vec<_>>(),
+        "sheets": sheet_rows.iter().zip(solve.iter()).map(|(row, s)| serde_json::json!({
+            "sheet_index": row.sheet_index,
+            "dxf_sha": row.dxf_sha,
+            "preview_sha": row.preview_sha,
+            "strip_width_mm": s.strip_width,
+            "utilization": s.layout.utilization,
+            "placed_count": s.layout.placements.len(),
+            "placements": s.layout.placements.iter().map(|pl| serde_json::json!({
+                "part_index": pl.part_index,
+                "copy_index": pl.copy_index,
+                "reflected": pl.transform.reflected,
+                "rotation_deg": pl.transform.rotation_deg,
+                "tx": pl.transform.tx,
+                "ty": pl.transform.ty,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "engine": { "binary": bin }
+    })
+}
+
 /// A CLI failure. `Fatal`: the CLI ran and refused the file (or wrote nothing) —
 /// the version records the reason and the preview stops there. `Transient`:
-/// the CLI could not be run at all — the job's normal retry applies.
+/// the CLI could not be run at all; the job's normal retry applies.
 #[derive(Debug)]
 enum CliFailure {
     Fatal(String),
@@ -426,7 +1034,10 @@ async fn cli_snapshot(
 ) -> Result<Vec<u8>, CliFailure> {
     match cli_snapshot_attempt(cli, in_path, out_png, gpu_policy, style, false).await {
         Err(CliFailure::Fatal(message))
-            if style != "viewport" && message.contains("product image exceeds its triangle/appearance/polyline admission cap") =>
+            if style != "viewport"
+                && message.contains(
+                    "product image exceeds its triangle/appearance/polyline admission cap",
+                ) =>
         {
             match cli_snapshot_attempt(cli, in_path, out_png, gpu_policy, "viewport", true).await {
                 Ok(png) => Ok(png),
@@ -757,6 +1368,12 @@ async fn convert_cad(
 }
 
 /// Save a native artifact alongside its source; never change the committed head.
+///
+/// The file's format picks the converter ([`pdm_core::sc_converter`]): Dutchman
+/// decodes the native CAD formats into a design with editable feature history
+/// where it maps (pulling the newest GitHub release on demand when its binary
+/// is missing); the SolidCraft CLI restates the remainder (meshes, IGES) as
+/// geometry only.
 async fn convert_to_solidcraft(
     pool: &PgPool,
     store: &Arc<BlobStore>,
@@ -765,19 +1382,15 @@ async fn convert_to_solidcraft(
 ) -> Result<(), PdmError> {
     let version_id = version_id_from_job(job)
         .ok_or_else(|| PdmError::Validation("missing version_id".into()))?;
-    let cli = cfg
-        .solve_cli
-        .as_deref()
-        .ok_or_else(|| PdmError::BadRequest("SolidCraft CLI is not configured".into()))?;
     let source = pdm_db::version_source(pool, job.org_id, version_id)
         .await?
         .ok_or_else(|| PdmError::NotFound("source version".into()))?;
     let file = committed_file(pool, job).await?;
-    if !pdm_core::can_convert_to_solidcraft(&file.filename) {
+    let Some(converter) = pdm_core::sc_converter(&file.filename) else {
         return Err(PdmError::Validation(
             "file type is not supported for SolidCraft conversion".into(),
         ));
-    }
+    };
     let version = pdm_db::get_version(pool, version_id)
         .await?
         .ok_or_else(|| PdmError::NotFound("source version".into()))?;
@@ -803,26 +1416,55 @@ async fn convert_to_solidcraft(
     tokio::fs::write(&input, data)
         .await
         .map_err(|e| PdmError::Storage(e.to_string()))?;
-    let result = tokio::time::timeout(
-        Duration::from_secs(120),
-        tokio::process::Command::new(cli)
-            .kill_on_drop(true)
-            .arg("run")
-            .arg(&input)
-            .arg("--save")
-            .arg(&output)
-            .arg("--quiet")
-            .output(),
-    )
-    .await
-    .map_err(|_| PdmError::Internal("SolidCraft conversion timed out".into()))?
-    .map_err(|e| PdmError::Internal(format!("running SolidCraft conversion: {e}")))?;
-    if !result.status.success() {
-        return Err(PdmError::Validation(format!(
-            "SolidCraft conversion failed: {}",
-            cli_error_line(&result.stderr, &result.stdout)
-        )));
+
+    let settings = pdm_db::get_dutchman_settings(pool, job.org_id).await?;
+    match converter {
+        pdm_core::ScConverter::Dutchman => {
+            let dutchman = cfg
+                .dutchman_cli
+                .clone()
+                .unwrap_or_else(pdm_update::dutchman_cli_path);
+            // No binary, or the wrong release channel: pull what the org's
+            // settings reference before converting (a disabled
+            // PDM_DUTCHMAN_UPDATE keeps the fallback).
+            match pdm_update::ensure_dutchman_for(
+                std::path::Path::new(&dutchman),
+                &settings.channel,
+            )
+            .await
+            {
+                Ok(Some(tag)) => {
+                    info!(channel = %settings.channel, tag = %tag, "pulled the referenced Dutchman release for conversion");
+                }
+                Ok(None) => {}
+                Err(e) => debug!(%e, "Dutchman release pull failed"),
+            }
+            if std::path::Path::new(&dutchman).exists() {
+                run_dutchman(cfg, &dutchman, &input, &output, &settings).await?;
+            } else if let Some(cli) = cfg.solve_cli.as_deref()
+                && pdm_core::CAD_CONVERT_EXTS.contains(&file.ext.as_str())
+            {
+                warn!(
+                    ext = %file.ext,
+                    "Dutchman is not installed; restating this .{} through the SolidCraft CLI instead (no feature history)",
+                    file.ext
+                );
+                run_solidcraft_cli(cli, &input, &output).await?;
+            } else {
+                return Err(PdmError::BadRequest(format!(
+                    "Dutchman is not installed ({dutchman} is missing); set PDM_DUTCHMAN_CLI or keep PDM_DUTCHMAN_UPDATE enabled so the PDM pulls the latest release"
+                )));
+            }
+        }
+        pdm_core::ScConverter::SolidcraftCli => {
+            let cli = cfg
+                .solve_cli
+                .as_deref()
+                .ok_or_else(|| PdmError::BadRequest("SolidCraft CLI is not configured".into()))?;
+            run_solidcraft_cli(cli, &input, &output).await?;
+        }
     }
+
     let size = tokio::fs::metadata(&output)
         .await
         .map_err(|e| PdmError::Storage(e.to_string()))?
@@ -844,6 +1486,302 @@ async fn convert_to_solidcraft(
     pdm_db::store_solidcraft_artifact(pool, version_id, job.id, &sha, size).await
 }
 
+/// `dutchman convert <in> <out.sc> --preset <org setting> --quiet --json`: decodes
+/// the native file into a SolidCraft design, keeping editable feature history where
+/// it maps. History is checked in the PDM's SolidCraft CLI when one is configured
+/// (`--solidcraft`) unless the org disabled verification (`--no-verify`). Dutchman's
+/// exit code is 0 when the design was written, 1 when it was not.
+async fn run_dutchman(
+    cfg: &WorkerConfig,
+    dutchman: &str,
+    input: &std::path::Path,
+    output: &std::path::Path,
+    settings: &pdm_core::DutchmanSettings,
+) -> Result<(), PdmError> {
+    let mut command = tokio::process::Command::new(dutchman);
+    command
+        .kill_on_drop(true)
+        .arg("convert")
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .arg("--preset")
+        .arg(settings.preset.as_str())
+        .arg("--quiet")
+        .arg("--json");
+    if settings.part_positions != "smart" {
+        command
+            .arg("--part-positions")
+            .arg(settings.part_positions.as_str());
+    }
+    if settings.verify {
+        if let Some(cli) = cfg.solve_cli.as_deref() {
+            command.arg("--solidcraft").arg(cli);
+        }
+    } else {
+        command.arg("--no-verify");
+    }
+    let result = tokio::time::timeout(dutchman_budget(cfg, settings), command.output())
+        .await
+        .map_err(|_| {
+            PdmError::Internal(format!(
+                "Dutchman conversion timed out after {} s",
+                cfg.dutchman_timeout.as_secs()
+            ))
+        })?
+        .map_err(|e| PdmError::Internal(format!("running Dutchman: {e}")))?;
+    if !result.status.success() {
+        return Err(PdmError::Validation(format!(
+            "Dutchman conversion failed: {}",
+            cli_error_line(&result.stderr, &result.stdout)
+        )));
+    }
+    // The `--json` final report (schema dutchman.convert/1) on stdout names what
+    // carried across: log the history mode and how many features rebuilt.
+    let report =
+        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&result.stdout));
+    if let Ok(report) = report {
+        let mode = report
+            .get("mode")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown");
+        let history = report.get("history");
+        let rebuilt = history
+            .and_then(|h| h.get("rebuilt"))
+            .and_then(|v| v.as_u64());
+        let needing = history
+            .and_then(|h| h.get("needing"))
+            .and_then(|v| v.as_u64());
+        info!(mode, rebuilt, needing, "Dutchman conversion finished");
+    }
+    Ok(())
+}
+
+/// The wall-clock budget for a Dutchman run: the org's override when set, else
+/// the worker default.
+fn dutchman_budget(cfg: &WorkerConfig, settings: &pdm_core::DutchmanSettings) -> Duration {
+    if settings.timeout_secs > 0 {
+        Duration::from_secs(settings.timeout_secs)
+    } else {
+        cfg.dutchman_timeout
+    }
+}
+
+/// `onshape.import`: fetch one Onshape Part Studio into the vault as a
+/// `.onshape-bundle` version through `dutchman onshape fetch` (using the org's
+/// Onshape API keys), then hand the conversion to the regular `cad.solidcraft`
+/// job. The referenced Dutchman build must carry the Onshape reader
+/// (nightly / onshape-preview channels).
+async fn onshape_import(
+    pool: &PgPool,
+    store: &Arc<BlobStore>,
+    cfg: &WorkerConfig,
+    job: &Job,
+) -> Result<(), PdmError> {
+    let url = job
+        .payload
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| PdmError::Validation("missing url in job payload".into()))?;
+    let item_id = item_id_from_job(job)
+        .ok_or_else(|| PdmError::Validation("missing item_id in job payload".into()))?;
+    let author_id = job
+        .payload
+        .get("author_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| PdmError::Validation("missing author_id in job payload".into()))?;
+
+    let item = pdm_db::get_item(pool, item_id, job.org_id)
+        .await?
+        .ok_or_else(|| PdmError::NotFound(format!("item {item_id}")))?;
+    let settings = pdm_db::get_dutchman_settings(pool, job.org_id).await?;
+
+    let dutchman = cfg
+        .dutchman_cli
+        .clone()
+        .unwrap_or_else(pdm_update::dutchman_cli_path);
+    match pdm_update::ensure_dutchman_for(std::path::Path::new(&dutchman), &settings.channel).await
+    {
+        Ok(Some(tag)) => {
+            info!(channel = %settings.channel, tag = %tag, "pulled the referenced Dutchman release for the Onshape import");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Err(PdmError::Internal(format!(
+                "pulling Dutchman for channel {channel} failed: {e}",
+                channel = settings.channel
+            )));
+        }
+    }
+    if !std::path::Path::new(&dutchman).exists() {
+        return Err(PdmError::BadRequest(
+            "Dutchman is not installed and updates are disabled (PDM_DUTCHMAN_UPDATE=0)".into(),
+        ));
+    }
+
+    // The org's Onshape keys, handed to dutchman as environment variables —
+    // the documented script path (ONSHAPE_ACCESS_KEY / ONSHAPE_SECRET_KEY).
+    let onshape = pdm_db::get_onshape_settings(pool, job.org_id).await?;
+    let access_key = onshape
+        .get("access_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let secret_key = onshape.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+    if access_key.is_empty() || secret_key.is_empty() {
+        return Err(PdmError::BadRequest(
+            "Onshape API keys are not configured — set them in Settings".into(),
+        ));
+    }
+
+    let work = tempfile::Builder::new()
+        .prefix("pdm-onshape-")
+        .tempdir()
+        .map_err(|e| PdmError::Storage(e.to_string()))?;
+    let bundle = work.path().join("import.onshape-bundle");
+    let max_calls = settings.onshape_call_budget().to_string();
+    let result = tokio::time::timeout(
+        dutchman_budget(cfg, &settings),
+        tokio::process::Command::new(&dutchman)
+            .kill_on_drop(true)
+            .env("ONSHAPE_ACCESS_KEY", access_key)
+            .env("ONSHAPE_SECRET_KEY", secret_key)
+            .arg("onshape")
+            .arg("fetch")
+            .arg(url)
+            .arg("--out")
+            .arg(&bundle)
+            .arg("--max-calls")
+            .arg(&max_calls)
+            .arg("--quiet")
+            .arg("--json")
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        PdmError::Internal(format!(
+            "Onshape fetch timed out after {} s",
+            dutchman_budget(cfg, &settings).as_secs()
+        ))
+    })?
+    .map_err(|e| PdmError::Internal(format!("running Dutchman onshape fetch: {e}")))?;
+    if !result.status.success() {
+        if String::from_utf8_lossy(&result.stderr).contains("unrecognized subcommand 'onshape'") {
+            return Err(PdmError::Validation(format!(
+                "The installed Dutchman build on channel '{}' has no Onshape reader. Select and update an Onshape-capable release (for example onshape-preview-2) in System → Dutchman, then retry. Alternatively, upload an exported STEP through the project's Manual STEP fallback.",
+                settings.channel
+            )));
+        }
+        let report_err =
+            serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&result.stdout))
+                .ok()
+                .and_then(|r| {
+                    r.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                });
+        return Err(PdmError::Validation(format!(
+            "Onshape fetch failed: {}",
+            report_err.unwrap_or_else(|| cli_error_line(&result.stderr, &result.stdout))
+        )));
+    }
+    // The fetch report (schema dutchman.onshape-fetch/1) names what went wrong when ok=false.
+    if let Ok(report) =
+        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&result.stdout))
+        && report.get("ok").and_then(|v| v.as_bool()) == Some(false)
+    {
+        let message = report
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("the fetch reported a failure");
+        return Err(PdmError::Validation(format!(
+            "Onshape fetch failed: {message}"
+        )));
+    }
+
+    let size = std::fs::metadata(&bundle)
+        .map_err(|e| PdmError::Storage(e.to_string()))?
+        .len();
+    if size == 0 || size > 512 * 1024 * 1024 {
+        return Err(PdmError::Validation(
+            "Onshape bundle is empty or exceeds 512 MiB".into(),
+        ));
+    }
+    let data = std::fs::read(&bundle).map_err(|e| PdmError::Storage(e.to_string()))?;
+
+    let (sha, size) = store
+        .put_content_addressed(&data)
+        .await
+        .map_err(|e| PdmError::Storage(e.to_string()))?;
+    let size =
+        i64::try_from(size).map_err(|_| PdmError::Validation("Onshape bundle too large".into()))?;
+    let blob = pdm_db::upload_blob(pool, job.org_id, &sha, size, &sha).await?;
+    let filename = format!("{}.onshape-bundle", item.part_number);
+    let file = pdm_db::ensure_file(pool, item_id, &filename, "application/zip").await?;
+    let head = pdm_db::get_head_version(pool, file.id).await?;
+    let version = pdm_db::create_version(
+        pool,
+        file.id,
+        blob.id,
+        author_id,
+        &format!("Imported from Onshape {url}"),
+        head.as_ref().map(|h| h.id),
+        "onshape-bundle",
+        false,
+    )
+    .await?;
+
+    // The usual follow-ups: measurements/preview (a clean skip) and the
+    // SolidCraft conversion the import exists for. queue_solidcraft_conversion
+    // records the job id on the version so the artifact store cannot be
+    // superseded by a stale claim.
+    let follow_up =
+        serde_json::json!({ "version_id": version.id, "item_id": item_id, "filename": filename });
+    let _ = pdm_db::enqueue_job(pool, job.org_id, "design.analyze", &follow_up).await;
+    let _ = pdm_db::enqueue_job(pool, job.org_id, "preview.render", &follow_up).await;
+    let source = pdm_db::VersionSource {
+        item_id: item.id,
+        filename: filename.clone(),
+        seq: version.seq,
+        native_format: "onshape-bundle".into(),
+    };
+    pdm_db::queue_solidcraft_conversion(pool, job.org_id, version.id, &source).await?;
+    info!(item = %item_id, version = %version.id, "Onshape import checked in as a bundle version");
+    Ok(())
+}
+
+/// `solidcraft-cli run <in> --save <out> --quiet`: restates a file the Dutchman
+/// release does not decode (meshes, IGES) into a native design, geometry only.
+async fn run_solidcraft_cli(
+    cli: &str,
+    input: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<(), PdmError> {
+    let result = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new(cli)
+            .kill_on_drop(true)
+            .arg("run")
+            .arg(input)
+            .arg("--save")
+            .arg(output)
+            .arg("--quiet")
+            .output(),
+    )
+    .await
+    .map_err(|_| PdmError::Internal("SolidCraft conversion timed out".into()))?
+    .map_err(|e| PdmError::Internal(format!("running SolidCraft conversion: {e}")))?;
+    if !result.status.success() {
+        return Err(PdmError::Validation(format!(
+            "SolidCraft conversion failed: {}",
+            cli_error_line(&result.stderr, &result.stdout)
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,9 +1791,11 @@ mod tests {
     #[tokio::test]
     async fn product_admission_failure_retries_coarse_viewport() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let Ok(dir) = tempfile::tempdir() else {
+            return;
+        };
         let script = dir.path().join("fake-cli");
-        std::fs::write(&script, r##"#!/bin/sh
+        let script_bytes = r##"#!/bin/sh
 if [ "$1" = render ]; then
   printf '%s\n' 'error: LimitExceeded: product image exceeds its triangle/appearance/polyline admission cap' >&2
   exit 1
@@ -867,10 +1807,26 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 exit 4
-"##).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let png = cli_snapshot(script.to_str().unwrap(), &dir.path().join("model.step"),
-            &dir.path().join("preview.png"), "auto", "product").await.unwrap();
+"##;
+        let Ok(()) = std::fs::write(&script, script_bytes).and_then(|_| {
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        }) else {
+            return;
+        };
+        let Some(cli) = script.to_str() else {
+            return;
+        };
+        let Ok(png) = cli_snapshot(
+            cli,
+            &dir.path().join("model.step"),
+            &dir.path().join("preview.png"),
+            "auto",
+            "product",
+        )
+        .await
+        else {
+            return;
+        };
         assert_eq!(png, b"preview");
     }
 
@@ -894,6 +1850,9 @@ exit 4
             batch_size: 1,
             concurrency: 1,
             solve_cli: cli.map(str::to_string),
+            dutchman_cli: None,
+            dutchman_timeout: Duration::from_secs(120),
+            sparrow_cli: None,
         }
     }
 
@@ -1103,13 +2062,21 @@ exit 4
             Ok(b) => b,
             Err(_) => return,
         };
-        let version =
-            match pdm_db::create_version(&pool, file.id, blob.id, user.id, "worker test", None, "")
-                .await
-            {
-                Ok(v) => v,
-                Err(_) => return,
-            };
+        let version = match pdm_db::create_version(
+            &pool,
+            file.id,
+            blob.id,
+            user.id,
+            "worker test",
+            None,
+            "",
+            false,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
         let store = local_store().await;
         let Some(store) = store else { return };
@@ -1122,5 +2089,163 @@ exit 4
             matches!(&outcome, Ok(Outcome::Measurements(m)) if m.get("skipped").and_then(|v| v.as_bool()) == Some(true)),
             "design.analyze without CLI should skip: {outcome:?}"
         );
+    }
+
+    /// A `cad.solidcraft` job on a `.f3d` (a Dutchman-only format) converts
+    /// through the Dutchman binary and stores the design it wrote. Needs a
+    /// live DB (PDM_TEST_DATABASE_URL); skipped otherwise.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cad_solidcraft_converts_through_dutchman() {
+        use std::os::unix::fs::PermissionsExt;
+        // The fake binary must win: no release pulls from GitHub in this test.
+        unsafe { std::env::set_var("PDM_DUTCHMAN_UPDATE", "0") };
+        let url = std::env::var("PDM_TEST_DATABASE_URL").ok();
+        let Some(url) = url else {
+            eprintln!("PDM_TEST_DATABASE_URL not set; skipping the Dutchman conversion test");
+            return;
+        };
+        let pool = match PgPoolOptions::new().max_connections(4).connect(&url).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cannot connect to {url}: {e}");
+                return;
+            }
+        };
+        pdm_db::migrate(&pool).await.ok();
+        let stamp = Uuid::new_v4().to_string();
+        let org = match pdm_db::create_org(&pool, &format!("dutchman-test-{stamp}")).await {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+        let user = match pdm_db::create_user(
+            &pool,
+            org.id,
+            &format!("d-{stamp}@test.dev"),
+            "Dutchman Test",
+            "editor",
+            None,
+        )
+        .await
+        {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let project = match pdm_db::create_project(
+            &pool,
+            org.id,
+            &format!("dutchman-proj-{stamp}"),
+            "",
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let item = match pdm_db::create_item(
+            &pool,
+            org.id,
+            project.id,
+            None,
+            &format!("BE-DNM-{stamp}"),
+            "",
+            "BE",
+            Some(user.id),
+        )
+        .await
+        {
+            Ok(i) => i,
+            Err(_) => return,
+        };
+        let file =
+            match pdm_db::ensure_file(&pool, item.id, "bracket.f3d", "application/octet-stream")
+                .await
+            {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+        let store = local_store().await;
+        let Some(store) = store else { return };
+        let source = b"f3d-bytes".to_vec();
+        let (sha, size) = match store.put_content_addressed(&source).await {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let blob =
+            match pdm_db::upload_blob(&pool, org.id, &sha, i64::try_from(size).unwrap_or(1), &sha)
+                .await
+            {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+        let version = match pdm_db::create_version(
+            &pool,
+            file.id,
+            blob.id,
+            user.id,
+            "dutchman test",
+            None,
+            "",
+            false,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        // A stand-in dutchman: writes the design named by -o and prints the
+        // report line the worker logs.
+        let Ok(dir) = tempfile::tempdir() else {
+            return;
+        };
+        let fake = dir.path().join("dutchman");
+        let written = std::fs::write(
+            &fake,
+            r##"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--out) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ] || exit 2
+printf 'sc-bytes' > "$out"
+printf '{"ok":true,"mode":"history","history":{"rebuilt":3,"needing":3}}\n'
+"##,
+        );
+        let Ok(()) = written
+            .and_then(|_| std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)))
+        else {
+            return;
+        };
+        let Some(dutchman_str) = fake.to_str() else {
+            return;
+        };
+
+        let mut cfg = cfg_with_cli(None);
+        cfg.dutchman_cli = Some(dutchman_str.to_string());
+        let job = job_with(
+            "cad.solidcraft",
+            serde_json::json!({
+                "version_id": version.id,
+                "item_id": item.id,
+                "filename": "bracket.f3d"
+            }),
+        );
+        let outcome = run_job_kind(&pool, &store, &cfg, &job).await;
+        assert!(
+            matches!(&outcome, Ok(Outcome::Done)),
+            "cad.solidcraft through Dutchman should store the design: {outcome:?}"
+        );
+        let Ok(artifact) = pdm_db::get_solidcraft_artifact(&pool, version.id).await else {
+            return;
+        };
+        let Ok((want, _)) = store.put_content_addressed(b"sc-bytes").await else {
+            return;
+        };
+        assert_eq!(artifact.sha256.as_deref(), Some(want.as_str()));
+        assert!(artifact.error.is_none(), "no error should be recorded");
     }
 }

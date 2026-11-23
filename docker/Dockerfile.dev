@@ -44,6 +44,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p pdm-server -p pdm-cli \
     && cp target/release/pdm-server /dist-pdm-server \
     && cp target/release/pdm-cli /dist-pdm-cli
+# Sparrow nesting engine (pinned commit; MIT, with MPL-2.0 jagua-rs). The worker
+# shells out to it for laser.nest jobs. Pinned so the I/O schema stays stable.
+ARG SPARROW_REV=b8ef03312b7a195895f6c5332c6674dd78420ede
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone https://github.com/JeroenGar/sparrow /sparrow \
+    && cd /sparrow && git checkout --quiet "$SPARROW_REV" \
+    && cargo build --release -p sparrow-cli --bin sparrow --features only_final_svg \
+    && cp /sparrow/target/release/sparrow /dist-sparrow
 
 # rust:1.99-slim is Debian 13 (glibc 2.41); the final stage must provide at
 # least that glibc, so bookworm (glibc 2.36) is too old.
@@ -51,8 +60,14 @@ FROM debian:trixie-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl mesa-vulkan-drivers libvulkan1 \
     && rm -rf /var/lib/apt/lists/*
+# Dutchman Convert (native CAD → SolidCraft with feature history): the newest
+# release at build time; the server keeps it current at runtime (best effort:
+# the first conversion pulls the binary itself when GitHub is unreachable).
+COPY solidcraft-pdm/docker/install-dutchman.sh /install-dutchman.sh
+RUN sh /install-dutchman.sh || { echo "WARNING: dutchman not installed at build time; the server pulls it on demand"; rm -f /usr/local/bin/dutchman; }
 COPY --from=builder /dist-pdm-server /usr/local/bin/pdm-server
 COPY --from=builder /dist-pdm-cli /usr/local/bin/pdm-cli
+COPY --from=builder /dist-sparrow /usr/local/bin/sparrow
 COPY --from=builder /dist-solidcraft-cli /usr/local/bin/solidcraft-cli
 COPY --from=builder /dist-solvecraft-cli /usr/local/bin/solvecraft-cli
 # Web-workspace portal (index.html + app.js + style.css). lib.rs serves / from
@@ -60,7 +75,9 @@ COPY --from=builder /dist-solvecraft-cli /usr/local/bin/solvecraft-cli
 COPY --from=builder /src/crates/pdm-api/static /opt/pdm/portal
 COPY --from=web-editors /portal/editors /opt/pdm/portal/editors
 ENV PDM_PORTAL_DIR=/opt/pdm/portal \
-    PDM_SOLVECRAFT_CLI=/usr/local/bin/solidcraft-cli
+    PDM_SOLVECRAFT_CLI=/usr/local/bin/solidcraft-cli \
+    PDM_DUTCHMAN_CLI=/usr/local/bin/dutchman \
+    PDM_SPARROW_CLI=/usr/local/bin/sparrow
 EXPOSE 8080
 # Server runs migrations on boot, then serves the API + in-process worker.
 CMD ["pdm-server"]

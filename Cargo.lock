@@ -1671,6 +1671,7 @@ dependencies = [
  "lettre",
  "pdm-core",
  "pdm-db",
+ "pdm-nesting",
  "pdm-storage",
  "pdm-update",
  "rand 0.9.5",
@@ -1685,6 +1686,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -1766,6 +1768,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdm-nesting"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "pdm-server"
 version = "0.1.0"
 dependencies = [
@@ -1832,7 +1844,9 @@ dependencies = [
  "chrono",
  "pdm-core",
  "pdm-db",
+ "pdm-nesting",
  "pdm-storage",
+ "pdm-update",
  "serde_json",
  "sqlx",
  "tempfile",

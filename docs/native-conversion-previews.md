@@ -5,22 +5,36 @@ Introduced in PDM **V.01-38**.
 ## Convert to SolidCraft
 
 The item header, Preview tab and version rows offer **Convert to SolidCraft**
-for STEP/IGES, Inventor, FreeCAD, Rhino and supported mesh files. The authenticated
-editor/admin action queues a bounded worker job for the selected immutable version.
-Repeated clicks reuse its active job; an existing successful artifact is reused.
-Actual format/version support depends on the configured CLI; a refused source
-records the CLI's reason rather than claiming that conversion succeeded.
+for the native CAD formats (Fusion `.f3d`/`.f3z`, Inventor `.ipt`/`.iam`,
+SolidWorks `.sldprt`/`.sldasm`, FreeCAD `.FCStd`, CATIA `.CATPart`, Rhino `.3dm`,
+Creo View `.pvz`, ACIS `.sat`/`.sab`/`.smt`/`.smb`, STEP `.step`/`.stp`), IGES
+and supported mesh files. The authenticated editor/admin action queues a bounded
+worker job for the selected immutable version. Repeated clicks reuse its active
+job; an existing successful artifact is reused. Actual format/version support
+depends on the configured converters; a refused source records the converter's
+reason rather than claiming that conversion succeeded.
 
-The worker opens the original bytes with the configured CLI and uses
-`solidcraft-cli run INPUT --save OUTPUT.sc --quiet`. A successful result becomes
-a content-addressed native download alongside the source. The button changes to
-**Download SolidCraft**. Read-only users can download an already created artifact.
+The worker picks the converter from the file format. The native CAD formats run
+through [Dutchman Convert](https://github.com/dutchman-cad/dutchman) —
+`dutchman convert INPUT -o OUTPUT.sc --preset standard --quiet --json`
+(`--solidcraft` points it at the PDM's CLI so a rebuilt history is verified) —
+which decodes the native file and **keeps the editable feature tree where it
+maps** (the JSON report's `mode` is `history`, `partial_history` or `import`).
+The PDM always converts with the newest published Dutchman release: the server
+re-checks GitHub on boot and hourly, and the job pulls the release on demand if
+the binary is missing. Meshes and IGES restate through
+`solidcraft-cli run INPUT --save OUTPUT.sc --quiet` (geometry only); if Dutchman
+is unavailable, Inventor/FreeCAD/Rhino/STEP fall back to that path as well. A
+successful result becomes a content-addressed native download alongside the
+source. The button changes to **Download SolidCraft**. Read-only users can
+download an already created artifact.
 
 Conversion does not replace the original blob, create an item head, change the
-part number, or rewrite history. A STEP becomes a native design containing its
-imported geometry; conversion does not reverse-engineer an original parametric
-feature tree. Use normal check-in separately if the native file should become a
-new vault version. Native `.sc` uploads are recognized for analysis and preview.
+part number, or rewrite history. A STEP or other format without a readable
+feature tree becomes a native design containing its imported geometry; conversion
+does not reverse-engineer an original parametric feature tree that the format
+does not carry. Use normal check-in separately if the native file should become
+a new vault version. Native `.sc` uploads are recognized for analysis and preview.
 
 New check-ins record the source extension on the version so a later change of
 format does not make historical version processing use the wrong extension.

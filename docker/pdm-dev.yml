@@ -22,6 +22,25 @@ services:
       timeout: 5s
       retries: 10
 
+  # Throwaway Postgres for e2e.sh: its own volume and port, so the acceptance
+  # test's `DROP SCHEMA public CASCADE` can never touch the live dev database.
+  postgres-e2e:
+    image: postgres:16
+    restart: "no"
+    environment:
+      POSTGRES_DB: pdm
+      POSTGRES_USER: pdm
+      POSTGRES_PASSWORD: pdm
+    ports:
+      - "25432:5432"
+    volumes:
+      - pgdata-e2e:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pdm -d pdm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   minio:
     image: alpine/minio:latest-release   # minio/minio no longer published on Docker Hub
     restart: unless-stopped
@@ -71,6 +90,7 @@ services:
       PDM_S3_SECRET_KEY: pdmsecret
       PDM_BUILD_TAG: ${PDM_BUILD_TAG:-V.01-01}   # shown in GET /version
       PDM_SOLVECRAFT_CLI: /usr/local/bin/solidcraft-cli
+      PDM_SPARROW_CLI: /usr/local/bin/sparrow
       PDM_WORKER: "0"   # jobs run in the pdm-worker service below
       PDM_LOCK_LEASE_HOURS: "24"
       PDM_MAX_UPLOAD_BYTES: "2147483648"   # 2 GiB: native CAD files with their history exceed 256 MB
@@ -103,6 +123,7 @@ services:
       PDM_S3_SECRET_KEY: pdmsecret
       PDM_BUILD_TAG: ${PDM_BUILD_TAG:-V.01-01}
       PDM_SOLVECRAFT_CLI: /usr/local/bin/solidcraft-cli
+      PDM_SPARROW_CLI: /usr/local/bin/sparrow
       PDM_WORKER: "1"
       PDM_WORKER_CONCURRENCY: ${PDM_WORKER_CONCURRENCY:-4}
       SOLIDCRAFT_GPU: ${SOLIDCRAFT_GPU:-auto}
@@ -114,4 +135,5 @@ services:
 
 volumes:
   pgdata:
+  pgdata-e2e:
   miniodata:

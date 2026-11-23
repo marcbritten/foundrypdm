@@ -22,7 +22,7 @@ Base URL in the dev image: `http://<host>:8080`.
 - `POST /projects` `{ name, description? }` → `{ project }`.
 - `GET /projects/{id}/items` → `{ items: [ItemSummary] }`. **ItemSummary** includes
   `part_number`, `description`, `classification`, `lifecycle_state`, `doc_id`, `head_version_seq`,
-  `latest_revision`, `modified_by`, `locked_by`, and (new) `filename`, `mime_type`.
+  `head_version`, `head_revision`, `latest_revision`, `modified_by`, `locked_by`, and (new) `filename`, `mime_type`.
 - `POST /projects/{id}/items` `{ part_number?, description?, classification?, folder_id? }` → `{ item }`.
 - `GET /projects/{id}/folders` → `{ folders: [...] }`. `POST /projects/{id}/folders` `{ name, parent_id? }` → `{ folder }`.
 - `PUT /projects/{id}/main-assembly` `{ item_id? }` → `{ project }` — set a project's **main assembly** (the
@@ -36,10 +36,14 @@ Base URL in the dev image: `http://<host>:8080`.
 - `PUT /blobs` — raw body → `{ blob: { sha256, size_bytes, ... } }` (content-addressed, org-scoped).
 - `POST /items/{id}/checkout` `{ workstation? }` → `{ lock, base_version }` (409 if held by another).
 - `DELETE /items/{id}/checkout` — undo.
-- `POST /items/{id}/checkin` `{ sha256, commit_message?, base_version?, filename?, mime_type? }` →
-  `{ version }` (409 on stale `base_version`; verifies blob SHA). **Version** includes `id`, `seq`,
-  `file_id`, `author_id`/`author_name`, `commit_message`, `base_version_id`, `blob_id`, `sha256`,
-  `size_bytes`, `native_format`, `mime_type`, `measurements`, `thumbnail_sha256`/`size`.
+- `POST /items/{id}/checkin` `{ sha256, commit_message?, base_version?, filename?, mime_type?, new_version? }` →
+  `{ version }` (409 on stale `base_version`; verifies blob SHA). `new_version` (default `false`)
+  controls versioning: a plain save is a new **revision** of the current version (V1 - R2), while
+  `new_version: true` starts a new **major version** (V2 - R1). A new major version also flags the
+  item's NC programs as outdated; a plain revision does not. **Version** includes `id`, `seq`,
+  `version`, `revision`, `file_id`, `author_id`/`author_name`, `commit_message`, `base_version_id`,
+  `blob_id`, `sha256`, `size_bytes`, `native_format`, `mime_type`, `measurements`,
+  `thumbnail_sha256`/`size`.
 - `GET /items/{id}/versions` → `{ versions: [Version] }` (newest last).
 - `GET /versions/{id}/blob` — raw bytes + `Content-Digest: sha-256=…`.
 - `GET /versions/{id}/thumbnail`, `GET /items/{id}/thumbnail` — PNG preview (**auth-gated**; 401 without

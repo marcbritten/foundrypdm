@@ -203,6 +203,8 @@ async fn e2e_vault_full_flow() {
     assert!(r.status().is_success(), "checkin v1: {}", r.status());
     let v1: serde_json::Value = r.json().await.unwrap();
     assert_eq!(v1["version"]["seq"], 1, "first version should be seq 1");
+    assert_eq!(v1["version"]["version"], 1, "first save is major version 1");
+    assert_eq!(v1["version"]["revision"], 1, "first save is revision 1");
     let v1_id = v1["version"]["id"].as_str().unwrap().to_string();
 
     // 4. Immutable file versions — upload same blob again, should dedup
@@ -226,7 +228,7 @@ async fn e2e_vault_full_flow() {
         "dedup should return same sha"
     );
 
-    // Create version 2
+    // Create version 2: a plain save is a new *revision* of the current version
     let design_v2 = br#"{"format":"solvecraft/5","name":"e2e_v2","units":"mm","params":[],"features":[],"next_id":1,"components":[],"occurrences":[],"assembly":{},"parts":{},"configs":{},"favorites":[],"materials":{},"appearances":{},"body_components":{},"body_offsets":{},"browser_groups":[],"browser_order":{},"named_views":[]}"#;
     let sha_v2 = sha256_hex(design_v2);
     let r = client
@@ -260,9 +262,60 @@ async fn e2e_vault_full_flow() {
         .unwrap();
     assert!(r.status().is_success(), "checkin v2: {}", r.status());
     let v2: serde_json::Value = r.json().await.unwrap();
-    assert_eq!(v2["version"]["seq"], 2, "second version should be seq 2");
+    assert_eq!(v2["version"]["seq"], 2, "second save should be seq 2");
+    assert_eq!(
+        v2["version"]["version"], 1,
+        "plain save stays in major version 1"
+    );
+    assert_eq!(v2["version"]["revision"], 2, "plain save is revision 2");
 
-    // Stale check-in: base_version=1 but head is 2
+    // Save as a new major version (V2 - R1)
+    let design_v3 = br#"{"format":"solvecraft/5","name":"e2e_v3","units":"mm","params":[],"features":[],"next_id":1,"components":[],"occurrences":[],"assembly":{},"parts":{},"configs":{},"favorites":[],"materials":{},"appearances":{},"body_components":{},"body_offsets":{},"browser_groups":[],"browser_order":{},"named_views":[]}"#;
+    let sha_v3 = sha256_hex(design_v3);
+    let r = client
+        .put(format!("{}/blobs", base()))
+        .bearer_auth(&token_a)
+        .body(design_v3.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "upload v3 blob: {}", r.status());
+    let _ = client
+        .post(format!("{}/items/{item_id}/checkout", base()))
+        .bearer_auth(&token_a)
+        .json(&json!({ "workstation": "e2e-a" }))
+        .send()
+        .await
+        .unwrap();
+    let r = client
+        .post(format!("{}/items/{item_id}/checkin", base()))
+        .bearer_auth(&token_a)
+        .json(&json!({
+            "sha256": sha_v3,
+            "commit_message": "New major version",
+            "base_version": 2,
+            "new_version": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.status().is_success(),
+        "checkin new version: {}",
+        r.status()
+    );
+    let v3: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v3["version"]["seq"], 3, "third save should be seq 3");
+    assert_eq!(
+        v3["version"]["version"], 2,
+        "new_version save bumps the major version"
+    );
+    assert_eq!(
+        v3["version"]["revision"], 1,
+        "new_version save resets the revision"
+    );
+
+    // Stale check-in: base_version=1 but head is 3
     let _ = client
         .post(format!("{}/items/{item_id}/checkout", base()))
         .bearer_auth(&token_a)
@@ -381,7 +434,17 @@ async fn e2e_vault_full_flow() {
         "modified_at should be set after check-in, got {}",
         summary["modified_at"]
     );
-    assert_eq!(summary["head_version_seq"].as_i64(), Some(2));
+    assert_eq!(summary["head_version_seq"].as_i64(), Some(3));
+    assert_eq!(
+        summary["head_version"].as_i64(),
+        Some(2),
+        "head is major version 2"
+    );
+    assert_eq!(
+        summary["head_revision"].as_i64(),
+        Some(1),
+        "head is revision 1 of V2"
+    );
     assert!(
         summary["latest_revision"].is_null(),
         "no revision released yet, got {}",
@@ -428,7 +491,7 @@ async fn e2e_vault_full_flow() {
     assert_eq!(detail["item"]["latest_revision"].as_str(), Some("A"));
 
     eprintln!(
-        "\nE2E VAULT PASSED — item {part_number}, 2 versions, audit verified, integrity OK, summary fields verified"
+        "\nE2E VAULT PASSED — item {part_number}, 3 saves (V1-R1, V1-R2, V2-R1), audit verified, integrity OK, summary fields verified"
     );
 }
 

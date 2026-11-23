@@ -102,9 +102,14 @@ function kindInfo(mime, filename){
   if (n.endsWith(".dxf") || m.includes("dxf")) return { label:"DXF", cls:"dxf", icon: kindSvg("ic-ftype-dxf") };
   if (n.endsWith(".pdf") || m.includes("pdf")) return { label:"PDF", cls:"pdf", icon: kindSvg("ic-ftype-pdf") };
   if (m.startsWith("image/")) return { label:"IMG", cls:"img", icon: kindSvg("ic-image") };
-  if (ext === "sc") return { label:"SC", cls:"cad", icon: kindSvg("ic-ftype-cad") };
+  if (ext === "sc" || ext === "solidcraft" || ext === "solvecraft")
+    return { label:"SC", cls:"cad", icon: kindSvg("ic-ftype-cad") };
+  if (ext === "onshape-bundle")
+    return { label:"ONSHAPE", cls:"cad", icon: kindSvg("ic-ftype-cad") };
   if (GCODE_EXTS.includes(ext)) return { label:"GCODE", cls:"cad", icon: kindSvg("ic-gcode") };
-  if (CAD_EXTS.includes(ext)) return { label:"CAD", cls:"cad", icon: kindSvg("ic-ftype-cad") };
+  // CAD files badge with their real format (F3D, STEP, STL, FCSTD, …) so the
+  // list shows what each file actually is.
+  if (CAD_EXTS.includes(ext)) return { label: ext.toUpperCase().slice(0, 8), cls:"cad", icon: kindSvg("ic-ftype-cad") };
   if (m.startsWith("text/") || ["txt","csv","md"].includes(ext))
     return { label:"TXT", cls:"", icon: kindSvg("ic-ftype-txt") };
   if (m === "" || m === "application/octet-stream" || m.includes("solidcraft"))
@@ -128,7 +133,7 @@ function actorName(ev){ const u = UMAP[ev.actor_id];
   return (u && (u.display_name || u.email)) || (ev.actor_name || "system"); }
 
 // ── modal (fields: {id,label,type,options,value,required,placeholder}) ───
-function openModal(title, fields, submitLabel, extraHtml){
+function openModal(title, fields, submitLabel, extraHtml, into){
   return new Promise(resolve => {
     const wrap = document.createElement("div"); wrap.className = "modal-backdrop";
     const win = document.createElement("div"); win.className = "modal";
@@ -178,7 +183,7 @@ function openModal(title, fields, submitLabel, extraHtml){
     body.appendChild(implicitSubmit);
     submit.onclick = submitForm;
     win.appendChild(head); win.appendChild(body); win.appendChild(foot);
-    wrap.appendChild(win); document.body.appendChild(wrap);
+    wrap.appendChild(win); (into || document.body).appendChild(wrap);
     document.addEventListener("keydown", onKey);
     const first = body.querySelector("input,select,textarea"); if (first) first.focus();
   });
@@ -270,7 +275,7 @@ async function enterWorkspace(){
 // links all survive. Transient view state (loaded items, selection, expanded
 // tree nodes) is dropped on navigation and refetched.
 const LEGACY_NAME = { files:"items", parts:"items", tasks:"approvals" };
-const NAV_NAMES = ["dashboard","projects","explorer","items","search","mfg","machines",
+const NAV_NAMES = ["dashboard","projects","explorer","items","search","mfg","machines","tools",
   "post-processors","sheet-metal","approvals","activity","bom","system","settings","admin"];
 function go(name, extra){
   name = LEGACY_NAME[name] || name;
@@ -282,6 +287,10 @@ function go(name, extra){
     if (extra && extra._tab) delete ROUTE._tab;
   }
   if (name === "explorer") ROUTE.origin = "projects";
+  if (name === "tool"){
+    TOOL.tab = (extra && extra._tab) || "general";
+    if (extra && extra._tab) delete ROUTE._tab;
+  }
   syncNav(); render(true);
   pushHash();
 }
@@ -302,6 +311,11 @@ function routeToHash(){
   if (n === "detail"){
     let h = "#/items/" + ROUTE.id;
     if (DETAIL.tab && DETAIL.tab !== "overview") h += "?tab=" + DETAIL.tab;
+    return h;
+  }
+  if (n === "tool"){
+    let h = "#/tools/" + ROUTE.toolid;
+    if (TOOL.tab && TOOL.tab !== "general") h += "?tab=" + TOOL.tab;
     return h;
   }
   const q = [];
@@ -344,11 +358,15 @@ function routeFromHash(){
   }
   if (seg[0] === "items" && seg.length === 2)
     return { name:"detail", origin:"items", id:seg[1], _tab: q.tab || undefined };
+  if (seg[0] === "tools" && seg.length === 2)
+    return { name:"tool", origin:"tools", toolid:seg[1], _tab: q.tab || undefined };
   return null;
 }
 function sameRoute(r){
-  if (r.name !== ROUTE.name || r.pid !== ROUTE.pid || r.id !== ROUTE.id) return false;
+  if (r.name !== ROUTE.name || r.pid !== ROUTE.pid || r.id !== ROUTE.id ||
+      r.toolid !== ROUTE.toolid) return false;
   if (r.name === "detail") return (r._tab || "overview") === DETAIL.tab;
+  if (r.name === "tool") return (r._tab || "general") === TOOL.tab;
   return (r._ptab || "items") === (ROUTE._ptab || "items") &&
     (r._kind || "all") === (ROUTE._kind || "all") &&
     (r._cls || "all") === (ROUTE._cls || "all") &&
@@ -365,8 +383,10 @@ function onHashNav(){
 function navTarget(){
   const map = { dashboard:"dashboard", projects:"projects", explorer:"projects",
     items:"items", files:"items", parts:"items", bom:"items", search:"search",
-    mfg:"mfg", machines:"machines", "post-processors":"post-processors",
-    "sheet-metal":"sheet-metal", approvals:"approvals", tasks:"approvals",
+    mfg:"mfg", machines:"machines", tools:"tools", tool:"tools",
+    "post-processors":"post-processors",
+    "sheet-metal":"sheet-metal", "laser-nests":"laser-nests",
+    approvals:"approvals", tasks:"approvals",
     activity:"activity", system:"system", settings:"settings", admin:"admin",
     detail: ROUTE.origin === "explorer" ? "projects" : "items" };
   return map[ROUTE.name] || "dashboard";
@@ -377,16 +397,19 @@ function syncNav(){
     a.classList.toggle("on", a.dataset.nav === target));
   const names = { dashboard:"Dashboard", projects:"Projects", explorer:"Project",
     items:"Items", search:"Search", mfg:"Manufacturing", machines:"Machines & Tools",
-    "post-processors":"Post-processors", "sheet-metal":"Sheet Metal Standards",
+    tools:"Tool library", "post-processors":"Post-processors", "sheet-metal":"Sheet Metal Standards",
+    "laser-nests":"Laser Nests",
     approvals:"Approvals", activity:"Activity", bom:"Bills of Material",
     system:"System", settings:"Settings", admin:"Administration", detail:"Item" };
   let c = names[ROUTE.name] || "";
   if (ROUTE.name === "explorer" && PMAP[ROUTE.pid]) c = PMAP[ROUTE.pid].name;
   if (ROUTE.name === "detail" && DETAIL.id && DETAIL.data) c = itemName(DETAIL.data.item);
+  if (ROUTE.name === "tool" && TOOL.data) c = TOOL.data.name;
   $("crumb").textContent = c;
 }
 const DETAIL = { id:null, tab:"overview", data:null, revs:[], comments:[], props:[], cmp:new Set(),
   pvSeq:null, folderCache:null };
+const TOOL = { id:null, tab:"general", data:null, cutting:[], docs:[] };
 
 async function render(skeleton){
   const v = $("view");
@@ -399,8 +422,11 @@ async function render(skeleton){
       case "items": await viewItems(v); break;
       case "mfg": await viewMfg(v); break;
       case "machines": await viewMachines(v); break;
+      case "tools": await viewTools(v); break;
+      case "tool": await viewToolDetail(v); break;
       case "post-processors": await viewPostProcessors(v); break;
       case "sheet-metal": await viewSheetMetal(v); break;
+      case "laser-nests": await viewLaserNests(v); break;
       case "approvals": await viewApprovals(v); break;
       case "activity": await viewActivity(v); break;
       case "bom": viewSoon(v, bigIcon("ic-bom"), "Bills of Material",
@@ -577,6 +603,27 @@ function sortItems(list, key, dir){
   });
 }
 
+// Sheet-metal parts carry a sheet_metal spec; the ▸ marks a flat pattern
+// that can be exported.
+function smBadge(it){
+  if (!it.sheet_metal) return "";
+  const tip = ["Sheet metal part"];
+  if (it.sheet_metal_material) tip.push(it.sheet_metal_material);
+  if (it.sheet_metal_thickness_mm != null) tip.push(it.sheet_metal_thickness_mm + " mm");
+  if (it.sheet_metal_flat_pattern) tip.push("flat pattern available");
+  else tip.push("no flat pattern attached yet");
+  return "<span class='badge sm' title='" + esc(tip.join(" · ")) + "'>SM" +
+    (it.sheet_metal_flat_pattern ? " ▸" : "") + "</span>";
+}
+
+// 3D model type column: a sheet-metal part, a solid, or not a 3D model.
+function itemType(it){
+  if (it.sheet_metal) return "<span class='smtype'>Sheet metal</span>";
+  const k = kindInfo(it.mime_type, it.filename);
+  if (k.cls === "cad" && k.label !== "GCODE") return "Solid";
+  return "—";
+}
+
 // ── shared item table ───────────────────────────────────────────────────
 function itemsTable(list, showProject, selSet){
   if (!list.length) return "<div class='empty'>No items match — upload a file or create an item.</div>";
@@ -585,12 +632,13 @@ function itemsTable(list, showProject, selSet){
     (selSet ? "<th style='width:28px'></th>" : "") +
     "<th class='sortable' data-s='_name'>Name</th>" +
     "<th class='sortable' data-s='part_number'>Part no</th>" +
+    "<th>Type</th>" +
     (showProject ? "<th>Project</th>" : "") +
     "<th>State</th><th>Ver</th>" +
     "<th class='sortable' data-s='modified_at'>Modified</th>" +
     "<th class='sortable' data-s='owner_name'>Owner</th><th>Lock</th>" +
     "<th style='width:32px'></th></tr></thead>";
-  const cols = 9 + ((selSet || showProject) ? 1 : 0);
+  const cols = 10 + ((selSet || showProject) ? 1 : 0);
   const rows = list.map(it => {
     const k = kindInfo(it.mime_type, it.filename);
     return "<tr class='clickable" + (it.archived_at ? " archived" : "") + "' data-id='" + it.id + "'>" +
@@ -599,9 +647,10 @@ function itemsTable(list, showProject, selSet){
       "<td><span class='namecell'><span class='thumb-sm' data-thumb='/items/" + it.id + "/thumbnail'></span>" +
         "<span class='fileicon' title='" + esc(k.label) + "'>" + k.icon + "</span>" +
         "<span class='nm'>" + esc(itemName(it)) + "</span>" +
-        revBadge(it.latest_revision) + kindBadge(it.mime_type, it.filename) + archBadge(it.archived_at) + "</span></td>" +
-      "<td class='mono muted'>" + esc(it.part_number) + "</td>" +
-      (showProject ? "<td class='muted'>" + esc(it._project || PMAP[it.project_id]?.name || "—") + "</td>" : "") +
+        revBadge(it.latest_revision) + kindBadge(it.mime_type, it.filename) + smBadge(it) + archBadge(it.archived_at) + "</span></td>" +
+       "<td class='mono muted'>" + esc(it.part_number) + "</td>" +
+       "<td class='muted'>" + itemType(it) + "</td>" +
+       (showProject ? "<td class='muted'>" + esc(it._project || PMAP[it.project_id]?.name || "—") + "</td>" : "") +
       "<td>" + stateBadge(it.lifecycle_state) + "</td>" +
       "<td>" + (it.head_version_seq ?? "—") + "</td>" +
       "<td class='muted'>" + fmtTime(it.modified_at) + "</td>" +
@@ -649,6 +698,8 @@ function showCtxMenu(x, y, it){
   if (it.head_version_seq) entries.push({ label:"Download latest", act: () => downloadLatest(it) });
   const editor = PdmEditors.forFile(it.mime_type, it.filename);
   if (it.head_version_seq && editor) entries.push({ label:"Open in " + editor.label + " (web)", act: () => openWebEditor(it.id) });
+  if (it.head_version_seq && isRole("editor") && convertibleByName(it.filename))
+    entries.push({ label:"Import to SolidCraft (Dutchman)", act: () => importItemHead(it) });
   if (!it.locked_by) entries.push({ label:"Check out", act: () => doCheckout(it.id) });
   else if (it.locked_by === myName()) entries.push({ label:"Undo checkout", act: () => doUndo(it.id) });
   entries.push({ label:"Upload new version", act: () => openDetail(it.id) });
@@ -686,6 +737,8 @@ function openKebabMenu(ev, id, kind){
   const entries = [];
   if (kind === "proj")
     entries.push({ label: "Edit", act: () => doEditProject(id) });
+  if (kind === "item" && it && isRole("editor") && it.head_version_seq && convertibleByName(it.filename))
+    entries.push({ label: "Import to SolidCraft (Dutchman)", act: () => importItemHead(it) });
   entries.push(
     { label: archived ? "Unarchive" : "Archive", act: () =>
         (kind === "proj" ? doArchiveProject(id) : doArchiveItem(id)) },
@@ -913,6 +966,338 @@ async function saveVersionBlob(v, fallbackName){
   a.download = fallbackName || ("version-" + v.seq);
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+// Bulk export of flat patterns: one DXF per sheet-metal part plus a
+// manifest.json that reports which parts had no pattern yet.
+async function exportFlatPatterns(ids){
+  if (!ids.length) return toast("Select items to export first", "err");
+  try {
+    const buf = await api("GET", "/sheet-metal/flat-patterns?items=" + ids.join(","));
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([buf], { type: "application/zip" }));
+    a.download = "flat-patterns.zip";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    toast("Flat patterns exported (" + ids.length + " item(s)) — see manifest.json for missing parts", "ok");
+  } catch(e){ toast("Export failed: " + e.message, "err"); }
+}
+
+// ── Laser nesting (Sparrow) ─────────────────────────────────────────────
+// ── Laser nest create panel ─────────────────────────────────────────────
+// The create flow is a full panel inside the Laser Nests view (not a modal),
+// because it has a sheet-information block plus an arbitrary number of part
+// lines, each with quantity / mirror / grain options. `NC.active` (module
+// state, not a route flag) survives timer-driven re-renders so the panel is
+// not clobbered by auto-refresh.
+let NC = { cands: [], lines: [], active: false };
+
+// Candidate sheet-metal parts, with flat-pattern availability + material.
+async function loadNestableParts(){
+  let specs = [];
+  try { const d = await api("GET", "/sheet-metal"); specs = d.sheet_metal || []; } catch(e){}
+  const items = await api("GET", "/items?limit=500").then(d => d.items || []).catch(() => []);
+  const byName = {};
+  items.forEach(it => { byName[it.id] = it.part_number || it.id.slice(0,8); });
+  const seen = {};
+  const cands = specs
+    .filter(s => s.item_id && byName[s.item_id] && !seen[s.item_id])
+    .map(s => {
+      seen[s.item_id] = 1;
+      return { id: s.item_id, name: byName[s.item_id],
+        hasFlat: !!s.flat_pattern_sha, material: s.material || "" };
+    })
+    .sort((a,b) => a.name.localeCompare(b.name));
+  return cands;
+}
+
+function ncOptions(sel){
+  return NC.cands.map(c =>
+    "<option value='" + c.id + "'" + (c.id === sel ? " selected" : "") + ">" +
+    esc(c.name) + (c.hasFlat ? "" : " · needs flat pattern") + "</option>").join("");
+}
+function ncGrainOptions(sel){
+  return [
+    ["any","No preference"],["along_length","Along part length"],["along_width","Across part length"]
+  ].map(([v,l]) => "<option value='" + v + "'" + (v===sel?" selected":"") + ">" + l + "</option>").join("");
+}
+function ncLineHtml(i){
+  const l = NC.lines[i];
+  return "<div class='nc-line' data-i='" + i + "'>" +
+    "<select data-f='item'>" + ncOptions(l.item_id) + "</select>" +
+    "<input data-f='qty' type='number' min='1' value='" + l.quantity + "' style='width:64px'>" +
+    "<label class='nc-check'><input data-f='mirror' type='checkbox'" + (l.mirror?" checked":"") + "> Mirror original</label>" +
+    "<label class='nc-check'><input data-f='allow' type='checkbox'" + (l.allow_mirror?" checked":"") + "> Flipping allowed</label>" +
+    "<select data-f='grain'>" + ncGrainOptions(l.grain) + "</select>" +
+    "<button class='nc-rm' title='Remove this line'>×</button>" +
+    "</div>";
+}
+function ncLinesHtml(){
+  return "<div class='nc-head nc-line'>" +
+      "<span>Part</span><span style='width:64px'>Qty</span>" +
+      "<span>Mirror original</span><span>Flipping allowed</span><span>Grain</span><span></span></div>" +
+    "<div id='ncLines'>" + NC.lines.map(ncLineHtml).join("") + "</div>";
+}
+function ncRebind(){
+  const box = $("ncLines");
+  box.querySelectorAll(".nc-line").forEach(row => {
+    const i = +row.dataset.i;
+    row.querySelector("[data-f=item]").onchange = e => { NC.lines[i].item_id = e.target.value; };
+    row.querySelector("[data-f=qty]").oninput = e => { NC.lines[i].quantity = Math.max(1, parseInt(e.target.value,10)||1); };
+    row.querySelector("[data-f=mirror]").onchange = e => { NC.lines[i].mirror = e.target.checked; };
+    row.querySelector("[data-f=allow]").onchange = e => { NC.lines[i].allow_mirror = e.target.checked; };
+    row.querySelector("[data-f=grain]").onchange = e => { NC.lines[i].grain = e.target.value; };
+    row.querySelector(".nc-rm").onclick = () => {
+      NC.lines.splice(i,1);
+      if (!NC.lines.length) NC.lines.push(ncDefaultLine());
+      document.querySelector(".nc-parts").innerHTML = ncLinesHtml(); ncRebind();
+    };
+  });
+  const add = $("ncAdd");
+  if (add) add.onclick = () => {
+    NC.lines.push(ncDefaultLine());
+    document.querySelector(".nc-parts").innerHTML = ncLinesHtml(); ncRebind();
+    const last = document.querySelector(".nc-lines .nc-line:last-child select");
+    if (last) last.focus();
+  };
+}
+function ncDefaultLine(){
+  return { item_id: NC.cands[0] ? NC.cands[0].id : "", quantity: 1,
+    mirror: false, allow_mirror: true, grain: "any" };
+}
+
+async function renderNestCreate(v){
+  NC.cands = await loadNestableParts();
+  // Drop any preselection carried on the route (consumed into NC.lines by the
+  // entry points) and seed a default line when none were added.
+  delete ROUTE._parts;
+  if (!NC.lines.length && NC.cands.length) NC.lines.push(ncDefaultLine());
+  v.innerHTML =
+    "<div class='head'><h2>New laser nest</h2>" +
+    "<button class='small' id='ncBack'>← Back to history</button></div>" +
+    "<div class='card nc' style='max-width:980px'>" +
+    "<h3 class='nc-sec'>Sheet information</h3>" +
+    "<div class='nc-grid'>" +
+      "<label>Units<input id='ncUnits' type='text' hidden value='in'>" +
+        "<select id='nc_units'>" +
+        "<option value='in' selected>Inches</option><option value='mm'>Millimetres</option></select></label>" +
+      "<label>Length<input id='nc_len' value='96' required></label>" +
+      "<label>Width<input id='nc_wid' value='48' required></label>" +
+      "<label>Grain direction<select id='nc_grain'>" +
+        "<option value='along_length' selected>Along length</option>" +
+        "<option value='along_width'>Along width</option>" +
+        "<option value='any'>Any</option></select></label>" +
+      "<label>Edge margin<input id='nc_margin' value='0.39'></label>" +
+      "<label>Spacing · horizontal<input id='nc_spx' value='0.2'></label>" +
+      "<label>Spacing · vertical<input id='nc_spy' value='0.2'></label>" +
+      "<label>Part source unit<select id='nc_punit'>" +
+        "<option value='auto' selected>Auto (file's declared units)</option>" +
+        "<option value='in'>Inches</option><option value='mm'>Millimetres</option></select></label>" +
+      "<label>Nest name<input id='nc_name' value='Laser nest " + new Date().toISOString().slice(0,10) + "'></label>" +
+    "</div>" +
+    "<h3 class='nc-sec nc-parts-title'>Parts</h3>" +
+    "<div class='nc-parts'>" + (NC.cands.length ? ncLinesHtml() :
+        "<div class='dim'>No sheet-metal parts found.</div>") + "</div>" +
+    (NC.cands.length ? "<button class='small' id='ncAdd'>+ Add part</button>" : "") +
+    "<div class='nc-foot'>" +
+      "<span class='dim'>Parts nest on the selected sheet; the laser receives millimetres.</span>" +
+      "<div class='grow'></div>" +
+      "<button class='primary' id='ncQueue'>Queue nest</button>" +
+    "</div>" +
+    "</div>";
+  $("ncBack").onclick = () => { NC.active = false; go("laser-nests"); };
+  if (NC.cands.length) ncRebind();
+  $("ncQueue").onclick = () => queueLaserNest();
+}
+
+async function queueLaserNest(){
+  if (!NC.lines.length) return toast("Add at least one part", "err");
+  const lines = NC.lines.map(l => ({
+    item_id: l.item_id,
+    quantity: Math.max(1, l.quantity|0),
+    mirror: !!l.mirror,
+    allow_mirror: l.allow_mirror !== false,
+    grain: l.grain || "any",
+  }));
+  const pu = $("nc_punit").value;
+  const body = {
+    name: $("nc_name").value.trim() || "Laser nest",
+    units: $("nc_units").value,
+    stock_width_mm: num($("nc_wid").value),
+    stock_height_mm: num($("nc_len").value),
+    edge_margin_mm: num($("nc_margin").value),
+    spacing_x_mm: num($("nc_spx").value),
+    spacing_y_mm: num($("nc_spy").value),
+    grain_direction: $("nc_grain").value,
+    default_part_unit: pu !== "auto" ? pu : undefined,
+    parts: lines,
+  };
+  if ([body.stock_width_mm, body.stock_height_mm].some(x => !isFinite(x) || x <= 0))
+    return toast("Length and width must be positive numbers", "err");
+  try {
+    const q = $("ncQueue"); q.disabled = true; q.textContent = "Queueing…";
+    const pre = await api("POST", "/laser-nests/validate", body);
+    if (pre && pre.ok === false){
+      const msgs = (pre.problems||[]).map(p=>p.problem);
+      if (pre.mixed_material) msgs.push("mixed materials");
+      if (pre.mixed_thickness) msgs.push("mixed thickness");
+      toast("Preflight: " + msgs.join("; "), "err", 9000);
+      q.disabled = false; q.textContent = "Queue nest";
+      return;
+    }
+    const r = await api("POST", "/laser-nests", body);
+    NC = { cands: [], lines: [], active: false };
+    toast("Laser nest queued (" + r.nest.status + ")", "ok");
+    go("laser-nests");
+  } catch(e){ toast("Create failed: " + e.message, "err");
+    const q = $("ncQueue"); if (q){ q.disabled = false; q.textContent = "Queue nest"; } }
+}
+
+// Thin wrapper so the Items bulk action still works: it jumps to the Laser
+// Nests view and opens the create panel with those parts pre-added.
+function openLaserNestDialog(itemIds){
+  if (!itemIds.length) return toast("Select one or more items first", "err");
+  NC = { cands: [], lines: itemIds.map(id => ({ item_id: id, quantity: 1,
+    mirror: false, allow_mirror: true, grain: "any" })), active: true };
+  go("laser-nests");
+}
+function num(s, d){ const n = parseFloat(s); return isFinite(n) ? n : (d === undefined ? NaN : d); }
+
+// Laser Nests view: a create panel (when "New nest" is active) plus history.
+async function viewLaserNests(v){
+  if (NC.active){
+    // Already rendered this panel (e.g. a timer re-render) → keep it as-is so
+    // the user's in-progress form is not wiped.
+    if (v.querySelector(".nc")) return;
+    v.innerHTML = "<div class='head'><h2>Laser Nests</h2><span class='spinner'></span> Loading parts…</div>";
+    try { await renderNestCreate(v); }
+    catch(e){ v.innerHTML = "<div class='head'><h2>Laser Nests</h2></div>" +
+      emptyState("ic-warning", "Load failed", e.message); }
+    return;
+  }
+  let d;
+  try { d = await api("GET", "/laser-nests?limit=50"); }
+  catch(e){ v.innerHTML = "<div class='head'><h2>Laser Nests</h2></div>" + emptyState("ic-warning", "Load failed", e.message); return; }
+  const nests = d.nests || [];
+  v.innerHTML =
+    "<div class='head'><h2>Laser Nests</h2>" +
+    "<span class='dim'>Nesting runs built from flat-pattern DXFs via the Sparrow engine.</span>" +
+    "<div class='grow'></div>" +
+    "<button class='primary' id='lnNew'>+ New nest</button></div>" +
+    (nests.length
+      ? "<div class='card ln-list'>" + nests.map(nestRow).join("") + "</div>"
+      : emptyState("ic-sheet-metal", "No laser nests yet",
+          "Create one from sheet-metal parts, or from the <b>Items</b> view."));
+  const nn = $("lnNew");
+  if (nn) nn.onclick = () => { NC.active = true; NC.lines = []; go("laser-nests"); };
+  v.querySelectorAll(".ln-row").forEach(row => {
+    row.onclick = () => toggleNestDetail(row);
+  });
+}
+function statusPill(s){
+  const cls = { completed:"ok", running:"run", queued:"run", failed:"err", cancelled:"dim" }[s] || "dim";
+  return "<span class='ln-status " + cls + "'>" + esc(s) + "</span>";
+}
+function nestRow(n){
+  const grain = (n.grain_direction && n.grain_direction !== "any")
+    ? " · grain " + esc(n.grain_direction.replace("along_","")) : "";
+  return "<div class='ln-row' data-id='" + n.id + "'>" +
+    "<div class='ln-top'><b>" + esc(n.name) + "</b> " + statusPill(n.status) +
+    (n.stale ? " <span class='badge' title='" + esc(n.stale_reason || "source changed") + "'>stale</span>" : "") +
+    " <span class='dim'>" + Math.round(n.stock_width_mm) + "×" + Math.round(n.stock_height_mm) + " mm" +
+    grain +
+    (n.material ? " · " + esc(n.material) : "") + " · " + fmtTime(n.created_at) + "</span></div>" +
+    (n.error ? "<div class='dim ln-err'>" + esc(n.error) + "</div>" : "") +
+    "<div class='ln-detail' id='ln-" + n.id + "'></div>" +
+    "</div>";
+}
+async function toggleNestDetail(row){
+  const id = row.dataset.id;
+  const box = document.getElementById("ln-" + id);
+  if (box.dataset.loaded === "1"){ box.style.display = box.style.display === "none" ? "" : "none"; return; }
+  box.style.display = "";
+  box.innerHTML = "<span class='dim'>loading…</span>";
+  try {
+    const d = await api("GET", "/laser-nests/" + id);
+    const det = d.detail, n = det.nest;
+    const sheets = det.sheets || [];
+    const spacing = (n.spacing_x_mm || n.spacing_y_mm)
+      ? " · spacing " + Math.round(n.spacing_x_mm) + "×" + Math.round(n.spacing_y_mm) + " mm" : "";
+    const grain = (n.grain_direction && n.grain_direction !== "any")
+      ? " · grain " + n.grain_direction.replace("along_","") : "";
+    const partLines = (det.parts||[]).map(p => {
+      const tags = [];
+      if (p.mirror) tags.push("mirrored");
+      if (!p.allow_mirror) tags.push("no-flip");
+      if (p.part_grain && p.part_grain !== "any") tags.push(p.part_grain.replace("along_","") + " grain");
+      return "<div class='ln-partline'><b>" + esc(p.part_number) + "</b> ×" + p.quantity +
+        (tags.length ? " <span class='dim'>(" + tags.join(", ") + ")</span>" : "") + "</div>";
+    }).join("");
+    box.innerHTML =
+      "<div class='ln-meta dim'>" + (det.parts||[]).reduce((a,p)=>a+p.quantity,0) +
+      " part(s) across " + det.parts.length + " line item(s) · " + sheets.length + " sheet(s)" +
+      spacing + grain + "</div>" +
+      (partLines ? "<div class='ln-partlines dim'>" + partLines + "</div>" : "") +
+      (sheets.length ? "<div class='ln-sheets'>" + sheets.map(s => sheetCard(n.id, s)).join("") + "</div>" :
+        "<div class='dim'>No sheets yet " + (n.status === "completed" ? "(failed run)" : "(still " + n.status + ")") + ".</div>") +
+      (n.status === "completed" ? "<div class='ln-actions'><button class='small' data-act='pkg'>Download package (.zip)</button>" +
+        "<button class='small' data-act='cancel' hidden>Cancel</button>" +
+        "<button class='small' data-act='rerun'>Re-run</button></div>" : "") +
+      (n.status === "running" || n.status === "queued" ? "<div class='ln-actions'><button class='small' data-act='cancel'>Cancel</button></div>" : "");
+    box.dataset.loaded = "1";
+    if (box.querySelector("[data-act=pkg]"))
+      box.querySelector("[data-act=pkg]").onclick = () => downloadNestPackage(n.id);
+    const rr = box.querySelector("[data-act=rerun]"); if (rr) rr.onclick = () => rerunNest(n.id);
+    const cc = box.querySelector("[data-act=cancel]"); if (cc) cc.onclick = () => cancelNest(n.id);
+    box.querySelectorAll("[data-dl]").forEach(b =>
+      b.onclick = e => { e.stopPropagation(); downloadNestSheet(n.id, b.dataset.dl); });
+    // Previews (authenticated SVG).
+    for (const s of sheets){
+      if (!s.preview_sha) continue;
+      fetch("/laser-nests/" + n.id + "/sheets/" + s.sheet_index + "/preview",
+        { headers: { "Authorization": "Bearer " + TOKEN } })
+        .then(r => r.ok ? r.blob() : Promise.reject(new Error("preview failed")))
+        .then(b => { const el = box.querySelector("img[data-sheet='" + s.sheet_index + "']");
+          if (el) el.src = URL.createObjectURL(b); })
+        .catch(() => {});
+    }
+  } catch(e){
+    box.innerHTML = "<span class='dim'>failed to load: " + esc(e.message) + "</span>";
+  }
+}
+function sheetCard(nestId, s){
+  return "<div class='ln-sheet'><img data-sheet='" + s.sheet_index + "' alt='sheet " + s.sheet_index + "' class='ln-preview'>" +
+    "<div class='ln-sheetmeta'>Sheet " + s.sheet_index + " · " + s.placed_count + " part(s)" +
+    (s.strip_width_mm ? " · strip " + Math.round(s.strip_width_mm) + " mm" : "") +
+    (s.utilization ? " · " + Math.round(s.utilization*100) + "% fill" : "") +
+    "</div>" +
+    (s.dxf_sha ? "<button class='small' data-dl='" + s.sheet_index + "'>DXF</button>" : "") +
+    "</div>";
+}
+async function downloadNestSheet(nestId, idx){
+  try {
+    const buf = await api("GET", "/laser-nests/" + nestId + "/sheets/" + idx + "/dxf");
+    saveBuffer(buf, "nest-sheet" + idx + ".dxf", "application/dxf");
+  } catch(e){ toast("Download failed: " + e.message, "err"); }
+}
+async function downloadNestPackage(nestId){
+  try {
+    const buf = await api("GET", "/laser-nests/" + nestId + "/package");
+    saveBuffer(buf, "nest-package.zip", "application/zip");
+  } catch(e){ toast("Package download failed: " + e.message, "err"); }
+}
+function saveBuffer(buf, name, type){
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([buf], { type }));
+  a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+async function cancelNest(nestId){
+  try { await api("POST", "/laser-nests/" + nestId + "/cancel"); toast("Nest cancelled", "ok"); go("laser-nests"); }
+  catch(e){ toast("Cancel failed: " + e.message, "err"); }
+}
+async function rerunNest(nestId){
+  try { const r = await api("POST", "/laser-nests/" + nestId + "/rerun"); toast("Re-run queued: " + r.nest.status, "ok"); go("laser-nests"); }
+  catch(e){ toast("Re-run failed: " + e.message, "err"); }
 }
 async function downloadLatest(it){
   try {
@@ -1277,15 +1662,19 @@ async function viewItems(v){
   if (!PROJECTS.length || !USERS.length) await loadCommon();
   if (!ROUTE._kind) ROUTE._kind = "all";
   if (!ROUTE._cls) ROUTE._cls = "all";
+  if (ROUTE._sm === undefined) ROUTE._sm = "all";
   if (ROUTE._q === undefined) ROUTE._q = "";
   if (!ROUTE._sort) ROUTE._sort = "modified_at";
   if (!ROUTE._dir) ROUTE._dir = "desc";
   if (!ROUTE._page) ROUTE._page = 1;
+  if (!(ROUTE._sel instanceof Set)) ROUTE._sel = new Set();
   const params = new URLSearchParams({
     limit: "100", page: String(ROUTE._page),
     sort: ROUTE._sort, dir: ROUTE._dir });
   if (ROUTE._kind !== "all") params.set("kind", ROUTE._kind);
   if (ROUTE._cls !== "all") params.set("classification", ROUTE._cls);
+  if (ROUTE._sm === "on") params.set("sheet_metal", "true");
+  if (ROUTE._sm === "off") params.set("sheet_metal", "false");
   if (ROUTE._q) params.set("q", ROUTE._q);
   const d = await api("GET", "/items?" + params.toString());
   const loaded = (d.items || []).map(it => Object.assign({}, it, {
@@ -1304,6 +1693,10 @@ async function viewItems(v){
     "<div class='chips' style='margin-bottom:10px'>" +
       chip("_cls","c","all","All classes") +
       ["BE","ASM","MFG","SC"].map(c => chip("_cls","c",c,c)).join("") + "</div>" +
+    "<div class='chips' style='margin-bottom:6px'>" +
+      chip("_sm","sm","all","All parts") +
+      chip("_sm","sm","on","SHEET METAL") +
+      chip("_sm","sm","off","Not sheet metal") + "</div>" +
     "<div class='row' style='margin-bottom:8px'>" +
       "<input id='iq' placeholder='filter: name, part no, description…' value='" + esc(ROUTE._q) + "' style='width:280px'>" +
       "<select id='isort'>" +
@@ -1325,12 +1718,24 @@ async function viewItems(v){
     "</div>" +
     "<div id='itwrap'></div>";
   const wrap = $("itwrap");
+  const bulkBar = () => {
+    const n = ROUTE._sel.size;
+    if (!n) return "";
+    return "<div class='bulkbar'><b>" + n + " selected</b>" +
+      "<button class='small' id='bsmflat'>Export flat patterns</button>" +
+      "<button class='small primary' id='blast'>Create laser nest</button>" +
+      "<div class='grow'></div>" +
+      "<button class='small' id='bsmclear'>Clear</button></div>";
+  };
   const fill = async (list) => {
-    wrap.innerHTML = list.length ? itemsTable(list, true) :
+    wrap.innerHTML = bulkBar() + (list.length ? itemsTable(list, true, ROUTE._sel) :
       emptyState("ic-items", "No items match",
         "Upload a file into a project, or widen the kind / class / text filters.",
-        "<div><button class='cta' id='iproj'>Open projects</button></div>");
+        "<div><button class='cta' id='iproj'>Open projects</button></div>"));
     const ip = $("iproj"); if (ip) ip.onclick = () => go("projects");
+    const bf = $("bsmflat"); if (bf) bf.onclick = () => exportFlatPatterns([...ROUTE._sel]);
+    const bl = $("blast"); if (bl) bl.onclick = () => openLaserNestDialog([...ROUTE._sel]);
+    const bc = $("bsmclear"); if (bc) bc.onclick = () => { ROUTE._sel.clear(); fill(shown()); };
     await attachThumbs(wrap);
     wireItemTable(wrap, {
       onSort: k => {
@@ -1347,6 +1752,8 @@ async function viewItems(v){
         }
         fill();
       },
+      onSel: () => fill(shown()),
+      selSet: ROUTE._sel,
     });
   };
   const shown = () => {
@@ -1367,6 +1774,9 @@ async function viewItems(v){
   }));
   v.querySelectorAll(".chip[data-c]").forEach(c => c.addEventListener("click", () => {
     ROUTE._cls = c.dataset.c; ROUTE._page = 1; render(false);
+  }));
+  v.querySelectorAll(".chip[data-sm]").forEach(c => c.addEventListener("click", () => {
+    ROUTE._sm = c.dataset.sm; ROUTE._page = 1; render(false);
   }));
   const ip = $("iprev"), inx = $("inext");
   if (ip) ip.onclick = () => { ROUTE._page = Math.max(1, ROUTE._page - 1); render(false); };
@@ -1439,8 +1849,7 @@ async function viewMachines(v){
   $("newtool").onclick = async () => {
     const f = await openModal("New tool", [
       { id:"name", label:"Name", required:true, placeholder:"e.g. 10 mm 4-flute end mill" },
-      { id:"kind", label:"Kind", type:"select",
-        options:["end_mill","drill","boring_bar","tap","other"], value:"end_mill" },
+      { id:"kind", label:"Kind", type:"select", options:TOOL_KINDS, value:"end_mill" },
       { id:"inventory", label:"Inventory count", placeholder:"0" },
       { id:"materials", label:"Compatible materials (comma-separated)", placeholder:"e.g. Aluminum, Steel" },
     ], "Add tool");
@@ -1455,6 +1864,386 @@ async function viewMachines(v){
       render(false);
     } catch(e){ toast("Add tool: " + e.message, "err"); }
   };
+}
+
+// ── tool library (General / Cutter / Cutting data / Post processor) ─────
+const TOOL_KINDS = [
+  { value:"end_mill", label:"End mill" }, { value:"drill", label:"Drill" },
+  { value:"tap", label:"Tap" }, { value:"reamer", label:"Reamer" },
+  { value:"face_mill", label:"Face mill" }, { value:"chamfer", label:"Chamfer" },
+  { value:"turning", label:"Turning" }, { value:"holder", label:"Holder" },
+  { value:"insert", label:"Insert" }];
+function kindLabel(k){ const f = TOOL_KINDS.find(x => x.value === k);
+  return f ? f.label : (k || "—"); }
+// Geometry fields offered per tool kind; values stored in dimensions JSONB,
+// in the tool's units (mm or in).
+const TOOL_GEOMETRY = {
+  end_mill: [["diameter","Diameter"],["flute_length","Cutting length"],
+    ["overall_length","Overall length"],["corner_radius","Corner radius"],
+    ["shank_diameter","Shank diameter"]],
+  drill: [["diameter","Diameter"],["overall_length","Overall length"],
+    ["point_angle","Point angle (deg)"],["shank_diameter","Shank diameter"]],
+  tap: [["diameter","Major diameter"],["thread_pitch","Thread pitch"],
+    ["overall_length","Overall length"],["chamfer_angle","Chamfer angle (deg)"]],
+  reamer: [["diameter","Diameter"],["flute_length","Cutting length"],
+    ["overall_length","Overall length"]],
+  face_mill: [["diameter","Diameter"],["cutter_diameter","Cutter diameter"],
+    ["overall_length","Overall length"]],
+  chamfer: [["diameter","Diameter"],["chamfer_angle","Chamfer angle (deg)"],
+    ["overall_length","Overall length"]],
+  turning: [["width","Insert width"],["length","Insert length"],
+    ["thickness","Insert thickness"],["nose_radius","Nose radius"]],
+  holder: [["shank_diameter","Shank diameter"],["collet_size","Collet size"],
+    ["overall_length","Overall length"]],
+  insert: [["width","Insert width"],["length","Insert length"],
+    ["thickness","Insert thickness"],["nose_radius","Nose radius"]],
+};
+const TOOL_MATERIALS = ["Solid carbide","Coated carbide","HSS","HSS (coated)","Carbide (indexable)",
+  "Cermet","Ceramic","Diamond (PCD)","CBN","High-speed steel","Other"];
+const FINISHES = ["roughing","semi-finishing","finishing","deep slotting","general"];
+
+async function viewTools(v){
+  const d = await api("GET", "/tools").catch(() => ({ tools: [] }));
+  const tools = d.tools || [];
+  v.innerHTML =
+    "<div class='head'><h2>Tool library</h2>" +
+    "<span class='dim muted'>cutter geometry, cutting data and machine tool numbers</span>" +
+    "<div class='grow'></div>" +
+    "<button id='newtool' class='primary'>＋ New tool</button></div>" +
+    "<div class='card'>" +
+    (tools.length ?
+      "<table><thead><tr><th>Name</th><th>Type</th><th>Vendor</th><th>Part no.</th>" +
+      "<th>Units</th><th>Flutes</th><th>Tool no.</th><th>Inventory</th></tr></thead><tbody>" +
+      tools.map(t => "<tr class='toolrow' data-id='" + t.id + "' style='cursor:pointer'>" +
+        "<td><b>" + esc(t.name) + "</b>" +
+        (t.description ? "<div class='dim'>" + esc(t.description).slice(0, 90) + "</div>" : "") + "</td>" +
+        "<td class='muted'>" + esc(kindLabel(t.kind)) + "</td>" +
+        "<td class='muted'>" + esc(t.vendor || "—") + "</td>" +
+        "<td class='muted mono'>" + esc(t.part_number || "—") + "</td>" +
+        "<td class='muted'>" + esc(t.units || "mm") + "</td>" +
+        "<td class='muted'>" + (t.flutes != null ? t.flutes : "—") + "</td>" +
+        "<td class='muted mono'>" + (t.tool_number != null ? "T" + t.tool_number : "—") + "</td>" +
+        "<td class='muted'>" + (t.inventory != null ? t.inventory : "—") + "</td>" +
+        "</tr>").join("") + "</tbody></table>" :
+      emptyState("ic-tool", "No tools yet",
+        "Create tools with their cutter geometry, cutting data and machine tool numbers.")) +
+    "</div>";
+  v.querySelectorAll(".toolrow").forEach(r =>
+    r.addEventListener("click", () => go("tool", { toolid: r.dataset.id, _tab:"general" })));
+  $("newtool").onclick = async () => {
+    const f = await openModal("New tool", [
+      { id:"name", label:"Name", required:true,
+        placeholder:"e.g. 10 - Ø0.38645\" R0.03543\" (3/8 High Feed O2R 2FL)" },
+      { id:"kind", label:"Type of tool", type:"select", options:TOOL_KINDS },
+      { id:"units", label:"Units", type:"select",
+        options:[{ value:"mm", label:"Millimetre (mm)" }, { value:"in", label:"Inch (in)" }] },
+      { id:"vendor", label:"Vendor", placeholder:"optional" },
+      { id:"part_number", label:"Part number", placeholder:"optional" },
+      { id:"description", label:"Description", type:"textarea", placeholder:"optional" },
+    ], "Create tool");
+    if (!f) return;
+    try {
+      const r = await api("POST", "/tools", {
+        name: f.name, kind: f.kind, units: f.units || "mm",
+        vendor: f.vendor || null, part_number: f.part_number || null,
+        description: f.description || null });
+      go("tool", { toolid: r.tool.id, _tab:"general" });
+    } catch(e){ toast("Create tool: " + e.message, "err"); }
+  };
+}
+
+async function viewToolDetail(v){
+  if (ROUTE._tab){ TOOL.tab = ROUTE._tab; delete ROUTE._tab; }
+  const id = ROUTE.toolid;
+  const d = await api("GET", "/tools/" + id);
+  TOOL.id = id; TOOL.data = d.tool; TOOL.cutting = d.cutting_data || []; TOOL.docs = d.documents || [];
+  const t = TOOL.data;
+  const tabCount = k => k === "cutting" ? TOOL.cutting.length : k === "general" ? TOOL.docs.length : 0;
+  v.innerHTML =
+    "<div class='head'><button id='tback' class='small'>← Tool library</button>" +
+    "<h2>" + esc(t.name) + "</h2>" +
+    "<span class='dim muted'>" + esc(kindLabel(t.kind)) + " · " + esc(t.units || "mm") +
+    (t.tool_number != null ? " · T" + t.tool_number : "") + "</span>" +
+    "<div class='grow'></div>" +
+    "<button id='tsave' class='primary small'>Save</button>" +
+    "<button id='tdel' class='small'>Delete</button></div>" +
+    "<div class='tabs'>" +
+    [["general","General"],["cutter","Cutter"],["cutting","Cutting data"],["post","Post processor"]]
+      .map(x => "<div class='tab" + (TOOL.tab === x[0] ? " on" : "") + "' data-t='" + x[0] + "'>" +
+        x[1] + (tabCount(x[0]) ? " <span class='count'>" + tabCount(x[0]) + "</span>" : "") +
+        "</div>").join("") +
+    "</div><div id='ttab'></div>";
+  $("tback").onclick = () => go("tools");
+  v.querySelectorAll(".tab").forEach(x => x.addEventListener("click", () => {
+    TOOL.tab = x.dataset.t;
+    v.querySelectorAll(".tab").forEach(y => y.classList.toggle("on", y === x));
+    pushHash(); renderToolTab();
+  }));
+  $("tsave").onclick = saveTool;
+  $("tdel").onclick = async () => {
+    if (!confirm("Delete tool \"" + t.name + "\"? Its cutting data and documents are removed too.")) return;
+    try { await api("DELETE", "/tools/" + id); toast("Tool deleted", "ok"); go("tools"); }
+    catch(e){ toast("Delete tool: " + e.message, "err"); }
+  };
+  renderToolTab();
+}
+function renderToolTab(){
+  const v = $("ttab");
+  if (!v) return;
+  if (TOOL.tab === "cutter") renderToolCutter(v);
+  else if (TOOL.tab === "cutting") renderToolCutting(v);
+  else if (TOOL.tab === "post") renderToolPost(v);
+  else renderToolGeneral(v);
+}
+function tf(label, inputHtml){
+  return "<div class='tfield'><label>" + label + "</label>" + inputHtml + "</div>";
+}
+function renderToolGeneral(v){
+  const t = TOOL.data;
+  v.innerHTML =
+    "<div class='card'>" +
+    tf("Description", "<textarea id='g-desc' rows='3'>" + esc(t.description || "") + "</textarea>") +
+    "<div class='tgrid'>" +
+    tf("Vendor", "<input id='g-vendor' value='" + esc(t.vendor || "") + "' placeholder='optional'>") +
+    tf("Part number", "<input id='g-pn' class='mono' value='" + esc(t.part_number || "") + "' placeholder='optional'>") +
+    tf("Link", "<input id='g-link' value='" + esc(t.link || "") + "' placeholder='https://…'>") +
+    "</div>" +
+    "<div style='margin-top:14px'><button id='tsave2' class='primary small'>Save general</button></div></div>" +
+    "<div class='card' style='margin-top:12px'><h2 class='sec'>Documents (" + TOOL.docs.length + ")</h2>" +
+    (TOOL.docs.length ?
+      "<table><thead><tr><th>Name</th><th>Size</th><th>Added</th><th></th></tr></thead><tbody>" +
+      TOOL.docs.map(doc => "<tr>" +
+        "<td><b>" + kindBadge(doc.content_type, doc.filename) + " " + esc(doc.filename) + "</b></td>" +
+        "<td class='muted'>" + bytes(doc.size_bytes) + "</td>" +
+        "<td class='muted'>" + fmtTime(doc.created_at) + "</td>" +
+        "<td style='text-align:right;white-space:nowrap'>" +
+        "<button class='small' data-dl='" + doc.id + "'>Download</button> " +
+        "<button class='small' data-dx='" + doc.id + "'>Remove</button></td></tr>").join("") +
+      "</tbody></table>" :
+      emptyState("ic-file", "No documents attached",
+        "Attach datasheets, drawings or vendor files to this tool.")) +
+    "<div style='margin-top:10px'><input type='file' id='g-file' class='hidden'>" +
+    "<button id='gup' class='small primary'>⬆ Upload document</button></div></div>";
+  $("tsave2").onclick = saveTool;
+  $("gup").onclick = () => $("g-file").click();
+  $("g-file").onchange = e => { uploadToolDoc(e.target.files[0]); e.target.value = ""; };
+  v.querySelectorAll("[data-dl]").forEach(b =>
+    b.onclick = () => downloadToolDoc(TOOL.docs.find(x => x.id === b.dataset.dl)));
+  v.querySelectorAll("[data-dx]").forEach(b =>
+    b.onclick = async () => {
+      try { await api("DELETE", "/tools/" + TOOL.id + "/documents/" + b.dataset.dx);
+        TOOL.docs = TOOL.docs.filter(x => x.id !== b.dataset.dx);
+        toast("Document removed", "ok"); renderToolTab();
+      } catch(e){ toast("Remove document: " + e.message, "err"); }
+    });
+}
+function renderToolCutter(v){
+  const t = TOOL.data;
+  const dims = t.dimensions || {};
+  const geoms = TOOL_GEOMETRY[t.kind] || [];
+  v.innerHTML =
+    "<div class='card'>" +
+    "<div class='tgrid'>" +
+    tf("Type of tool", "<select id='c-kind'>" +
+      TOOL_KINDS.map(k => "<option value='" + k.value + "'" +
+        (k.value === t.kind ? " selected" : "") + ">" + k.label + "</option>").join("") + "</select>") +
+    tf("Units", "<select id='c-units'>" +
+      ["mm","in"].map(u => "<option value='" + u + "'" + (u === (t.units || "mm") ? " selected" : "") + ">" +
+        (u === "mm" ? "Millimetre (mm)" : "Inch (in)") + "</option>").join("") + "</select>") +
+    tf("Rotation", "<select id='c-rotation'>" +
+      ["cw","ccw"].map(r => "<option value='" + r + "'" + (r === (t.rotation || "cw") ? " selected" : "") + ">" +
+        (r === "cw" ? "Clockwise (CW)" : "Counter-clockwise (CCW)") + "</option>").join("") + "</select>") +
+    tf("Flutes / cutting edges", "<input id='c-flutes' type='number' min='0' step='1' value='" +
+      (t.flutes != null ? t.flutes : "") + "'>") +
+    "</div>" +
+    "<div class='tsec'><h3>Material</h3>" +
+    tf("Cutter material", "<select id='c-material'>" +
+      "<option value=''></option>" +
+      (t.tool_material && !TOOL_MATERIALS.includes(t.tool_material) ?
+        "<option value='" + esc(t.tool_material) + "' selected>" + esc(t.tool_material) + "</option>" : "") +
+      TOOL_MATERIALS.map(m => "<option" + (m === t.tool_material ? " selected" : "") + ">" + m + "</option>").join("") +
+      "</select>") +
+    "</div>" +
+    (geoms.length ?
+      "<div class='tsec'><h3>Geometry (" + esc(kindLabel(t.kind)) + ", in " + esc(t.units || "mm") + ")</h3>" +
+      "<div class='tgrid'>" +
+      geoms.map(g => "<div class='tfield'><label>" + g[1] + "</label>" +
+        "<input id='geom-" + g[0] + "' type='number' step='any' value='" +
+        (dims[g[0]] != null ? esc(String(dims[g[0]])) : "") + "'></div>").join("") +
+      "</div></div>" : "") +
+    "<div style='margin-top:14px'><button id='tsave3' class='primary small'>Save cutter</button></div></div>";
+  $("c-kind").onchange = () => renderToolTab();
+  $("tsave3").onclick = saveTool;
+}
+function renderToolCutting(v){
+  const u = TOOL.data.units || "mm";
+  v.innerHTML =
+    "<div class='card'><h2 class='sec'>Cutting data (" + TOOL.cutting.length + ")</h2>" +
+    "<div class='dim muted' style='margin-bottom:10px'>One row per material / finish required. Feed values are in " +
+    esc(u) + "/min, feed-per-tooth in " + esc(u) + ", spindle in rpm.</div>" +
+    (TOOL.cutting.length ?
+      "<table><thead><tr><th>Label</th><th>Material</th><th>Finish</th><th>Spindle (rpm)</th>" +
+      "<th>Cutting feed</th><th>Feed/tooth</th><th></th></tr></thead><tbody>" +
+      TOOL.cutting.map(c => "<tr>" +
+        "<td><b>" + esc(c.label || "—") + "</b></td>" +
+        "<td class='muted'>" + esc(c.material || "—") + "</td>" +
+        "<td class='muted'>" + esc(c.finish || "—") + "</td>" +
+        "<td class='mono muted'>" + (c.spindle_speed != null ? c.spindle_speed : "—") + "</td>" +
+        "<td class='mono muted'>" + (c.cutting_feedrate != null ? c.cutting_feedrate + " " + u + "/min" : "—") + "</td>" +
+        "<td class='mono muted'>" + (c.feed_per_tooth != null ? c.feed_per_tooth + " " + u : "—") + "</td>" +
+        "<td style='text-align:right;white-space:nowrap'>" +
+        "<button class='small' data-ce='" + c.id + "'>Edit</button> " +
+        "<button class='small' data-cd='" + c.id + "'>Delete</button></td></tr>").join("") +
+      "</tbody></table>" :
+      emptyState("ic-tool", "No cutting data yet",
+        "Add speeds and feedrates for the materials and finishes this tool is used on.")) +
+    "<div style='margin-top:10px'><button id='cadd' class='small primary'>＋ Add cutting data</button></div></div>";
+  $("cadd").onclick = () => addOrEditCutting(null);
+  v.querySelectorAll("[data-ce]").forEach(b =>
+    b.onclick = () => addOrEditCutting(TOOL.cutting.find(x => x.id === b.dataset.ce)));
+  v.querySelectorAll("[data-cd]").forEach(b =>
+    b.onclick = async () => {
+      if (!confirm("Delete this cutting-data row?")) return;
+      try { await api("DELETE", "/tools/" + TOOL.id + "/cutting-data/" + b.dataset.cd);
+        TOOL.cutting = TOOL.cutting.filter(x => x.id !== b.dataset.cd);
+        toast("Cutting data deleted", "ok"); renderToolTab();
+      } catch(e){ toast("Delete cutting data: " + e.message, "err"); }
+    });
+}
+function cuttingDataFields(existing, u){
+  const g = k => existing && existing[k] != null ? String(existing[k]) : "";
+  return [
+    { id:"label", label:"Label", placeholder:"e.g. Steel — roughing" },
+    { id:"material", label:"Material", placeholder:"e.g. Aluminum 6061" },
+    { id:"finish", label:"Finish required", type:"select",
+      options:FINISHES, value:existing ? (existing.finish || "roughing") : "roughing" },
+    { id:"spindle_speed", label:"Spindle speed (rpm)", placeholder:"e.g. 9000", value:g("spindle_speed") },
+    { id:"surface_speed", label:"Surface speed", placeholder:"optional", value:g("surface_speed") },
+    { id:"ramp_spindle_speed", label:"Ramp spindle speed (rpm)", placeholder:"optional", value:g("ramp_spindle_speed") },
+    { id:"cutting_feedrate", label:"Cutting feedrate (" + u + "/min)", placeholder:"e.g. 41.5", value:g("cutting_feedrate") },
+    { id:"feed_per_tooth", label:"Feed per tooth (" + u + ")", placeholder:"e.g. 0.007", value:g("feed_per_tooth") },
+    { id:"lead_in_feedrate", label:"Lead-in feedrate (" + u + "/min)", placeholder:"optional", value:g("lead_in_feedrate") },
+    { id:"lead_out_feedrate", label:"Lead-out feedrate (" + u + "/min)", placeholder:"optional", value:g("lead_out_feedrate") },
+    { id:"transition_feedrate", label:"Transition feedrate (" + u + "/min)", placeholder:"optional", value:g("transition_feedrate") },
+    { id:"ramp_feedrate", label:"Ramp feedrate (" + u + "/min)", placeholder:"optional", value:g("ramp_feedrate") },
+    { id:"ramp_angle", label:"Ramp angle (deg)", placeholder:"optional", value:g("ramp_angle") },
+    { id:"plunge_feedrate", label:"Plunge feedrate (" + u + "/min)", placeholder:"optional", value:g("plunge_feedrate") },
+    { id:"plunge_feed_per_rev", label:"Plunge feed per revolution (" + u + ")", placeholder:"optional", value:g("plunge_feed_per_rev") },
+  ];
+}
+function numOrNull(s){ s = String(s ?? "").trim(); if (s === "") return null;
+  const v = Number(s); return isNaN(v) ? null : v; }
+async function addOrEditCutting(existing){
+  const u = TOOL.data.units || "mm";
+  const f = await openModal(existing ? "Edit cutting data" : "Add cutting data",
+    cuttingDataFields(existing, u), existing ? "Save" : "Add");
+  if (!f) return;
+  const body = {
+    label: f.label || null, material: f.material || null, finish: f.finish,
+    spindle_speed: numOrNull(f.spindle_speed), surface_speed: numOrNull(f.surface_speed),
+    ramp_spindle_speed: numOrNull(f.ramp_spindle_speed),
+    cutting_feedrate: numOrNull(f.cutting_feedrate), feed_per_tooth: numOrNull(f.feed_per_tooth),
+    lead_in_feedrate: numOrNull(f.lead_in_feedrate),
+    lead_out_feedrate: numOrNull(f.lead_out_feedrate),
+    transition_feedrate: numOrNull(f.transition_feedrate),
+    ramp_feedrate: numOrNull(f.ramp_feedrate), ramp_angle: numOrNull(f.ramp_angle),
+    plunge_feedrate: numOrNull(f.plunge_feedrate),
+    plunge_feed_per_rev: numOrNull(f.plunge_feed_per_rev),
+  };
+  try {
+    if (existing){
+      const r = await api("PUT", "/tools/" + TOOL.id + "/cutting-data/" + existing.id, body);
+      const i = TOOL.cutting.findIndex(x => x.id === existing.id);
+      if (i >= 0) TOOL.cutting[i] = r.cutting_data;
+      toast("Cutting data saved", "ok");
+    } else {
+      const r = await api("POST", "/tools/" + TOOL.id + "/cutting-data", body);
+      TOOL.cutting.push(r.cutting_data);
+      toast("Cutting data added", "ok");
+    }
+    renderToolTab();
+  } catch(e){ toast("Cutting data: " + e.message, "err"); }
+}
+function renderToolPost(v){
+  const t = TOOL.data;
+  v.innerHTML =
+    "<div class='card'><h2 class='sec'>Post processor</h2>" +
+    "<div class='dim muted' style='margin-bottom:10px'>The tool number this cutter is loaded at on the machine, " +
+    "as written in the tool table by the post processor.</div>" +
+    "<div class='tgrid'>" +
+    tf("Tool number in machine", "<input id='p-tnum' type='number' min='0' step='1' value='" +
+      (t.tool_number != null ? t.tool_number : "") + "' placeholder='e.g. 10'>") +
+    "</div>" +
+    (t.tool_number != null ?
+      "<div class='dim' style='margin-top:8px'>Currently T" + t.tool_number + ".</div>" : "") +
+    "<div style='margin-top:14px'><button id='tsave4' class='primary small'>Save post processor</button></div></div>";
+  $("tsave4").onclick = saveTool;
+}
+function collectToolEdits(){
+  const txt = id => { const el = $(id); return el ? (el.value.trim() || null) : undefined; };
+  const num = id => { const el = $(id); if (!el) return undefined;
+    const s = el.value.trim(); if (s === "") return null;
+    const v = Number(s); return isNaN(v) ? null : v; };
+  const edits = {};
+  const set = (k, val) => { if (val !== undefined) edits[k] = val; };
+  set("description", txt("g-desc"));
+  set("vendor", txt("g-vendor"));
+  set("part_number", txt("g-pn"));
+  set("link", txt("g-link"));
+  set("kind", txt("c-kind"));
+  set("units", txt("c-units"));
+  set("rotation", txt("c-rotation"));
+  set("flutes", num("c-flutes"));
+  set("tool_material", txt("c-material"));
+  set("tool_number", num("p-tnum"));
+  if ($("c-kind")) {
+    const dims = TOOL.data.dimensions || {};
+    for (const [k] of TOOL_GEOMETRY[TOOL.data.kind] || []) {
+      const el = $("geom-" + k);
+      if (!el) continue;
+      const s = el.value.trim();
+      if (s === "") delete dims[k];
+      else { const val = Number(s); dims[k] = isNaN(val) ? s : val; }
+    }
+    for (const k of Object.keys(dims)) {
+      if (!(TOOL_GEOMETRY[TOOL.data.kind] || []).some(x => x[0] === k)) delete dims[k];
+    }
+    set("dimensions", Object.keys(dims).length ? dims : null);
+  }
+  return edits;
+}
+async function saveTool(){
+  try {
+    const edits = collectToolEdits();
+    if (!Object.keys(edits).length){ toast("Nothing to save", "ok"); return; }
+    TOOL.data = (await api("PUT", "/tools/" + TOOL.id, edits)).tool;
+    toast("Tool saved", "ok");
+    render(false);
+  } catch(e){ toast("Save tool: " + e.message, "err"); }
+}
+async function uploadToolDoc(file){
+  if (!file) return;
+  try {
+    const r = await api("PUT", "/blobs", undefined, file);
+    const d = await api("POST", "/tools/" + TOOL.id + "/documents", {
+      filename: file.name, blob_id: r.blob.id, content_type: file.type || null });
+    TOOL.docs.push(d.document);
+    toast("Document attached", "ok");
+    renderToolTab();
+  } catch(e){ toast("Upload document: " + e.message, "err"); }
+}
+async function downloadToolDoc(doc){
+  if (!doc) return;
+  try {
+    const r = await fetch("/tools/" + TOOL.id + "/documents/" + doc.id + "/download",
+      { headers: { "Authorization": "Bearer " + TOKEN } });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const u = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a");
+    a.href = u; a.download = doc.filename; document.body.appendChild(a);
+    a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(u), 10000);
+  } catch(e){ toast("Download: " + e.message, "err"); }
 }
 
 // ── post-processor registry ─────────────────────────────────────────────
@@ -2143,10 +2932,11 @@ function viewSystem(v){
     "<div class='skel'><span class='spinner'></span> loading…</div>";
   const load = async () => {
     try {
-      const [d, cad, scweb] = await Promise.all([
+      const [d, cad, scweb, dm] = await Promise.all([
         api("GET", "/system-info"),
         api("GET", "/settings/cad-cli").catch(() => ({})),
-        api("GET", "/settings/solidcraft-web").catch(() => ({}))
+        api("GET", "/settings/solidcraft-web").catch(() => ({})),
+        api("GET", "/settings/dutchman").catch(() => ({}))
       ]);
       const row = (k, val) =>
         "<tr><td class='dim'>" + k + "</td><td class='mono'>" +
@@ -2184,6 +2974,50 @@ function viewSystem(v){
           "<p class='dim'><a href='https://github.com/tangency-labs/solidcraft/releases/latest' target='_blank' rel='noreferrer'>tangency-labs/solidcraft</a></p>" +
           "<div class='row'><button id='cli-upd' class='primary'>" +
             (cad.update_available ? "Update CLI" : "Check / reinstall CLI") + "</button></div>" +
+          "</div>" +
+        "<div class='card'><h2 class='sec'>Dutchman (feature-tree converter)</h2><table>" +
+          "<tr><td class='dim'>Installed</td><td class='mono'>" +
+            (dm.installed
+              ? esc(String(dm.installed)) + (dm.info && dm.info.tag ? " · " + esc(String(dm.info.channel)) : "")
+              : "<span class='dim'>" + (dm.path ? "not installed — pulled on demand" : "—") + "</span>") +
+          "</td></tr>" +
+          row("Binary path", dm.path) +
+          "</table>" +
+          (dm.error ? "<p class='dim' style='color:#d98'>" + esc(dm.error) + "</p>" : "") +
+          "<p class='dim'>Decodes native CAD (Fusion, Inventor, SolidWorks, FreeCAD, CATIA, Rhino, " +
+            "ACIS, STEP, Onshape bundles) into SolidCraft designs with editable feature history. " +
+            (dm.auto_update
+              ? "Tracks the selected release channel automatically (boot + hourly; PDM_DUTCHMAN_UPDATE=0 opts out)."
+              : "Auto-update is off (PDM_DUTCHMAN_UPDATE=0).") +
+          " <a href='https://github.com/dutchman-cad/dutchman/releases' target='_blank' rel='noreferrer'>dutchman-cad/dutchman releases</a></p>" +
+          "<div class='row'><label for='dm-channel'>Release channel</label>" +
+          "<select id='dm-channel'>" +
+            ((dm.channels || []).map(c =>
+              "<option value='" + esc(c.value) + "'" +
+              (dm.settings && dm.settings.channel === c.value ? " selected" : "") + ">" + esc(c.label) + "</option>")
+            .join("")) +
+          "</select></div>" +
+          "<div class='row'><button id='dm-upd' class='primary'>" +
+            (dm.update_available ? "Download the referenced release" : "Check / reinstall Dutchman") +
+            "</button></div>" +
+          "<h2 class='sec' style='margin-top:12px'>Conversion settings (this org)</h2>" +
+          "<div class='row'><label for='dm-preset'>Preset</label>" +
+          "<select id='dm-preset'>" + ["fast","standard","full"].map(p =>
+            "<option value='" + p + "'" + ((dm.settings||{}).preset === p ? " selected" : "") + ">" + p + "</option>").join("") +
+          "</select>" +
+          "<label for='dm-parts'>Part positions</label>" +
+          "<select id='dm-parts'>" + ["smart","last-shown","first-placed"].map(p =>
+            "<option value='" + p + "'" + ((dm.settings||{}).part_positions === p ? " selected" : "") + ">" + p + "</option>").join("") +
+          "</select></div>" +
+          "<div class='row'><label for='dm-verify'><input type='checkbox' id='dm-verify'" +
+            (((dm.settings||{}).verify !== false) ? " checked" : "") + "> Verify history in SolidCraft</label>" +
+          "<label for='dm-timeout'>Timeout (s, 0 = 1800)</label>" +
+          "<input id='dm-timeout' type='number' min='0' max='7200' step='60' style='width:90px' value='" +
+            ((dm.settings||{}).timeout_secs || 0) + "'></div>" +
+          "<div class='row'><label for='dm-onshape-calls'>Onshape fetch calls (0 = 200)</label>" +
+          "<input id='dm-onshape-calls' type='number' min='0' max='10000' step='10' style='width:110px' value='" +
+            ((dm.settings||{}).onshape_max_calls || 0) + "'></div>" +
+          "<div class='row'><button id='dm-save'>Save conversion settings</button></div>" +
           "</div>" +
         "<div class='card'><h2 class='sec'>SolidCraft web editor</h2><table>" +
           "<tr><td class='dim'>Installed</td><td class='mono'>" +
@@ -2235,6 +3069,32 @@ function viewSystem(v){
           toast("SolidCraft web " + (r.installed || "updated"), "ok");
           load();
         } catch(e){ toast("Web editor update: " + e.message, "err"); wup.disabled = false; wup.textContent = "Update web editor"; }
+      };
+      const dup = $("dm-upd");
+      if (dup) dup.onclick = async () => {
+        dup.disabled = true; dup.textContent = "Downloading…";
+        try {
+          const channel = $("dm-channel") ? $("dm-channel").value : "latest";
+          await api("PUT", "/settings/dutchman", { channel });
+          const r = await api("POST", "/settings/dutchman/update", {});
+          toast("Dutchman " + (r.installed || "updated") + " (" + channel + ")", "ok");
+          load();
+        } catch(e){ toast("Dutchman update: " + e.message, "err"); dup.disabled = false; dup.textContent = "Update Dutchman"; }
+      };
+      const dsave = $("dm-save");
+      if (dsave) dsave.onclick = async () => {
+        dsave.disabled = true;
+        try {
+          await api("PUT", "/settings/dutchman", {
+            preset: $("dm-preset").value,
+            part_positions: $("dm-parts").value,
+            verify: $("dm-verify").checked,
+            timeout_secs: Number($("dm-timeout").value || 0),
+            onshape_max_calls: Number($("dm-onshape-calls").value || 0)
+          });
+          toast("Dutchman settings saved", "ok");
+          load();
+        } catch(e){ toast("Dutchman settings: " + e.message, "err"); dsave.disabled = false; }
       };
     } catch(e){
       v.innerHTML = "<div class='errbox'>" + esc(e.message) + "</div>" +
@@ -2490,15 +3350,17 @@ function bulkBarHTML(){
     "<button class='small' id='bmove'>Move to folder</button>" +
     "<button class='small' id='bowner'>Assign owner</button>" +
     "<button class='small' id='bco'>Check out</button>" +
+    "<button class='small' id='bflat'>Export flat patterns</button>" +
     "<div class='grow'></div>" +
     "<button class='small' id='bclear'>Clear</button></div>";
 }
 function wireBulk(){
   const ids = [...ROUTE._sel];
-  const bm = $("bmove"), bo = $("bowner"), bc = $("bco"), bl = $("bclear");
+  const bm = $("bmove"), bo = $("bowner"), bc = $("bco"), bf = $("bflat"), bl = $("bclear");
   if (bm) bm.onclick = () => moveItems(ROUTE.pid, ids);
   if (bo) bo.onclick = () => assignOwner(ids);
   if (bc) bc.onclick = () => checkoutBulk(ids);
+  if (bf) bf.onclick = () => exportFlatPatterns(ids);
   if (bl) bl.onclick = () => { ROUTE._sel.clear(); refreshExpTable(); };
 }
 async function refreshExpTable(){
@@ -2607,9 +3469,10 @@ async function viewExplorer(v){
     "<span class='dim muted'>" + ROUTE._items.length + " items · created " +
     fmtTime(proj ? proj.created_at : null) + "</span>" +
     "<div class='grow'></div>" +
-    "<button id='newfolder' class='small'>＋ Folder</button>" +
-    "<button id='newitem' class='small'>＋ Item</button>" +
-    "<button id='uploadbtn' class='primary small'>⬆ Upload</button>" +
+     "<button id='newfolder' class='small'>＋ Folder</button>" +
+     "<button id='newitem' class='small'>＋ Item</button>" +
+     (isRole("editor") ? "<button id='newscpart' class='small' title='Model a new part in the SolidCraft web CAD app, then Save to PDM stores it as a new item (blank part number = auto-assign)'>✎ New part in SolidCraft web</button>" : "") +
+     "<button id='uploadbtn' class='primary small'>⬆ Upload</button>" +
     "<button id='projkebab' class='kebab-btn vis' title='Project actions'>⋮</button>" +
     "</div>" +
     "<div class='tabs'>" + ptabs.map(t =>
@@ -2657,6 +3520,8 @@ async function viewExplorer(v){
       render(false);
     } catch(e){ toast("Create failed: " + e.message, "err"); }
   };
+  const nsp = $("newscpart");
+  if (nsp) nsp.onclick = () => newPartInSolidcraftWeb(pid);
   $("uploadbtn").onclick = () => pickFiles(pid);
   attachThumbs(v);
   await renderProjectTab(v);
@@ -2798,6 +3663,25 @@ async function projectSettingsTab(box){
     "</div>" +
     maSection +
     "<div id='onshape-folder-section' style='margin-top:14px;border-top:1px solid var(--line);padding-top:14px'><h2 class='sec'>Onshape folder sync</h2><p class='dim'>Loading…</p></div>" +
+    "<div id='os-import-section' style='margin-top:14px;border-top:1px solid var(--line);padding-top:14px'>" +
+    "<h2 class='sec'>Import from Onshape (Dutchman)</h2>" +
+    "<p class='dim'>Fetches one Part Studio straight from Onshape with the Dutchman Onshape reader " +
+    "(the org's Onshape API keys), checks the .onshape-bundle in as a new version, and converts it " +
+    "to a SolidCraft design. The Dutchman channel must reference a build with the Onshape reader " +
+    "(System › Dutchman). Re-importing the same Part Studio adds a version to the existing item.</p>" +
+    "<div class='modal-field'><label>Part Studio URL</label>" +
+    "<input id='os-import-url' placeholder='https://cad.onshape.com/documents/&lt;id&gt;/w/&lt;workspace&gt;/e/&lt;element&gt;'></div>" +
+    "<div class='modal-field'><label>Name / part number (optional)</label><input id='os-import-name'></div>" +
+    "<div class='row'><label style='display:inline-flex;gap:6px;align-items:center'><input type='checkbox' id='os-import-convert' checked> Check in the converted SolidCraft design</label> " +
+    "<button id='os-import-go' class='primary'>Import</button></div>" +
+    "<h3>Manual STEP fallback</h3>" +
+    "<p class='dim'>Export STEP from Onshape, then upload it here to convert its geometry to SolidCraft. " +
+    "This does not require Onshape API keys or the Dutchman Onshape reader. STEP does not include the original feature history. " +
+    "The Part Studio URL above is optional for this upload; when supplied, it reuses the linked item, including an item left by a failed import.</p>" +
+    "<div class='modal-field'><label for='os-step-file'>Onshape STEP export</label><input id='os-step-file' type='file' accept='.step,.stp'></div>" +
+    "<button id='os-step-go'>Upload STEP</button>" +
+    "<p id='os-import-status' role='status' aria-live='polite' style='white-space:pre-wrap'></p>" +
+    "</div>" +
     "<p class='dim' style='font-size:12.5px;margin-top:12px'>Part-number prefixes and the approval gate are org-wide — set them under Settings. Use the project menu (⋮) to archive or delete this project.</p>" +
     "</div>";
   const setBtn = $("ma-set"), chg = $("ma-change"), clr = $("ma-clear");
@@ -2809,7 +3693,9 @@ async function projectSettingsTab(box){
   try {
     const data = await api("GET", "/projects/" + pid + "/onshape-folder");
     if (!section.isConnected) return;
-    if (!data.enabled) { section.innerHTML = "<h2 class='sec'>Onshape folder sync</h2><p class='dim'>Disabled in organization Settings.</p>"; return; }
+    if (!data.enabled) {
+      section.innerHTML = "<h2 class='sec'>Onshape folder sync</h2><p class='dim'>Disabled in organization Settings.</p>";
+    } else {
     const link = data.link;
     const result = link && link.result || {};
     section.innerHTML = "<h2 class='sec'>Onshape folder sync</h2>" +
@@ -2831,7 +3717,102 @@ async function projectSettingsTab(box){
       catch(e){ toast("Onshape sync: " + e.message, "err"); }
     };
     if (link && link.status === "running") setTimeout(() => { if (section.isConnected && ROUTE.pid === pid && ROUTE._ptab === "settings") projectSettingsTab(box); }, 5000);
+    }
   } catch(e) { if (section.isConnected) section.textContent = "Onshape folder sync: " + e.message; }
+  const osGo = $("os-import-go");
+  const stepGo = $("os-step-go"), status = $("os-import-status");
+  stepGo.onclick = async () => {
+    const file = $("os-step-file").files[0];
+    if (!file) { toast("Choose an exported STEP file first", "err"); return; }
+    const options = {
+      url: $("os-import-url").value.trim(), name: $("os-import-name").value.trim(),
+      convert: $("os-import-convert").checked
+    };
+    stepGo.disabled = true; osGo.disabled = true;
+    status.textContent = "Uploading STEP" + (options.convert ? " and converting to SolidCraft…" : "…");
+    try {
+      const result = await importOnshapeStep(pid, file, options);
+      status.textContent = "STEP saved to " + result.item.part_number + " as v" + result.version.seq +
+        (options.convert ? "; SolidCraft design checked in. See the item's Versions tab." : ". See the item's Versions tab.");
+      toast("Onshape STEP import complete", "ok");
+    } catch(e) {
+      status.textContent = "STEP import: " + e.message;
+      toast(status.textContent, "err", 10000);
+    } finally {
+      stepGo.disabled = false; osGo.disabled = false;
+    }
+  };
+  if (osGo) osGo.onclick = async () => {
+    const url = $("os-import-url").value.trim();
+    if (!url) { toast("Paste a Part Studio link first", "err"); return; }
+    const name = $("os-import-name").value.trim() || undefined;
+    const convert = $("os-import-convert").checked;
+    osGo.disabled = true; stepGo.disabled = true; osGo.textContent = "Importing…";
+    status.textContent = "Starting Onshape import…";
+    try {
+      const r = await api("POST", "/projects/" + pid + "/onshape-import", {
+        url, name
+      });
+      status.textContent = "Fetching from Onshape. Job: " + r.job.id + " (see Tasks).";
+      toast("Fetching the Part Studio from Onshape — this can take a while…", "ok", 10000);
+      if (!await waitForVersionJob(r.job.id, { isConnected: true })) return;
+      if (convert) {
+        toast("Importing to SolidCraft…", "ok", 10000);
+        const d = await api("GET", "/items/" + r.item.id);
+        if (!d.head_version) throw new Error("the imported item has no version");
+        await importVersionToSolidcraft(r.item.id, d.head_version);
+      }
+      toast("Onshape import complete", "ok");
+      ALLITEMS = []; ALLITEMS_AT = 0;
+      if (box.isConnected && ROUTE.pid === pid && ROUTE._ptab === "settings") await projectSettingsTab(box);
+    } catch(e) {
+      status.textContent += "\nOnshape import failed: " + e.message +
+        "\nYou can upload an exported STEP below to import the geometry instead.";
+      toast("Onshape import: " + e.message, "err", 10000);
+    } finally {
+      stepGo.disabled = false;
+      if (osGo.isConnected) { osGo.disabled = false; osGo.textContent = "Import"; }
+    }
+  };
+}
+
+// A manual export stays a STEP source; linking it to Onshape never changes the
+// format passed to Dutchman. No Onshape network access or API keys are needed.
+async function importOnshapeStep(pid, file, options){
+  if (!/\.(step|stp)$/i.test(file.name)) throw new Error("Choose a .step or .stp file");
+  if (!file.size) throw new Error("The STEP file is empty");
+  let source = null, item;
+  if (options.url) {
+    const match = options.url.match(/^https:\/\/(?:cad\.)?onshape\.com\/documents\/([a-f\d]{24})\/(w|v)\/([a-f\d]{24})\/e\/([a-f\d]{24})(?:[/?#]|$)/i);
+    if (!match) throw new Error("Use a Part Studio workspace or version URL, or leave the URL blank");
+    source = { document:match[1], element:match[4] };
+    const found = await api("GET", "/integrations/onshape/lookup?document_id=" + source.document + "&element_id=" + source.element);
+    item = found.item;
+    if (item && item.project_id !== pid)
+      throw new Error("This Part Studio is already linked to an item in another project");
+  }
+  if (!item) {
+    const created = await api("POST", "/projects/" + pid + "/items", {
+      description:options.name || file.name.replace(/\.[^.]+$/, ""),
+      part_number:options.name || null, classification:"BE", folder_id:null
+    });
+    item = created.item;
+  }
+  if (source) {
+    for (const [key, value] of [["onshape.document_id", source.document], ["onshape.element_id", source.element], ["onshape.url", options.url]])
+      await api("PUT", "/items/" + item.id + "/properties/" + encodeURIComponent(key), { value, value_type:"string" });
+  }
+  const result = await checkinItem(item.id, file, "Manual Onshape STEP export" + (options.url ? " from " + options.url : ""));
+  ALLITEMS = []; ALLITEMS_AT = 0;
+  if (options.convert) {
+    try {
+      await importVersionToSolidcraft(item.id, result.version);
+    } catch(e) {
+      throw new Error("STEP saved to " + item.part_number + " as v" + result.version.seq +
+        ", but SolidCraft conversion failed: " + e.message + ". Retry Convert to SolidCraft from the item's Versions tab.");
+    }
+  }
+  return { item, version:result.version };
 }
 
 // ── item detail ─────────────────────────────────────────────────────────
@@ -2845,7 +3826,7 @@ function detailTabs(){
     ["revisions", "Revisions", (DETAIL.revs || []).length || null],
     ["deps", "Dependencies"],
     ["bom", "BOM"],
-    ["mfg", "Manufacturing"],
+    ["mfg", "Sheet metal"],
     ["comments", "Comments", (DETAIL.comments || []).length || null],
     ["activity", "Activity"],
     ["perm", "Permissions"],
@@ -2856,9 +3837,22 @@ function versionDownloadName(vv,d){
   const name=sourceFilename(vv,d)||d.item.part_number, dot=name.lastIndexOf(".");
   return dot>0 ? name.slice(0,dot)+"-v"+vv.seq+name.slice(dot) : name+"-v"+vv.seq;
 }
+// Formats the server's `cad.solidcraft` job converts: native CAD goes through
+// Dutchman (feature history where it maps), geometry-only formats through the
+// SolidCraft CLI.
+const CONVERTIBLE_EXTS = ["f3d","f3z","sldprt","sldasm","catpart","pvz","sat","sab","smt","smb",
+  "onshape-bundle",
+  "step","stp","igs","iges","ipt","iam","fcstd","3dm","stl","obj","3mf","glb","gltf"];
+function extOf(filename){
+  const n = String(filename || ""); const dot = n.lastIndexOf(".");
+  return dot > 0 ? n.slice(dot + 1).toLowerCase() : "";
+}
 function nativeConversionAllowed(vv, d){
-  const ext = String(vv.native_format || sourceFilename(vv,d).split(".").pop()).toLowerCase();
-  return ["step","stp","igs","iges","ipt","iam","fcstd","3dm","stl","obj","3mf","glb","gltf"].includes(ext);
+  const ext = String(vv.native_format || extOf(sourceFilename(vv,d))).toLowerCase();
+  return CONVERTIBLE_EXTS.includes(ext);
+}
+function convertibleByName(filename){
+  return CONVERTIBLE_EXTS.includes(extOf(filename));
 }
 function serverPreviewAllowed(vv,d){
   return nativeConversionAllowed(vv,d) || /\.(sc|solidcraft|solvecraft|json)$/i.test(sourceFilename(vv,d));
@@ -2866,7 +3860,7 @@ function serverPreviewAllowed(vv,d){
 function nativeAction(vv,d){
   if (!vv || !isRole("editor") || (!vv.derived_solidcraft_sha256 && !nativeConversionAllowed(vv,d))) return "";
   return "<button class='small' data-native='" + vv.id +
-    "' title='Convert this version to a native SolidCraft design and check it in as a new version'>" +
+    "' title='Import this version into SolidCraft with Dutchman (keeping the editable feature tree where it maps) and check the result in as a new version'>" +
     "Convert to SolidCraft</button>";
 }
 // ── SolidCraft web (the CAD app, bundled in the image and run in a same-origin
@@ -2884,7 +3878,7 @@ function solidcraftWebOpenable(vv,d){
 async function openSolidcraftWeb(itemId, versionId){
   try {
     const d = await api("GET", "/items/" + itemId);
-    let version = versionId ? (d.versions || []).find(v => v.id === versionId) : d.head_version;
+    const version = versionId ? (d.versions || []).find(v => v.id === versionId) : d.head_version;
     if (!version) throw new Error("No version available to open");
     const openedVersionId = version.id;
     let designName;
@@ -2905,30 +3899,75 @@ async function openSolidcraftWeb(itemId, versionId){
     if (!designName) throw new Error("This version has no file name to open");
     await PdmEditors.openSolidcraft({ version, name: designName,
       designUrl: "/public/design/" + openedVersionId + "/" + encodeURIComponent(designName),
-      checkin: isRole("editor") ? async (buffer, message) => {
-        const cur = await api("GET", "/items/" + itemId);
-        if (!cur.head_version || cur.head_version.id !== version.id)
-          throw new Error("The vault head has changed since this design was opened. Download your edits and compare with the latest version.");
-        if (cur.lock && cur.lock.user_id !== myId()) throw new Error("The item is checked out by " + lockName(cur.lock));
-        if (!cur.lock) await api("POST", "/items/" + itemId + "/checkout", { workstation:location.hostname });
-        const up = await api("PUT", "/blobs", null, new Uint8Array(buffer));
-        const result = await api("POST", "/items/" + itemId + "/checkin", {
-          sha256:up.blob.sha256, base_version:version.seq, commit_message:message,
-          filename:designName, mime_type:"application/octet-stream",
-        });
-        version = result.version;
-        ALLITEMS = []; ALLITEMS_AT = 0;
-        return version;
-      } : null,
+      checkin: isRole("editor") ? makeScCheckin(itemId, version, designName) : null,
       onSaved: () => { if (CUR_RELOAD) CUR_RELOAD(); },
+    });
+  } catch(e){ toast("SolidCraft web: " + e.message, "err", 8000); }
+}
+// Check the design bytes into the item as a new immutable version (checking
+// the item out first when unheld). base null = the item's first version.
+async function scCheckin(itemId, base, versionId, designName, buffer, message){
+  const cur = await api("GET", "/items/" + itemId);
+  if (base !== null && (!cur.head_version || cur.head_version.id !== versionId))
+    throw new Error("The vault head has changed since this design was opened. Download your edits and compare with the latest version.");
+  if (cur.lock && cur.lock.user_id !== myId()) throw new Error("The item is checked out by " + lockName(cur.lock));
+  if (!cur.lock) await api("POST", "/items/" + itemId + "/checkout", { workstation:location.hostname });
+  const up = await api("PUT", "/blobs", null, new Uint8Array(buffer));
+  const result = await api("POST", "/items/" + itemId + "/checkin", {
+    sha256:up.blob.sha256, base_version:base, commit_message:message,
+    filename:designName, mime_type:"application/octet-stream",
+  });
+  ALLITEMS = []; ALLITEMS_AT = 0;
+  return result.version;
+}
+// Successive check-ins of one design (the editor's Save to PDM button): the
+// base tracks the newest version this session checked in.
+function makeScCheckin(itemId, version, designName){
+  let head = version;
+  return async (buffer, message) => {
+    const v = await scCheckin(itemId, head.seq, head.id, designName, buffer, message);
+    head = v;
+    return v;
+  };
+}
+// "New part in SolidCraft web" (project explorer): a blank SolidCraft web
+// session; Save to PDM asks for the item's metadata (part number blank =
+// auto-assign from the org's prefix) and checks the design in as v1.
+async function newPartInSolidcraftWeb(pid){
+  try {
+    const fd = await api("GET", "/projects/" + pid + "/folders").catch(() => ({ folders: [] }));
+    const folders = fd.folders || [];
+    await PdmEditors.openSolidcraft({
+      createNew: isRole("editor") ? async (buffer, into) => {
+        const f = await openModal("New part", [
+          { id:"desc", label:"Description", required:true, placeholder:"what is this part?" },
+          { id:"pn", label:"Part number (blank = auto-assign)" },
+          { id:"cls", label:"Classification", type:"select", options:["BE","ASM","MFG","SC"], value:"BE" },
+          { id:"folder", label:"Folder", type:"select",
+            options:[{value:"",label:"(project root)"}]
+              .concat(folders.map(x => ({ value:x.id, label:x.name }))) },
+          { id:"msg", label:"Version message", value:"Created in SolidCraft web" },
+        ], "Create part", null, into);
+        if (!f) return null;
+        const created = await api("POST", "/projects/" + pid + "/items",
+          { part_number: f.pn || null, description: f.desc,
+            classification: f.cls, folder_id: f.folder || null });
+        const item = created.item;
+        const filename = item.part_number + ".sc";
+        const version = await scCheckin(item.id, null, null, filename, buffer, f.msg || "Created in SolidCraft web");
+        return { item, version, checkin: makeScCheckin(item.id, version, filename) };
+      } : null,
+      onSaved: () => { render(false); },
     });
   } catch(e){ toast("SolidCraft web: " + e.message, "err", 8000); }
 }
 function wireNativeActions(root){
   root.querySelectorAll("[data-native]").forEach(b => { b.onclick = () => nativeVersionAction(b.dataset.native,b); });
 }
+// Dutchman feature-tree conversions can run for many minutes, so the poll is
+// generous (15 min); the Tasks view shows live progress meanwhile.
 async function waitForVersionJob(id,button){
-  for (let i=0;i<180;i++) {
+  for (let i=0;i<900;i++) {
     if (!button.isConnected) return false;
     const {job} = await api("GET","/jobs/"+id);
     if (job.status === "done") return true;
@@ -2944,46 +3983,67 @@ async function refreshVersionInfo(itemId,vid){
   const vv = data.versions.find(v=>v.id===vid);
   return vv;
 }
+// Shared "import to SolidCraft": converts the given version through the
+// server's `cad.solidcraft` job (Dutchman for native CAD, with the feature
+// tree where it maps; the SolidCraft CLI for geometry-only formats), then
+// checks the resulting .sc in as a new immutable version. The source version
+// is preserved.
+async function importVersionToSolidcraft(itemId, version, button){
+  if (!version.derived_solidcraft_sha256){
+    if (button) button.textContent = "Converting…";
+    const result = await api("POST","/versions/"+version.id+"/solidcraft");
+    if (!result.artifact.sha256 && result.job)
+      await waitForVersionJob(result.job.id, { isConnected: () => true });
+    const data = await api("GET","/items/"+itemId);
+    const cur = data.versions.find(v=>v.id===version.id);
+    if (!cur || !cur.derived_solidcraft_sha256)
+      throw new Error((cur && cur.derived_solidcraft_error) || "The conversion did not produce a native design");
+  }
+  const meta = await api("GET","/versions/"+version.id+"/solidcraft");
+  const item = await api("GET","/items/"+itemId);
+  const dup = (item.versions||[]).find(v=>v.sha256 === meta.artifact.sha256);
+  if (dup){ toast("Already imported to SolidCraft — see v"+dup.seq,"ok"); return; }
+  if (item.lock && item.lock.user_id !== myId())
+    throw new Error("checked out by " + lockName(item.lock) + " — undo the checkout and retry");
+  if (button) button.textContent = "Checking in…";
+  if (!item.lock) await api("POST","/items/"+itemId+"/checkout",{workstation:location.hostname});
+  const bytes = await api("GET","/versions/"+version.id+"/solidcraft/blob");
+  const up = await api("PUT","/blobs",null,new Uint8Array(bytes));
+  const attempt = await api("POST","/items/"+itemId+"/checkin",{
+    sha256:up.blob.sha256, size:up.blob.size_bytes,
+    base_version: item.head_version ? item.head_version.seq : null,
+    commit_message:"Converted v"+version.seq+" to SolidCraft",
+    filename:meta.filename, mime_type:"application/octet-stream",
+  });
+  toast("Imported to SolidCraft — new version v"+attempt.version.seq+" (source version preserved).","ok",7000);
+  ALLITEMS = []; ALLITEMS_AT = 0;
+  CUR_RELOAD && CUR_RELOAD();
+}
+// From the version rows / item header (detail view).
 async function nativeVersionAction(vid,button){
   const itemId = DETAIL.id;
   const version = DETAIL.data.versions.find(v=>v.id===vid);
   if (!version) return;
   button.disabled = true;
   try {
-    if (!version.derived_solidcraft_sha256){
-      button.textContent = "Converting…";
-      const result = await api("POST","/versions/"+vid+"/solidcraft");
-      if (!result.artifact.sha256 && (!result.job || !await waitForVersionJob(result.job.id,button))) return;
-      const updated = await refreshVersionInfo(itemId,vid);
-      if (!updated) return;
-      if (!updated.derived_solidcraft_sha256)
-        throw new Error(updated.derived_solidcraft_error || "The conversion did not produce a native design");
-    }
-    const meta = await api("GET","/versions/"+vid+"/solidcraft");
-    const item = await api("GET","/items/"+itemId);
-    const dup = (item.versions||[]).find(v=>v.sha256 === meta.artifact.sha256);
-    if (dup){ toast("Already converted to SolidCraft — see v"+dup.seq,"ok"); return; }
-    if (item.lock && item.lock.user_id !== myId())
-      throw new Error("checked out by " + lockName(item.lock) + " — undo the checkout and retry");
-    button.textContent = "Checking in…";
-    if (!item.lock) await api("POST","/items/"+itemId+"/checkout",{workstation:location.hostname});
-    const bytes = await api("GET","/versions/"+vid+"/solidcraft/blob");
-    const up = await api("PUT","/blobs",null,new Uint8Array(bytes));
-    const body = {
-      sha256:up.blob.sha256, size:up.blob.size_bytes,
-      base_version: item.head_version ? item.head_version.seq : null,
-      commit_message:"Converted v"+version.seq+" to SolidCraft",
-      filename:meta.filename, mime_type:"application/octet-stream",
-    };
-    const attempt = await api("POST","/items/"+itemId+"/checkin",body);
-    toast("Created v"+attempt.version.seq+" — SolidCraft conversion of v"+version.seq+" (source version preserved).","ok",7000);
-    ALLITEMS = [];
-    CUR_RELOAD && CUR_RELOAD();
+    await importVersionToSolidcraft(itemId, version, button);
   } catch(e){ toast("Convert to SolidCraft: "+e.message,"err",8000); }
   finally {
     button.disabled=false;
     button.textContent = "Convert to SolidCraft";
   }
+}
+// From the items list (right-click menu and ⋮): import the item's head version.
+async function importItemHead(it){
+  try {
+    const d = await api("GET", "/items/" + it.id);
+    const vv = d.head_version;
+    if (!vv) throw new Error("No version to import");
+    if (isNativeDesign(vv, d)) { toast("Already a native SolidCraft design","ok"); return; }
+    if (!nativeConversionAllowed(vv, d)) throw new Error("This file type does not convert to SolidCraft");
+    toast("Importing to SolidCraft via Dutchman — this can take a few minutes…","ok",10000);
+    await importVersionToSolidcraft(it.id, vv);
+  } catch(e){ toast("Import to SolidCraft: "+e.message,"err",8000); }
 }
 async function regenerateVersionPreview(vid,button){
   const itemId=DETAIL.id;
@@ -3124,12 +4184,139 @@ async function renderDetailTab(){
   else if (t === "bom") tabSoon(box, bigIcon("ic-bom"), "Bill of materials",
     "BOM export is a PDM backend feature on the roadmap. This item's classification (" +
     esc(DETAIL.data.item.classification || "") + ") shows under Items.");
-  else if (t === "mfg") tabSoon(box, bigIcon("ic-manufacturing"), "Manufacturing",
-    "Manufacturing packages (DXF / G-code / release bundles) are a PDM backend feature on the roadmap. Named revisions for this item appear under Revisions.");
+  else if (t === "mfg") await tabSheetMetal(box);
 }
 function tabSoon(box, ic, title, text){
   box.innerHTML = "<div class='soon'><span class='ic'>" + ic + "</span><h3>" +
     esc(title) + "</h3><p>" + esc(text) + "</p></div>";
+}
+
+// ── sheet metal tab (MFG): spec + flat-pattern DXF attach/download ─────
+async function tabSheetMetal(box){
+  const it = DETAIL.data.item;
+  const d = await api("GET", "/items/" + it.id + "/sheet-metal");
+  const spec = d.sheet_metal_spec || null;
+  const mats = await api("GET", "/sheet-materials").catch(() => ({ materials: [] }));
+  const matNames = [...new Set((mats.materials || []).map(m => m.material).filter(Boolean))];
+  const edit = isRole("editor");
+  const specLine = (k, v) => "<div><span class='k'>" + k + "</span> " + (v != null && v !== "" ? esc(String(v)) : "—") + "</div>";
+  box.innerHTML =
+    "<div class='head'>" +
+      "<h2>Sheet metal</h2>" +
+      "<span class='dim muted'>" + (spec
+        ? "Flagged as a sheet-metal part — it shows under the Items › SHEET METAL filter and can be bulk-exported with flat patterns"
+        : "Flag this part as sheet metal to separate it from ordinary 3D models") + "</span>" +
+    "</div>" +
+    "<div class='grid2'>" +
+      "<div class='card'>" +
+        "<h3 class='sec'>Spec</h3>" +
+        "<div class='dmeta' style='margin:0'>" +
+          specLine("Material", spec && spec.material) +
+          specLine("Thickness", spec && spec.thickness_mm != null ? spec.thickness_mm + " mm" : null) +
+          specLine("Bend radius", spec && spec.bend_radius_mm != null ? spec.bend_radius_mm + " mm" : null) +
+          specLine("K-factor", spec && spec.k_factor != null ? spec.k_factor : null) +
+        "</div>" +
+        (edit ?
+          "<div style='margin-top:12px'>" +
+            "<div class='row'>" +
+              "<input id='sm-mat' list='sm-mat-names' placeholder='Material (e.g. Steel 1.1512)' value='" +
+                esc((spec && spec.material) || "") + "' style='flex:1;min-width:160px'>" +
+              "<datalist id='sm-mat-names'>" + matNames.map(n => "<option value='" + esc(n) + "'>").join("") + "</datalist>" +
+            "</div>" +
+            "<div class='row' style='margin-top:6px'>" +
+              "<input id='sm-thick' type='number' step='0.01' min='0' placeholder='Thickness mm' value='" +
+                (spec && spec.thickness_mm != null ? spec.thickness_mm : "") + "' style='width:110px'>" +
+              "<input id='sm-br' type='number' step='0.01' min='0' placeholder='Bend radius mm' value='" +
+                (spec && spec.bend_radius_mm != null ? spec.bend_radius_mm : "") + "' style='width:110px'>" +
+              "<input id='sm-kf' type='number' step='0.001' placeholder='K-factor' value='" +
+                (spec && spec.k_factor != null ? spec.k_factor : "") + "' style='width:90px'>" +
+              "<button id='sm-save' class='primary small'>" + (spec ? "Save spec" : "Mark as sheet metal") + "</button>" +
+            "</div>" +
+          "</div>" : "") +
+      "</div>" +
+      "<div class='card'>" +
+        "<h3 class='sec'>Flat pattern (DXF)</h3>" +
+        (spec && spec.flat_pattern_sha
+          ? "<p class='dim' style='margin:0 0 8px'>Attached · sha256 " + esc(spec.flat_pattern_sha.slice(0, 16)) + "…</p>" +
+            "<div class='row'>" +
+              "<button class='primary small' id='sm-dl'>Download flat pattern</button>" +
+              (edit ? "<button class='small' id='sm-replace'>Replace…</button>" +
+                "<button class='small' id='sm-gen'>Regenerate from 3D model</button>" : "") +
+            "</div>"
+          : "<p class='dim' style='margin:0 0 8px'>No flat pattern attached yet. For SolidCraft sheet-metal designs the flat pattern is generated from the 3D model; otherwise export it from your CAD system as DXF and attach it." +
+            (spec ? "" : " The spec on the left is optional — you can generate or attach a pattern first.") + "</p>" +
+            (edit ? "<div class='row'>" +
+              "<button class='primary small' id='sm-gen'>Generate from 3D model</button>" +
+              "<button class='small' id='sm-attach'>Attach flat pattern (DXF)…</button>" +
+            "</div>" : "")) +
+        (edit ? "<input type='file' id='sm-file' accept='.dxf,application/dxf' style='display:none'>" : "") +
+      "</div>" +
+    "</div>";
+  const save = $("sm-save");
+  if (save) save.onclick = async () => {
+    const num = x => x.trim() === "" ? null : Number(x);
+    const thick = num($("sm-thick").value), br = num($("sm-br").value), kf = num($("sm-kf").value);
+    if ((thick != null && isNaN(thick)) || (br != null && isNaN(br)) || (kf != null && isNaN(kf)))
+      return toast("Numeric fields must be numbers", "err");
+    try {
+      await api("POST", "/items/" + it.id + "/sheet-metal", {
+        material: $("sm-mat").value.trim() || null,
+        thickness_mm: thick, bend_radius_mm: br, k_factor: kf,
+      });
+      toast(spec ? "Spec saved" : "Part flagged as sheet metal", "ok");
+      DETAIL.data = null;
+      await render(false);
+    } catch(e){ toast("Save failed: " + e.message, "err"); }
+  };
+  const dl = $("sm-dl");
+  if (dl) dl.onclick = async () => {
+    try {
+      const buf = await api("GET", "/items/" + it.id + "/flat-pattern");
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([buf], { type: "application/dxf" }));
+      a.download = it.part_number + "-flat.dxf";
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    } catch(e){ toast("Download failed: " + e.message, "err"); }
+  };
+  const gen = $("sm-gen");
+  if (gen) gen.onclick = async () => {
+    gen.disabled = true;
+    const prev = gen.textContent;
+    gen.textContent = "Generating…";
+    try {
+      const d = await api("POST", "/items/" + it.id + "/flat-pattern/generate", {});
+      let job = d.job;
+      for (let i = 0; i < 80; i++){
+        await new Promise(r => setTimeout(r, 1500));
+        try { job = (await api("GET", "/jobs/" + job.id)).job; } catch(e){ continue; }
+        if (job.status === "done" || job.status === "failed" || job.status === "dead") break;
+      }
+      if (job.status === "done") toast("Flat pattern generated", "ok");
+      else toast("Generation " + job.status + ": " + (job.last_error || "timed out — it may still finish in the background"), "err");
+      DETAIL.data = null;
+      await render(false);
+      return;
+    } catch(e){ toast("Generate failed: " + e.message, "err"); }
+    gen.disabled = false;
+    gen.textContent = prev;
+  };
+  const pick = () => $("sm-file").click();
+  const rep = $("sm-replace"); if (rep) rep.onclick = pick;
+  const att = $("sm-attach"); if (att) att.onclick = pick;
+  const fi = $("sm-file");
+  if (fi) fi.onchange = async () => {
+    const f = fi.files && fi.files[0];
+    if (!f) return;
+    fi.value = "";
+    try {
+      const buf = await f.arrayBuffer();
+      await api("POST", "/items/" + it.id + "/flat-pattern", null, new Uint8Array(buf));
+      toast("Flat pattern attached", "ok");
+      DETAIL.data = null;
+      await render(false);
+    } catch(e){ toast("Attach failed: " + e.message, "err"); }
+  };
 }
 
 // ── overview tab ──

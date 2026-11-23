@@ -1,5 +1,6 @@
 use axum::extract::{Extension, Path, Query, State};
-use axum::response::Response;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use bytes::Bytes;
@@ -67,6 +68,10 @@ pub struct CheckinReq {
     pub base_version: Option<i32>,
     pub filename: Option<String>,
     pub mime_type: Option<String>,
+    /// Check in as a new *major* version (V2 - R1 instead of V1 - R2+).
+    /// Default `false`: the save is a new revision of the current version.
+    #[serde(default)]
+    pub new_version: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -138,8 +143,16 @@ pub struct ListParams {
     pub owner: Option<Uuid>,
     pub folder: Option<Uuid>,
     pub q: Option<String>,
+    /// `true` = only items with a sheet-metal spec; `false` = only items
+    /// without one; omitted = no sheet-metal filtering.
+    pub sheet_metal: Option<bool>,
     pub sort: Option<String>,
     pub dir: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct FlatPatternExportQuery {
+    pub items: String,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +165,7 @@ pub struct SearchQuery {
     pub kind: Option<String>,
     pub owner: Option<Uuid>,
     pub folder: Option<Uuid>,
+    pub sheet_metal: Option<bool>,
     pub sort: Option<String>,
     pub dir: Option<String>,
     pub page: Option<u32>,
@@ -671,7 +685,9 @@ pub async fn put_onshape_settings(
         access_key: body.access_key.unwrap_or(current.access_key),
         secret,
         default_project_id: body.default_project_id.or(current.default_project_id),
-        folder_sync_enabled: body.folder_sync_enabled.unwrap_or(current.folder_sync_enabled),
+        folder_sync_enabled: body
+            .folder_sync_enabled
+            .unwrap_or(current.folder_sync_enabled),
     };
     pdm_db::set_onshape_settings(
         &state.pool,
@@ -765,6 +781,175 @@ pub async fn onshape_send(
     Ok(result.into())
 }
 
+#[derive(serde::Deserialize)]
+pub struct OnshapeImportReq {
+    pub url: String,
+    pub name: Option<String>,
+    pub part_number: Option<String>,
+}
+
+/// One Onshape Part Studio link, in the shapes Onshape share links and the PDM
+/// picker produce:
+/// `https://cad.onshape.com/documents/<doc>/w/<ws>/e/<element>` or the
+/// immutable `.../v/<version>/e/<element>` variant. Returns
+/// `(document_id, element_id)`.
+fn parse_onshape_part_studio_url(url: &str) -> Result<(String, String), PdmError> {
+    fn is_onshape_id(s: &str) -> bool {
+        s.len() == 24 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+    let rest = url
+        .trim()
+        .strip_prefix("https://")
+        .ok_or_else(|| PdmError::BadRequest("Onshape URL must start with https://".into()))?;
+    let seg: Vec<&str> = rest.split('/').collect();
+    let host_ok = seg
+        .first()
+        .is_some_and(|h| matches!(*h, "cad.onshape.com" | "onshape.com"));
+    let valid = match seg.as_slice() {
+        [_, "documents", doc, "w", ws, "e", el, ..]
+            if host_ok && is_onshape_id(doc) && is_onshape_id(ws) && is_onshape_id(el) =>
+        {
+            Some((doc.to_string(), el.to_string()))
+        }
+        [_, "documents", doc, "v", ver, "e", el, ..]
+            if host_ok && is_onshape_id(doc) && is_onshape_id(ver) && is_onshape_id(el) =>
+        {
+            Some((doc.to_string(), el.to_string()))
+        }
+        _ => None,
+    };
+    valid.ok_or_else(|| {
+        PdmError::BadRequest(
+            "use a Part Studio link like https://cad.onshape.com/documents/<id>/w/<workspace>/e/<element>".into(),
+        )
+    })
+}
+
+/// POST /projects/{project_id}/onshape-import — import one Onshape Part Studio
+/// into the project: the worker's `onshape.import` job fetches the offline
+/// `.onshape-bundle` (Dutchman's Onshape reader, the org's channel must
+/// reference a build that carries it) and checks it in as a version; the usual
+/// `cad.solidcraft` conversion then follows. Re-imports land on the item
+/// already tied to that document element.
+pub async fn onshape_import_request(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(project_id): Path<Uuid>,
+    Json(body): Json<OnshapeImportReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user = require_user(&authed)?.clone();
+    let org = require_org(&authed);
+    require_role(&authed, "editor")?;
+    let (doc, element) = parse_onshape_part_studio_url(&body.url).map_err(AppError)?;
+    let settings = crate::onshape::OnshapeSettings::from_json(
+        &pdm_db::get_onshape_settings(&state.pool, org).await?,
+    );
+    if !settings.configured() {
+        return Err(AppError(PdmError::BadRequest(
+            "Onshape API keys are not configured — set them in Settings".into(),
+        )));
+    }
+    let has_dutchman = std::env::var(pdm_update::DUTCHMAN_CLI_ENV)
+        .is_ok_and(|p| !p.trim().is_empty())
+        || !pdm_update::dutchman_update_disabled();
+    if !has_dutchman {
+        return Err(AppError(PdmError::BadRequest(
+            "Dutchman is not available (no PDM_DUTCHMAN_CLI set, and PDM_DUTCHMAN_UPDATE=0)".into(),
+        )));
+    }
+    pdm_db::get_project(&state.pool, project_id, org)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound(format!("project {project_id}"))))?;
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let item = match pdm_db::find_item_by_onshape(&state.pool, org, &doc, &element, None).await? {
+        Some(existing) => {
+            if existing.project_id != project_id {
+                return Err(AppError(PdmError::Conflict(
+                    "This Onshape Part Studio is already linked to an item in another project"
+                        .into(),
+                )));
+            }
+            existing
+        }
+        None => {
+            let classification = "BE";
+            let prefixes = pdm_db::list_part_number_prefixes(&state.pool, org).await?;
+            let prefix = pdm_core::prefix_for_category(&prefixes, classification);
+            let part_number = body
+                .part_number
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or(name.clone())
+                .unwrap_or_else(|| {
+                    // The auto part number is filled in below; a placeholder
+                    // cannot be returned from this sync arm.
+                    String::new()
+                });
+            let part_number = if part_number.is_empty() {
+                let seq = pdm_db::next_part_number(&state.pool, org, &prefix).await?;
+                pdm_core::generate_part_number(&prefix, seq)
+            } else {
+                part_number
+            };
+            let description = name
+                .clone()
+                .unwrap_or_else(|| format!("Onshape {doc}/{element}"));
+            pdm_db::create_item(
+                &state.pool,
+                org,
+                project_id,
+                None,
+                &part_number,
+                &description,
+                classification,
+                Some(user.id),
+            )
+            .await?
+        }
+    };
+    let _ = pdm_db::upsert_property(
+        &state.pool,
+        item.id,
+        "onshape.document_id",
+        "string",
+        &serde_json::json!(doc),
+    )
+    .await;
+    let _ = pdm_db::upsert_property(
+        &state.pool,
+        item.id,
+        "onshape.element_id",
+        "string",
+        &serde_json::json!(element),
+    )
+    .await;
+    let payload = serde_json::json!({
+        "item_id": item.id,
+        "url": body.url.trim(),
+        "author_id": user.id,
+    });
+    let job = pdm_db::enqueue_job(&state.pool, org, "onshape.import", &payload).await?;
+    pdm_db::record_audit(
+        &state.pool,
+        org,
+        Some(user.id),
+        "",
+        "project.onshape_import",
+        "item",
+        Some(item.id),
+        Some(serde_json::json!({ "url": body.url.trim(), "project_id": project_id, "job_id": job.id })),
+    )
+    .await?;
+    Ok(serde_json::json!({ "item": item, "job": job }).into())
+}
+
 /// GET /settings/cad-cli — installed SolidCraft CLI vs GitHub latest.
 pub async fn get_cad_cli(
     Extension(_authed): Extension<Authed>,
@@ -808,6 +993,119 @@ pub async fn update_cad_cli(
         .await
         .map_err(|e| AppError(PdmError::Internal(e.to_string())))?;
     Ok(serde_json::json!({ "ok": true, "installed": tag, "path": dest }).into())
+}
+
+/// GET /settings/dutchman — the installed Dutchman (native-CAD → SolidCraft
+/// feature-tree converter), this org's conversion settings, and the release
+/// channels to pick from.
+pub async fn get_dutchman(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    let path = pdm_update::dutchman_cli_path();
+    let installed = if std::path::Path::new(&path).exists() {
+        pdm_update::dutchman_version_of(std::path::Path::new(&path)).await
+    } else {
+        None
+    };
+    let info = pdm_update::read_dutchman_info(std::path::Path::new(&path));
+    let settings = pdm_db::get_dutchman_settings(&state.pool, org).await?;
+    let latest = pdm_update::fetch_dutchman_latest()
+        .await
+        .ok()
+        .map(|r| r.tag_name);
+    // A due update: no binary yet, or the installed build came from another
+    // channel than the org's (the boot/interval loop chases marker changes).
+    let update_available = !std::path::Path::new(&path).exists()
+        || info
+            .as_ref()
+            .map(|i| i.channel != settings.channel)
+            .unwrap_or(true);
+    let channels = pdm_update::dutchman_channels().await.map_or_else(
+        |_| serde_json::json!([{ "value": "latest", "label": format!("Latest stable ({})", latest.as_deref().unwrap_or("?")) }, { "value": "nightly", "label": "Nightly (includes unreleased work)" }]),
+        |opts| {
+            serde_json::json!(opts
+                .into_iter()
+                .map(|(value, label)| serde_json::json!({ "value": value, "label": label }))
+                .collect::<Vec<_>>())
+        },
+    );
+    Ok(serde_json::json!({
+        "path": path,
+        "installed": installed,
+        "info": info,
+        "settings": settings,
+        "latest": latest,
+        "update_available": update_available,
+        "channels": channels,
+        "auto_update": !pdm_update::dutchman_update_disabled(),
+        "source": "https://github.com/dutchman-cad/dutchman/releases/latest",
+    })
+    .into())
+}
+
+/// PUT /settings/dutchman — this org's Dutchman conversion settings (admin).
+#[derive(serde::Deserialize)]
+pub struct DutchmanSettingsReq {
+    channel: Option<String>,
+    preset: Option<String>,
+    part_positions: Option<String>,
+    verify: Option<bool>,
+    timeout_secs: Option<u64>,
+    onshape_max_calls: Option<u32>,
+}
+
+pub async fn save_dutchman(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Json(body): Json<DutchmanSettingsReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_admin(&authed)?;
+    let org = require_org(&authed);
+    let mut settings = pdm_db::get_dutchman_settings(&state.pool, org).await?;
+    if let Some(v) = body.channel.filter(|s| !s.trim().is_empty()) {
+        settings.channel = v.trim().to_string();
+    }
+    if let Some(v) = body.preset.filter(|s| !s.trim().is_empty()) {
+        settings.preset = v.trim().to_string();
+    }
+    if let Some(v) = body.part_positions.filter(|s| !s.trim().is_empty()) {
+        settings.part_positions = v.trim().to_string();
+    }
+    if let Some(v) = body.verify {
+        settings.verify = v;
+    }
+    if let Some(v) = body.timeout_secs {
+        settings.timeout_secs = v;
+    }
+    if let Some(v) = body.onshape_max_calls {
+        settings.onshape_max_calls = v;
+    }
+    pdm_db::set_dutchman_settings(&state.pool, org, &settings).await?;
+    Ok(serde_json::json!({ "settings": settings }).into())
+}
+
+/// POST /settings/dutchman/update — pull the release the org's channel
+/// references onto this host now (admin).
+pub async fn update_dutchman(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_admin(&authed)?;
+    let org = require_org(&authed);
+    let settings = pdm_db::get_dutchman_settings(&state.pool, org).await?;
+    let dest = std::path::PathBuf::from(pdm_update::dutchman_cli_path());
+    let rel = pdm_update::apply_dutchman_tag(&dest, &settings.channel, &settings.channel)
+        .await
+        .map_err(|e| AppError(PdmError::Internal(e.to_string())))?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "channel": settings.channel,
+        "installed": rel.tag_name,
+        "path": dest.to_string_lossy(),
+    })
+    .into())
 }
 
 /// Where the SolidCraft web build is served from at runtime: the portal
@@ -1024,49 +1322,81 @@ pub async fn unarchive_project(
 
 /// DELETE /projects/{project_id} — hard-delete a project (cascades to items).
 #[derive(Deserialize)]
-pub struct FolderSyncLinkReq { pub folder_id: String }
+pub struct FolderSyncLinkReq {
+    pub folder_id: String,
+}
 
 pub async fn get_folder_sync(
-    State(state): State<AppState>, Extension(authed): Extension<Authed>, Path(project): Path<Uuid>,
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(project): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_user(&authed)?;
     let org = require_org(&authed);
-    pdm_db::get_project(&state.pool, project, org).await?.ok_or_else(|| PdmError::NotFound("Project not found".into()))?;
-    let settings = crate::onshape::OnshapeSettings::from_json(&pdm_db::get_onshape_settings(&state.pool, org).await?);
+    pdm_db::get_project(&state.pool, project, org)
+        .await?
+        .ok_or_else(|| PdmError::NotFound("Project not found".into()))?;
+    let settings = crate::onshape::OnshapeSettings::from_json(
+        &pdm_db::get_onshape_settings(&state.pool, org).await?,
+    );
     let row: Option<(String, String, String, serde_json::Value)> = sqlx::query_as("SELECT folder_id, folder_name, status, result FROM onshape_folder_sync WHERE project_id=$1 AND org_id=$2")
         .bind(project).bind(org).fetch_optional(&state.pool).await.map_err(PdmError::Db)?;
     Ok(serde_json::json!({"enabled": settings.folder_sync_enabled, "link": row.map(|(folder_id,folder_name,status,result)| serde_json::json!({"folder_id":folder_id,"folder_name":folder_name,"status":status,"result":result}))}).into())
 }
 
 pub async fn put_folder_sync(
-    State(state): State<AppState>, Extension(authed): Extension<Authed>, Path(project): Path<Uuid>, Json(body): Json<FolderSyncLinkReq>,
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(project): Path<Uuid>,
+    Json(body): Json<FolderSyncLinkReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_role(&authed, "editor")?;
     let org = require_org(&authed);
-    pdm_db::get_project(&state.pool, project, org).await?.ok_or_else(|| PdmError::NotFound("Project not found".into()))?;
-    let settings = crate::onshape::OnshapeSettings::from_json(&pdm_db::get_onshape_settings(&state.pool, org).await?);
-    if !settings.folder_sync_enabled { return Err(PdmError::BadRequest("Enable Onshape folder sync in Settings first".into()).into()); }
+    pdm_db::get_project(&state.pool, project, org)
+        .await?
+        .ok_or_else(|| PdmError::NotFound("Project not found".into()))?;
+    let settings = crate::onshape::OnshapeSettings::from_json(
+        &pdm_db::get_onshape_settings(&state.pool, org).await?,
+    );
+    if !settings.folder_sync_enabled {
+        return Err(
+            PdmError::BadRequest("Enable Onshape folder sync in Settings first".into()).into(),
+        );
+    }
     let folder = body.folder_id.trim();
     let name = crate::onshape::folder_name(&settings, folder).await?;
     let changed = sqlx::query("INSERT INTO onshape_folder_sync(project_id,org_id,folder_id,folder_name) VALUES($1,$2,$3,$4) ON CONFLICT(project_id) DO UPDATE SET folder_id=EXCLUDED.folder_id, folder_name=EXCLUDED.folder_name,status='idle',result='{}'::jsonb,updated_at=now() WHERE onshape_folder_sync.status <> 'running'")
         .bind(project).bind(org).bind(folder).bind(&name).execute(&state.pool).await.map_err(PdmError::Db)?;
-    if changed.rows_affected() == 0 { return Err(PdmError::BadRequest("Wait for the current sync to finish".into()).into()); }
+    if changed.rows_affected() == 0 {
+        return Err(PdmError::BadRequest("Wait for the current sync to finish".into()).into());
+    }
     Ok(serde_json::json!({"folder_id":folder,"folder_name":name}).into())
 }
 
 pub async fn start_folder_sync(
-    State(state): State<AppState>, Extension(authed): Extension<Authed>, Path(project): Path<Uuid>,
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(project): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let user = require_role(&authed, "editor")?.id;
     let org = require_org(&authed);
-    let settings = crate::onshape::OnshapeSettings::from_json(&pdm_db::get_onshape_settings(&state.pool, org).await?);
-    if !settings.folder_sync_enabled { return Err(PdmError::BadRequest("Onshape folder sync is disabled".into()).into()); }
+    let settings = crate::onshape::OnshapeSettings::from_json(
+        &pdm_db::get_onshape_settings(&state.pool, org).await?,
+    );
+    if !settings.folder_sync_enabled {
+        return Err(PdmError::BadRequest("Onshape folder sync is disabled".into()).into());
+    }
     let folder: Option<String> = sqlx::query_scalar("UPDATE onshape_folder_sync SET status='running',result='{}'::jsonb,updated_at=now() WHERE project_id=$1 AND org_id=$2 AND status <> 'running' RETURNING folder_id")
         .bind(project).bind(org).fetch_optional(&state.pool).await.map_err(PdmError::Db)?;
-    let folder = folder.ok_or_else(|| PdmError::BadRequest("Link a folder first, or wait for the current sync".into()))?;
+    let folder = folder.ok_or_else(|| {
+        PdmError::BadRequest("Link a folder first, or wait for the current sync".into())
+    })?;
     tokio::spawn(async move {
         let outcome = crate::onshape::sync_folder(&state, org, user, project, &folder).await;
-        let (status, result) = match outcome { Ok(v) => ("completed", v), Err(e) => ("failed", serde_json::json!({"error":e.to_string()})) };
+        let (status, result) = match outcome {
+            Ok(v) => ("completed", v),
+            Err(e) => ("failed", serde_json::json!({"error":e.to_string()})),
+        };
         if let Err(e) = sqlx::query("UPDATE onshape_folder_sync SET status=$1,result=$2,updated_at=now() WHERE project_id=$3 AND org_id=$4")
             .bind(status).bind(result).bind(project).bind(org).execute(&state.pool).await { tracing::error!("Onshape sync status: {e}"); }
     });
@@ -1318,6 +1648,7 @@ pub async fn list_items(
         q.owner,
         q.folder,
         q.q.as_deref(),
+        q.sheet_metal,
         q.sort.as_deref(),
         q.dir.as_deref(),
         page,
@@ -1354,6 +1685,7 @@ pub async fn list_items_org(
         q.owner,
         q.folder,
         q.q.as_deref(),
+        q.sheet_metal,
         q.sort.as_deref(),
         q.dir.as_deref(),
         page,
@@ -1568,6 +1900,7 @@ pub async fn checkin(
         .and_then(|s| s.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let new_version = body.new_version.unwrap_or(false);
     let version = pdm_db::create_version(
         &state.pool,
         file.id,
@@ -1576,6 +1909,7 @@ pub async fn checkin(
         &commit_msg,
         head.as_ref().map(|v| v.id),
         &native_format,
+        new_version,
     )
     .await?;
 
@@ -1595,8 +1929,21 @@ pub async fn checkin(
     }
 
     // 4c. Flag any NC program for this item that isn't based on the new version as potentially
-    //     outdated (the source design changed). Best-effort: MFG is optional, so don't fail the check-in.
-    let _ = pdm_db::flag_outdated_nc_programs(&state.pool, org, item_id, version.id).await;
+    //     outdated (the source design changed). Only a new major version does this: revisions
+    //     within a version stay compatible by definition. Best-effort: MFG is optional.
+    if new_version {
+        let _ = pdm_db::flag_outdated_nc_programs(&state.pool, org, item_id, version.id).await;
+        // A new CAD version supersedes any laser nest that pinned the old one.
+        if let Some(old_head) = &head {
+            let _ = pdm_db::mark_laser_nests_stale_for_version(
+                &state.pool,
+                org,
+                old_head.id,
+                "a new CAD version was checked in",
+            )
+            .await;
+        }
+    }
 
     // 5. Release lock
     pdm_db::release_lock(&state.pool, item_id, user.id).await?;
@@ -1612,6 +1959,8 @@ pub async fn checkin(
         Some(item_id),
         Some(serde_json::json!({
             "version_seq": version.seq,
+            "version": version.version,
+            "revision": version.revision,
             "commit_message": commit_msg,
             "sha256": body.sha256
         })),
@@ -1760,9 +2109,16 @@ pub async fn request_solidcraft_conversion(
             "this file type does not need or support SolidCraft conversion".into(),
         )));
     }
-    if !std::env::var("PDM_SOLVECRAFT_CLI").is_ok_and(|p| !p.trim().is_empty()) {
+    // A conversion needs Dutchman (the native formats with feature history) or the
+    // SolidCraft CLI (meshes, IGES). Dutchman counts as available when it is
+    // configured or the PDM may pull the latest release for it.
+    let has_cli = std::env::var("PDM_SOLVECRAFT_CLI").is_ok_and(|p| !p.trim().is_empty());
+    let has_dutchman = std::env::var(pdm_update::DUTCHMAN_CLI_ENV)
+        .is_ok_and(|p| !p.trim().is_empty())
+        || !pdm_update::dutchman_update_disabled();
+    if !has_cli && !has_dutchman {
         return Err(AppError(PdmError::BadRequest(
-            "SolidCraft CLI is not configured".into(),
+            "SolidCraft conversion is not configured (no CAD CLI, and Dutchman updates are disabled)".into(),
         )));
     }
     pdm_db::queue_solidcraft_conversion(&state.pool, authed.org_id, version_id, &source).await?;
@@ -2162,6 +2518,7 @@ pub async fn search(
         q.kind.as_deref(),
         q.owner,
         q.folder,
+        q.sheet_metal,
         q.sort.as_deref(),
         q.dir.as_deref(),
         page,
@@ -3025,11 +3382,69 @@ pub struct CreateMachineReq {
 pub struct CreateToolReq {
     pub name: String,
     pub kind: Option<String>,
+    pub description: Option<String>,
+    pub vendor: Option<String>,
+    pub part_number: Option<String>,
+    pub link: Option<String>,
+    pub units: Option<String>,
+    pub rotation: Option<String>,
+    pub flutes: Option<i32>,
+    pub tool_material: Option<String>,
+    pub tool_number: Option<i32>,
     pub dimensions: Option<serde_json::Value>,
     pub cutting_params: Option<serde_json::Value>,
     pub material_compatibility: Option<Vec<String>>,
     pub inventory: Option<i32>,
     pub tool_life: Option<serde_json::Value>,
+}
+
+/// `PUT /tools/{id}` — every field optional; absent fields keep their value.
+#[derive(Deserialize)]
+pub struct UpdateToolReq {
+    pub name: Option<String>,
+    pub kind: Option<String>,
+    pub description: Option<String>,
+    pub vendor: Option<String>,
+    pub part_number: Option<String>,
+    pub link: Option<String>,
+    pub units: Option<String>,
+    pub rotation: Option<String>,
+    pub flutes: Option<i32>,
+    pub tool_material: Option<String>,
+    pub tool_number: Option<i32>,
+    pub dimensions: Option<serde_json::Value>,
+    pub cutting_params: Option<serde_json::Value>,
+    pub material_compatibility: Option<Vec<String>>,
+    pub inventory: Option<i32>,
+    pub tool_life: Option<serde_json::Value>,
+}
+
+/// Speed + feedrate values for one cutting-data set (per material/finish).
+#[derive(Deserialize)]
+pub struct CuttingDataReq {
+    pub label: Option<String>,
+    pub material: Option<String>,
+    pub finish: Option<String>,
+    pub spindle_speed: Option<f64>,
+    pub surface_speed: Option<f64>,
+    pub ramp_spindle_speed: Option<f64>,
+    pub cutting_feedrate: Option<f64>,
+    pub feed_per_tooth: Option<f64>,
+    pub lead_in_feedrate: Option<f64>,
+    pub lead_out_feedrate: Option<f64>,
+    pub transition_feedrate: Option<f64>,
+    pub ramp_feedrate: Option<f64>,
+    pub ramp_angle: Option<f64>,
+    pub plunge_feedrate: Option<f64>,
+    pub plunge_feed_per_rev: Option<f64>,
+}
+
+/// `POST /tools/{id}/documents` — the blob was already uploaded via PUT /blobs.
+#[derive(Deserialize)]
+pub struct AddToolDocumentReq {
+    pub filename: String,
+    pub blob_id: Uuid,
+    pub content_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3096,12 +3511,30 @@ pub async fn create_tool(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
     let kind = body.kind.as_deref().unwrap_or("end_mill");
+    let units = body.units.as_deref().unwrap_or("mm");
+    let rotation = body.rotation.as_deref().unwrap_or("cw");
+    for v in [units, rotation] {
+        if !(v == "mm" || v == "in" || v == "cw" || v == "ccw") {
+            return Err(AppError(PdmError::Validation(
+                "units must be mm|in and rotation cw|ccw".into(),
+            )));
+        }
+    }
     let mat: &[String] = body.material_compatibility.as_deref().unwrap_or(&[]);
     let tool = pdm_db::create_tool(
         &state.pool,
         org,
         &body.name,
         kind,
+        body.description.as_deref(),
+        body.vendor.as_deref(),
+        body.part_number.as_deref(),
+        body.link.as_deref(),
+        units,
+        rotation,
+        body.flutes,
+        body.tool_material.as_deref(),
+        body.tool_number,
         body.dimensions.as_ref(),
         body.cutting_params.as_ref(),
         mat,
@@ -3110,6 +3543,278 @@ pub async fn create_tool(
     )
     .await?;
     Ok(serde_json::json!({ "tool": tool }).into())
+}
+
+/// GET /tools/{id} — one tool (with its cutting-data sets and documents).
+pub async fn get_tool(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    let tool = pdm_db::get_tool(&state.pool, org, id)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("tool".into())))?;
+    let cutting_data = pdm_db::list_cutting_data(&state.pool, id).await?;
+    let documents = pdm_db::list_tool_documents(&state.pool, id).await?;
+    Ok(serde_json::json!({
+        "tool": tool,
+        "cutting_data": cutting_data,
+        "documents": documents,
+    })
+    .into())
+}
+
+/// PUT /tools/{id} — update the tool. Absent fields keep their current value.
+pub async fn update_tool(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateToolReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    let cur = pdm_db::get_tool(&state.pool, org, id)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("tool".into())))?;
+    let units = body.units.as_deref().unwrap_or(&cur.units);
+    let rotation = body.rotation.as_deref().unwrap_or(&cur.rotation);
+    if !(units == "mm" || units == "in") {
+        return Err(AppError(PdmError::Validation(
+            "units must be mm or in".into(),
+        )));
+    }
+    if !(rotation == "cw" || rotation == "ccw") {
+        return Err(AppError(PdmError::Validation(
+            "rotation must be cw or ccw".into(),
+        )));
+    }
+    let name = body.name.as_deref().unwrap_or(&cur.name);
+    let kind = body.kind.as_deref().unwrap_or(&cur.kind);
+    let tool = pdm_db::update_tool(
+        &state.pool,
+        org,
+        id,
+        name,
+        kind,
+        body.description.as_deref().or(cur.description.as_deref()),
+        body.vendor.as_deref().or(cur.vendor.as_deref()),
+        body.part_number.as_deref().or(cur.part_number.as_deref()),
+        body.link.as_deref().or(cur.link.as_deref()),
+        units,
+        rotation,
+        body.flutes.or(cur.flutes),
+        body.tool_material
+            .as_deref()
+            .or(cur.tool_material.as_deref()),
+        body.tool_number.or(cur.tool_number),
+        body.dimensions.as_ref().or(cur.dimensions.as_ref()),
+        body.cutting_params.as_ref().or(cur.cutting_params.as_ref()),
+        body.material_compatibility
+            .as_ref()
+            .unwrap_or(&cur.material_compatibility),
+        body.inventory.unwrap_or(cur.inventory),
+        body.tool_life.as_ref().or(cur.tool_life.as_ref()),
+    )
+    .await?;
+    Ok(serde_json::json!({ "tool": tool }).into())
+}
+
+/// DELETE /tools/{id} — remove a tool (and its cutting data + documents).
+pub async fn delete_tool(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    pdm_db::delete_tool(&state.pool, org, id).await?;
+    Ok(serde_json::json!({ "ok": true }).into())
+}
+
+// ── Tool cutting data (speeds + feedrates per material/finish) ──────────
+
+/// GET /tools/{id}/cutting-data
+pub async fn list_tool_cutting_data(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    require_tool_exists(&state.pool, org, id).await?;
+    let rows = pdm_db::list_cutting_data(&state.pool, id).await?;
+    Ok(serde_json::json!({ "cutting_data": rows }).into())
+}
+
+/// POST /tools/{id}/cutting-data
+pub async fn create_tool_cutting_data(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CuttingDataReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    require_tool_exists(&state.pool, org, id).await?;
+    let row = pdm_db::create_cutting_data(
+        &state.pool,
+        id,
+        body.label.as_deref(),
+        body.material.as_deref(),
+        body.finish.as_deref(),
+        body.spindle_speed,
+        body.surface_speed,
+        body.ramp_spindle_speed,
+        body.cutting_feedrate,
+        body.feed_per_tooth,
+        body.lead_in_feedrate,
+        body.lead_out_feedrate,
+        body.transition_feedrate,
+        body.ramp_feedrate,
+        body.ramp_angle,
+        body.plunge_feedrate,
+        body.plunge_feed_per_rev,
+    )
+    .await?;
+    Ok(serde_json::json!({ "cutting_data": row }).into())
+}
+
+/// PUT /tools/{id}/cutting-data/{cid}
+pub async fn update_tool_cutting_data(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path((id, cid)): Path<(Uuid, Uuid)>,
+    Json(body): Json<CuttingDataReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    require_tool_exists(&state.pool, org, id).await?;
+    let row = pdm_db::update_cutting_data(
+        &state.pool,
+        id,
+        cid,
+        body.label.as_deref(),
+        body.material.as_deref(),
+        body.finish.as_deref(),
+        body.spindle_speed,
+        body.surface_speed,
+        body.ramp_spindle_speed,
+        body.cutting_feedrate,
+        body.feed_per_tooth,
+        body.lead_in_feedrate,
+        body.lead_out_feedrate,
+        body.transition_feedrate,
+        body.ramp_feedrate,
+        body.ramp_angle,
+        body.plunge_feedrate,
+        body.plunge_feed_per_rev,
+    )
+    .await?;
+    Ok(serde_json::json!({ "cutting_data": row }).into())
+}
+
+/// DELETE /tools/{id}/cutting-data/{cid}
+pub async fn delete_tool_cutting_data(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path((id, cid)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    require_tool_exists(&state.pool, org, id).await?;
+    pdm_db::delete_cutting_data(&state.pool, id, cid).await?;
+    Ok(serde_json::json!({ "ok": true }).into())
+}
+
+// ── Tool documents ──────────────────────────────────────────────────────
+
+async fn require_tool_exists(pool: &sqlx::PgPool, org: Uuid, id: Uuid) -> Result<(), AppError> {
+    pdm_db::get_tool(pool, org, id)
+        .await?
+        .map(|_| ())
+        .ok_or_else(|| AppError(PdmError::NotFound("tool".into())))
+}
+
+/// GET /tools/{id}/documents
+pub async fn list_tool_documents(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    require_tool_exists(&state.pool, org, id).await?;
+    let docs = pdm_db::list_tool_documents(&state.pool, id).await?;
+    Ok(serde_json::json!({ "documents": docs }).into())
+}
+
+/// POST /tools/{id}/documents — attach an already-uploaded blob to the tool.
+pub async fn add_tool_document(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<AddToolDocumentReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    require_tool_exists(&state.pool, org, id).await?;
+    let blob = pdm_db::get_blob_by_id(&state.pool, body.blob_id)
+        .await?
+        .filter(|b| b.org_id == org)
+        .ok_or_else(|| AppError(PdmError::NotFound("blob".into())))?;
+    let doc = pdm_db::create_tool_document(
+        &state.pool,
+        id,
+        &body.filename,
+        blob.id,
+        blob.size_bytes,
+        body.content_type.as_deref(),
+    )
+    .await?;
+    Ok(serde_json::json!({ "document": doc }).into())
+}
+
+/// GET /tools/{id}/documents/{doc_id}/download — stream the attached blob.
+pub async fn download_tool_document(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path((id, doc_id)): Path<(Uuid, Uuid)>,
+) -> Result<Response, AppError> {
+    let org = require_org(&authed);
+    require_tool_exists(&state.pool, org, id).await?;
+    let doc = pdm_db::get_tool_document(&state.pool, id, doc_id)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("document".into())))?;
+    let blob = pdm_db::get_blob_by_id(&state.pool, doc.blob_id)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("blob for document".into())))?;
+    let data = state
+        .store
+        .get_by_sha(&blob.sha256)
+        .await
+        .map_err(|e| AppError(PdmError::Storage(e.to_string())))?;
+    let filename = doc.filename.replace('"', "");
+    let response = axum::http::Response::builder()
+        .status(200)
+        .header(
+            "content-type",
+            doc.content_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".into()),
+        )
+        .header("content-length", data.len().to_string())
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(data))
+        .map_err(|e| AppError(PdmError::Internal(format!("response build: {e}"))))?;
+    Ok(response)
+}
+
+/// DELETE /tools/{id}/documents/{doc_id}
+pub async fn delete_tool_document(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path((id, doc_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    require_tool_exists(&state.pool, org, id).await?;
+    pdm_db::delete_tool_document(&state.pool, id, doc_id).await?;
+    Ok(serde_json::json!({ "ok": true }).into())
 }
 
 /// GET /post-processors — the org's post-processors.
@@ -3651,6 +4356,352 @@ pub async fn create_sheet_metal(
     Ok(serde_json::json!({ "sheet_metal_spec": s }).into())
 }
 
+// ── Per-item sheet metal: spec editing + flat-pattern DXF ───────────────
+
+/// Marks a 3D model as a sheet-metal part (or edits its spec). The presence
+/// of a spec row is what distinguishes sheet-metal parts from other items
+/// in the listings and enables flat-pattern export.
+#[derive(Deserialize)]
+pub struct SaveItemSheetMetalReq {
+    pub material: Option<String>,
+    pub thickness_mm: Option<f64>,
+    pub bend_radius_mm: Option<f64>,
+    pub k_factor: Option<f64>,
+}
+
+async fn owned_item(
+    state: &AppState,
+    org: Uuid,
+    item_id: Uuid,
+) -> Result<pdm_core::Item, AppError> {
+    pdm_db::get_item(&state.pool, item_id, org)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound(format!("item {item_id}"))))
+}
+
+/// GET /items/{item_id}/sheet-metal — the item's sheet-metal spec, if any.
+pub async fn item_sheet_metal(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(item_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    owned_item(&state, org, item_id).await?;
+    let spec = pdm_db::get_item_sheet_metal(&state.pool, org, item_id).await?;
+    Ok(serde_json::json!({ "sheet_metal_spec": spec, "item_id": item_id }).into())
+}
+
+/// POST /items/{item_id}/sheet-metal — create or update the spec.
+pub async fn save_item_sheet_metal(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(item_id): Path<Uuid>,
+    Json(body): Json<SaveItemSheetMetalReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user = require_role(&authed, "editor")?;
+    let org = require_org(&authed);
+    owned_item(&state, org, item_id).await?;
+    let s = pdm_db::upsert_item_sheet_metal(
+        &state.pool,
+        org,
+        item_id,
+        body.material.as_deref(),
+        body.thickness_mm,
+        body.bend_radius_mm,
+        body.k_factor,
+    )
+    .await?;
+    pdm_db::record_audit(
+        &state.pool,
+        org,
+        Some(user.id),
+        "",
+        "item.sheet_metal",
+        "item",
+        Some(item_id),
+        None,
+    )
+    .await?;
+    Ok(serde_json::json!({ "sheet_metal_spec": s }).into())
+}
+
+/// POST /items/{item_id}/flat-pattern — attach a generated flat-pattern DXF
+/// (raw bytes). The blob is content-addressed like every other upload.
+pub async fn upload_item_flat_pattern(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(item_id): Path<Uuid>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user = require_role(&authed, "editor")?;
+    let org = require_org(&authed);
+    owned_item(&state, org, item_id).await?;
+    if body.is_empty() {
+        return Err(AppError(PdmError::Validation("empty upload".into())));
+    }
+    if body.len() as u64 > state.max_upload {
+        return Err(AppError(PdmError::Validation(format!(
+            "flat pattern exceeds the {} byte upload limit",
+            state.max_upload
+        ))));
+    }
+    let (sha, size) = state
+        .store
+        .put_content_addressed(&body)
+        .await
+        .map_err(|e| AppError(PdmError::Storage(e.to_string())))?;
+    pdm_db::upload_blob(
+        &state.pool,
+        org,
+        &sha,
+        i64::try_from(size).map_err(|_| PdmError::Validation("file too large".into()))?,
+        &sha,
+    )
+    .await?;
+    let s = pdm_db::set_item_flat_pattern(&state.pool, org, item_id, &sha).await?;
+    // Pin a revision-bound artifact to the item's head version so nests can
+    // reference the exact CAD revision this uploaded DXF belongs to.
+    if let Ok(Some(file)) = pdm_db::get_file(&state.pool, item_id).await
+        && let Ok(Some(head)) = pdm_db::get_head_version(&state.pool, file.id).await
+    {
+        let _ = pdm_db::create_flat_pattern_artifact(
+            &state.pool,
+            org,
+            item_id,
+            head.id,
+            &sha,
+            i64::try_from(size).map_err(|_| PdmError::Validation("file too large".into()))?,
+            "uploaded",
+            "user upload",
+            "unknown",
+            "uploaded flat pattern",
+        )
+        .await;
+    }
+    pdm_db::record_audit(
+        &state.pool,
+        org,
+        Some(user.id),
+        "",
+        "item.flat_pattern",
+        "item",
+        Some(item_id),
+        None,
+    )
+    .await?;
+    Ok(serde_json::json!({ "sheet_metal_spec": s }).into())
+}
+
+/// POST /items/{item_id}/flat-pattern/generate — queue a `sheet.flat-pattern`
+/// job: run the engine's `sheet.export_dxf` on the head version's design and
+/// attach the result to the item's sheet-metal spec.
+pub async fn generate_item_flat_pattern(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(item_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user = require_role(&authed, "editor")?;
+    let org = require_org(&authed);
+    owned_item(&state, org, item_id).await?;
+    let file = pdm_db::get_file(&state.pool, item_id)
+        .await?
+        .ok_or_else(|| AppError(PdmError::Validation("item has no file yet".into())))?;
+    let head = pdm_db::get_head_version(&state.pool, file.id)
+        .await?
+        .ok_or_else(|| {
+            AppError(PdmError::Validation(
+                "item has no checked-in version yet".into(),
+            ))
+        })?;
+    let payload = serde_json::json!({
+        "version_id": head.id,
+        "item_id": item_id,
+        "filename": file.filename,
+    });
+    let job = pdm_db::enqueue_job(&state.pool, org, "sheet.flat-pattern", &payload).await?;
+    pdm_db::record_audit(
+        &state.pool,
+        org,
+        Some(user.id),
+        "",
+        "item.flat_pattern_generate",
+        "item",
+        Some(item_id),
+        None,
+    )
+    .await?;
+    Ok(serde_json::json!({ "job": job, "item_id": item_id }).into())
+}
+
+/// GET /items/{item_id}/flat-pattern — download the item's flat-pattern DXF.
+pub async fn download_item_flat_pattern(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(item_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    let org = require_org(&authed);
+    let item = owned_item(&state, org, item_id).await?;
+    let spec = pdm_db::get_item_sheet_metal(&state.pool, org, item_id)
+        .await?
+        .and_then(|s| s.flat_pattern_sha)
+        .ok_or_else(|| {
+            AppError(PdmError::NotFound(format!(
+                "item {} has no flat pattern attached",
+                item.part_number
+            )))
+        })?;
+    let blob = pdm_db::get_blob_by_sha(&state.pool, org, &spec)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("flat pattern blob".into())))?;
+    let data = state
+        .store
+        .get_by_sha(&blob.sha256)
+        .await
+        .map_err(|e| AppError(PdmError::Storage(e.to_string())))?;
+    axum::http::Response::builder()
+        .status(200)
+        .header("content-type", "application/dxf")
+        .header("content-length", data.len().to_string())
+        .header("content-digest", format!("sha-256={}", blob.sha256))
+        .header(
+            "content-disposition",
+            format!(
+                "attachment; filename=\"{}-flat.dxf\"",
+                item.part_number
+                    .chars()
+                    .map(|c| if matches!(c, '/' | '\\' | ':') {
+                        '_'
+                    } else {
+                        c
+                    })
+                    .collect::<String>()
+            ),
+        )
+        .body(axum::body::Body::from(data))
+        .map_err(|e| AppError(PdmError::Internal(format!("response build: {e}"))))
+}
+
+/// GET /sheet-metal/flat-patterns?items=id1,id2,… — export the flat patterns
+/// of several items as a single ZIP (one DXF per part plus a manifest
+/// listing what was included and what was missing).
+pub async fn export_flat_patterns(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Query(q): Query<FlatPatternExportQuery>,
+) -> Result<Response, AppError> {
+    let org = require_org(&authed);
+    let ids: Vec<Uuid> = q
+        .items
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse())
+        .collect::<Result<Vec<Uuid>, _>>()
+        .map_err(|_| {
+            AppError(PdmError::BadRequest(
+                "items must be comma-separated UUIDs".into(),
+            ))
+        })?;
+    if ids.is_empty() {
+        return Err(AppError(PdmError::BadRequest("no items given".into())));
+    }
+    if ids.len() > 200 {
+        return Err(AppError(PdmError::BadRequest(
+            "at most 200 items per export".into(),
+        )));
+    }
+    let entries = pdm_db::list_flat_patterns(&state.pool, org, &ids).await?;
+    let by_item: std::collections::HashMap<Uuid, _> =
+        entries.iter().map(|e| (e.item_id, e)).collect();
+
+    let mut included = Vec::new();
+    let mut missing = Vec::new();
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for id in &ids {
+        match by_item.get(id) {
+            None => missing.push(serde_json::json!({
+                "item_id": id,
+                "reason": "item not found in this organization",
+            })),
+            Some(e) => match e.flat_pattern_sha.clone() {
+                None => missing.push(serde_json::json!({
+                    "item_id": id,
+                    "part_number": e.part_number,
+                    "reason": "no flat pattern attached",
+                })),
+                Some(sha) => {
+                    let data = match state.store.get_by_sha(&sha).await {
+                        Ok(data) => data,
+                        Err(err) => {
+                            missing.push(serde_json::json!({
+                                "item_id": id,
+                                "part_number": e.part_number,
+                                "reason": format!("flat pattern blob not found ({err})"),
+                            }));
+                            continue;
+                        }
+                    };
+                    let safe_part: String = e
+                        .part_number
+                        .chars()
+                        .map(|c| {
+                            if matches!(c, '/' | '\\' | ':') {
+                                '_'
+                            } else {
+                                c
+                            }
+                        })
+                        .collect();
+                    let mut name = format!("{safe_part}-flat.dxf");
+                    while !used_names.insert(name.clone()) {
+                        name = format!("{safe_part}-flat-{item}.dxf", item = e.item_id);
+                    }
+                    let opts = zip::write::FileOptions::<()>::default();
+                    zip.start_file(&name, opts)
+                        .map_err(|err| AppError(PdmError::Internal(format!("zip: {err}"))))?;
+                    std::io::Write::write_all(&mut zip, &data)
+                        .map_err(|err| AppError(PdmError::Internal(format!("zip: {err}"))))?;
+                    included.push(serde_json::json!({
+                        "item_id": e.item_id,
+                        "part_number": e.part_number,
+                        "revision": e.revision,
+                        "file": name,
+                        "sha256": sha,
+                        "size_bytes": e.flat_pattern_size,
+                    }));
+                }
+            },
+        }
+    }
+    let manifest = serde_json::to_vec_pretty(&serde_json::json!({
+        "generated_at": chrono::Utc::now(),
+        "included": included,
+        "missing": missing,
+    }))
+    .map_err(|err| AppError(PdmError::Internal(format!("manifest: {err}"))))?;
+    let opts = zip::write::FileOptions::<()>::default();
+    zip.start_file("manifest.json", opts)
+        .map_err(|err| AppError(PdmError::Internal(format!("zip: {err}"))))?;
+    std::io::Write::write_all(&mut zip, &manifest)
+        .map_err(|err| AppError(PdmError::Internal(format!("zip: {err}"))))?;
+    let bytes = zip
+        .finish()
+        .map_err(|err| AppError(PdmError::Internal(format!("zip: {err}"))))?
+        .into_inner();
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    axum::http::Response::builder()
+        .status(200)
+        .header("content-type", "application/zip")
+        .header("content-length", bytes.len().to_string())
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"flat-patterns-{stamp}.zip\""),
+        )
+        .body(axum::body::Body::from(bytes))
+        .map_err(|e| AppError(PdmError::Internal(format!("response build: {e}"))))
+}
+
 // ── Sheet-metal standards library (MFG reference data) ──────────────────
 
 #[derive(Deserialize)]
@@ -3775,6 +4826,781 @@ pub async fn parse_gcode_endpoint(
     Ok(serde_json::json!({ "summary": summary }).into())
 }
 
+// ── Laser nesting (Sparrow) ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct NestPartReq {
+    pub item_id: Uuid,
+    /// Exact CAD version to nest; omitted → the item's newest flat pattern.
+    pub file_version_id: Option<Uuid>,
+    #[serde(default = "default_qty")]
+    pub quantity: i32,
+    /// Cut layer. "auto" (default) follows flat-pattern conventions:
+    /// CUT/OUTLINE/contour layers are cut, BEND_*/mark/etch layers are
+    /// marking. A specific layer name restricts cutting to that layer.
+    pub layer_cut: Option<String>,
+    pub layers_mark: Option<Vec<String>>,
+    /// Source unit override: "mm" | "in" | "unknown" (defer to the file).
+    pub unit: Option<String>,
+    /// Use a mirror of the original geometry for this line (default false).
+    #[serde(default)]
+    pub mirror: bool,
+    /// Allow the solver to flip copies of this line (default true).
+    #[serde(default = "default_true")]
+    pub allow_mirror: bool,
+    /// This part's grain preference: "along_length" | "along_width" | "any"
+    /// (default "any"). Drives rotation restriction with the sheet grain.
+    #[serde(default)]
+    pub grain: Option<String>,
+}
+
+fn default_qty() -> i32 {
+    1
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+pub struct CreateLaserNestReq {
+    pub name: String,
+    pub project_id: Option<Uuid>,
+    pub machine_id: Option<Uuid>,
+    pub material: Option<String>,
+    pub thickness_mm: Option<f64>,
+    /// The unit the user entered `stock_width_mm`, `stock_height_mm`,
+    /// `edge_margin_mm` and `part_gap_mm` in: "mm" (default) or "in". All
+    /// dimensions are stored internally in millimetres; "in" inputs are
+    /// converted (×25.4) at create time.
+    #[serde(default)]
+    pub units: Option<String>,
+    pub stock_width_mm: f64,
+    pub stock_height_mm: f64,
+    pub edge_margin_mm: Option<f64>,
+    /// Uniform part spacing (legacy): used for both axes when the separate
+    /// `spacing_*_mm` values are absent.
+    pub part_gap_mm: Option<f64>,
+    /// Horizontal (x-axis) spacing between parts, in `units`.
+    pub spacing_x_mm: Option<f64>,
+    /// Vertical (y-axis) spacing between parts, in `units`.
+    pub spacing_y_mm: Option<f64>,
+    /// Sheet grain direction: "along_length" | "along_width" | "any"
+    /// (default "along_length"). Drives per-part rotation restriction.
+    #[serde(default)]
+    pub grain_direction: Option<String>,
+    /// Source unit for part DXFs that declare no `$INSUNITS` and have no
+    /// per-part override: "mm", "in", or "auto" (default — honour the file's
+    /// `$INSUNITS`, falling back to mm when the file is unitless).
+    #[serde(default)]
+    pub default_part_unit: Option<String>,
+    pub allowed_rotations: Option<Vec<f64>>,
+    pub seed: Option<i64>,
+    #[serde(default)]
+    pub parts: Vec<NestPartReq>,
+}
+
+#[derive(Deserialize)]
+pub struct ListLaserNestsQuery {
+    pub project_id: Option<Uuid>,
+    pub limit: Option<i32>,
+}
+
+/// Resolved, version-pinned source for one nest part.
+struct PartSource {
+    item_id: Uuid,
+    file_version_id: Uuid,
+    artifact_id: Option<Uuid>,
+    dxf_sha: String,
+    dxf_size: i64,
+    part_number: String,
+    revision_label: String,
+    layer_cut: String,
+    layers_mark: Vec<String>,
+    unit: String,
+    mirror: bool,
+    allow_mirror: bool,
+    part_grain: String,
+    material: Option<String>,
+    thickness_mm: Option<f64>,
+}
+
+fn is_dxf_filename(name: &str) -> bool {
+    name.rsplit('.')
+        .next()
+        .map(|e| e.eq_ignore_ascii_case("dxf"))
+        .unwrap_or(false)
+}
+
+/// Millimetres-per-unit factor for the nest's dimensional inputs (stock,
+/// margin, gap). "in"/"inch" -> 25.4, otherwise 1.0.
+fn stock_unit_factor(units: &Option<String>) -> f64 {
+    match units
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("in") | Some("inch") | Some("inches") | Some("imperial") => 25.4,
+        _ => 1.0,
+    }
+}
+
+/// The nest-level default part source unit (a concrete "mm"/"in"). Files that
+/// declare `$INSUNITS` are still honoured first; this only applies to
+/// unit-less files. Defaults to mm.
+fn default_part_unit_of(v: &Option<String>) -> String {
+    match v
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("in") | Some("inch") | Some("inches") | Some("imperial") => "in".into(),
+        _ => "mm".into(),
+    }
+}
+
+/// Resolve the exact flat-pattern DXF + metadata for a requested nest part.
+async fn resolve_part_source(
+    state: &AppState,
+    org: Uuid,
+    req: &NestPartReq,
+) -> Result<PartSource, AppError> {
+    let item = pdm_db::get_item(&state.pool, req.item_id, org)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound(format!("item {}", req.item_id))))?;
+    let spec = pdm_db::get_item_sheet_metal(&state.pool, org, req.item_id).await?;
+
+    // 1. An explicit version, or the newest artifact, or the legacy pointer.
+    let (version_id, dxf_sha, dxf_size, unit, artifact_id): (
+        Uuid,
+        String,
+        i64,
+        String,
+        Option<Uuid>,
+    ) = if let Some(v) = req.file_version_id {
+        let version = pdm_db::get_version(&state.pool, v)
+            .await?
+            .ok_or_else(|| AppError(PdmError::NotFound(format!("version {v}"))))?;
+        // Prefer a revision-bound artifact for this version.
+        if let Some(art) =
+            pdm_db::latest_flat_pattern_artifact(&state.pool, org, req.item_id, v).await?
+        {
+            (v, art.sha256, art.size_bytes, art.unit, Some(art.id))
+        } else if is_dxf_filename(&item_filename(&state.pool, version.file_id).await) {
+            // The version itself is a DXF.
+            let blob = pdm_db::get_blob_by_id(&state.pool, version.blob_id)
+                .await?
+                .ok_or_else(|| AppError(PdmError::Validation("version has no blob".into())))?;
+            (
+                v,
+                blob.sha256,
+                blob.size_bytes,
+                req.unit.clone().unwrap_or_else(|| "unknown".into()),
+                None,
+            )
+        } else {
+            return Err(AppError(PdmError::Validation(
+                "the selected version has no flat-pattern DXF".into(),
+            )));
+        }
+    } else if let Some(art) = pdm_db::list_flat_pattern_artifacts(&state.pool, org, req.item_id)
+        .await?
+        .into_iter()
+        .next()
+    {
+        (
+            art.file_version_id,
+            art.sha256,
+            art.size_bytes,
+            art.unit,
+            Some(art.id),
+        )
+    } else if let Some(sha) = spec.as_ref().and_then(|s| s.flat_pattern_sha.clone()) {
+        let file = pdm_db::get_file(&state.pool, req.item_id)
+            .await?
+            .ok_or_else(|| AppError(PdmError::Validation("item has no file".into())))?;
+        let head = pdm_db::get_head_version(&state.pool, file.id)
+            .await?
+            .ok_or_else(|| AppError(PdmError::Validation("item has no version".into())))?;
+        let size = pdm_db::get_blob_by_sha(&state.pool, org, &sha)
+            .await?
+            .map(|b| b.size_bytes)
+            .unwrap_or(0);
+        (head.id, sha, size, "unknown".into(), None)
+    } else if let Some(head) = head_dxf_version(&state.pool, org, req.item_id).await? {
+        // The item's head version is itself a DXF flat pattern.
+        let blob = pdm_db::get_blob_by_id(&state.pool, head.blob_id)
+            .await?
+            .ok_or_else(|| AppError(PdmError::Validation("version has no blob".into())))?;
+        (
+            head.id,
+            blob.sha256,
+            blob.size_bytes,
+            req.unit.clone().unwrap_or_else(|| "unknown".into()),
+            None,
+        )
+    } else {
+        return Err(AppError(PdmError::Validation(
+            "no flat-pattern DXF for this part; generate or attach one first".into(),
+        )));
+    };
+
+    let version = pdm_db::get_version(&state.pool, version_id)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("version".into())))?;
+    let revision_label = format!("V{}-R{}", version.version, version.revision);
+
+    Ok(PartSource {
+        item_id: req.item_id,
+        file_version_id: version_id,
+        artifact_id,
+        dxf_sha,
+        dxf_size,
+        part_number: item.part_number,
+        revision_label,
+        layer_cut: req
+            .layer_cut
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| pdm_nesting::part::LAYER_CUT_AUTO.to_string()),
+        layers_mark: req.layers_mark.clone().unwrap_or_default(),
+        unit: req.unit.clone().unwrap_or(unit),
+        mirror: req.mirror,
+        allow_mirror: req.allow_mirror,
+        part_grain: grain_value(req.grain.as_deref()),
+        material: spec.as_ref().and_then(|s| s.material.clone()),
+        thickness_mm: spec.as_ref().and_then(|s| s.thickness_mm),
+    })
+}
+
+/// Normalise a part grain direction to the stored canonical form (default
+/// "any": no preference).
+fn grain_value(v: Option<&str>) -> String {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("along_width") | Some("across") | Some("width") => "along_width".into(),
+        Some("along_length") | Some("length") => "along_length".into(),
+        _ => "any".into(),
+    }
+}
+
+/// Normalise the sheet grain direction (default "along_length").
+fn sheet_grain_value(v: &Option<String>) -> String {
+    match v
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("along_width") | Some("across") | Some("width") => "along_width".into(),
+        Some("any") => "any".into(),
+        _ => "along_length".into(),
+    }
+}
+
+async fn item_filename(pool: &sqlx::PgPool, file_id: Uuid) -> String {
+    pdm_db::get_file_by_id(pool, file_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|f| f.filename)
+        .unwrap_or_default()
+}
+
+/// The item's head version, if its file is a DXF flat pattern.
+async fn head_dxf_version(
+    pool: &sqlx::PgPool,
+    _org: Uuid,
+    item_id: Uuid,
+) -> Result<Option<pdm_core::FileVersion>, AppError> {
+    let file = match pdm_db::get_file(pool, item_id).await? {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+    if !is_dxf_filename(&file.filename) {
+        return Ok(None);
+    }
+    pdm_db::get_head_version(pool, file.id)
+        .await
+        .map_err(AppError)
+}
+
+/// Preflight: resolve every part and report structured readiness without creating
+/// the run.
+pub async fn validate_laser_nest(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Json(body): Json<CreateLaserNestReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    if body.parts.is_empty() {
+        return Err(AppError(PdmError::BadRequest("no parts".into())));
+    }
+    let mut problems: Vec<serde_json::Value> = Vec::new();
+    let mut parts = Vec::new();
+    for p in &body.parts {
+        match resolve_part_source(&state, org, p).await {
+            Ok(src) => parts.push(src),
+            Err(e) => problems.push(serde_json::json!({
+                "item_id": p.item_id,
+                "problem": e.0.to_string(),
+            })),
+        }
+    }
+    // Mixed-material / thickness check.
+    let materials: Vec<&Option<String>> = parts.iter().map(|p| &p.material).collect();
+    let thickness: Vec<Option<f64>> = parts.iter().map(|p| p.thickness_mm).collect();
+    let material_ok = materials
+        .windows(2)
+        .all(|w| w[0].as_deref() == w[1].as_deref());
+    let thickness_ok = thickness.windows(2).all(|w| w[0] == w[1]);
+    Ok(serde_json::json!({
+        "ok": problems.is_empty() && material_ok && thickness_ok,
+        "problems": problems,
+        "mixed_material": !material_ok,
+        "mixed_thickness": !thickness_ok,
+        "material": body.material.clone().or_else(|| parts.first().and_then(|p| p.material.clone())),
+        "thickness_mm": body.thickness_mm.or_else(|| parts.first().and_then(|p| p.thickness_mm)),
+        "parts": parts.iter().zip(body.parts.iter()).map(|(p, req)| serde_json::json!({
+            "item_id": p.item_id,
+            "part_number": p.part_number,
+            "revision": p.revision_label,
+            "file_version_id": p.file_version_id,
+            "dxf_sha": p.dxf_sha,
+            "quantity": req.quantity,
+            "unit": p.unit,
+        })).collect::<Vec<_>>(),
+    })
+    .into())
+}
+
+pub async fn create_laser_nest(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Json(body): Json<CreateLaserNestReq>,
+) -> Result<Response, AppError> {
+    let user = require_role(&authed, "editor")?;
+    let org = require_org(&authed);
+    if body.parts.is_empty() {
+        return Err(AppError(PdmError::BadRequest("no parts".into())));
+    }
+    // Interpret the dimensional inputs in the user's chosen unit; store mm.
+    // Unspecified margin/spacing use physical mm defaults (10 mm / 5 mm).
+    let um = stock_unit_factor(&body.units);
+    let stock_w = body.stock_width_mm * um;
+    let stock_h = body.stock_height_mm * um;
+    let margin = body.edge_margin_mm.map(|m| m * um).unwrap_or(10.0);
+    // Directional spacing: explicit per-axis values win; the legacy uniform
+    // part_gap applies to both; otherwise physical 5 mm.
+    let legacy_gap = body.part_gap_mm.map(|g| g * um);
+    let gap_x = body
+        .spacing_x_mm
+        .map(|g| g * um)
+        .or(legacy_gap)
+        .unwrap_or(5.0);
+    let gap_y = body
+        .spacing_y_mm
+        .map(|g| g * um)
+        .or(legacy_gap)
+        .unwrap_or(5.0);
+    let default_part_unit = default_part_unit_of(&body.default_part_unit);
+    let grain_direction = sheet_grain_value(&body.grain_direction);
+    let mut resolved: Vec<PartSource> = Vec::new();
+    for p in &body.parts {
+        resolved.push(resolve_part_source(&state, org, p).await?);
+    }
+    // Mixed material/thickness within one run is rejected.
+    for w in resolved.windows(2) {
+        if w[0].material != w[1].material {
+            return Err(AppError(PdmError::Validation(
+                "all parts in a nest must share the same material (use separate runs)".into(),
+            )));
+        }
+        if w[0].thickness_mm != w[1].thickness_mm {
+            return Err(AppError(PdmError::Validation(
+                "all parts in a nest must share the same thickness (use separate runs)".into(),
+            )));
+        }
+    }
+    let material = body
+        .material
+        .clone()
+        .or_else(|| resolved.first().and_then(|p| p.material.clone()));
+    let thickness = body
+        .thickness_mm
+        .or_else(|| resolved.first().and_then(|p| p.thickness_mm));
+
+    let params = pdm_db::LaserNestParams {
+        name: body.name,
+        project_id: body.project_id,
+        machine_id: body.machine_id,
+        material,
+        thickness_mm: thickness,
+        stock_width_mm: stock_w,
+        stock_height_mm: stock_h,
+        edge_margin_mm: margin,
+        part_gap_mm: legacy_gap.unwrap_or(5.0),
+        spacing_x_mm: gap_x,
+        spacing_y_mm: gap_y,
+        grain_direction,
+        chord_tol_mm: pdm_nesting::part::DEFAULT_CHORD_TOL,
+        join_tol_mm: pdm_nesting::part::DEFAULT_JOIN_TOL,
+        default_part_unit,
+        // Empty = derive rotations from the grain settings.
+        allowed_rotations: body.allowed_rotations.clone().unwrap_or_default(),
+        time_budget_sec: 600,
+        attempt_limit_sec: 60,
+        max_sheets: 16,
+        seed: body.seed,
+        solver_version: Some("sparrow 0.3.0 / jagua-rs 2.0.0".into()),
+        engine_build: Some("pinned sparrow b8ef033".into()),
+        created_by: Some(user.id),
+        parent_nest_id: None,
+    };
+    let part_inputs: Vec<pdm_db::LaserNestPartInput> = resolved
+        .iter()
+        .zip(body.parts.iter())
+        .enumerate()
+        .map(|(ordinal, (src, req))| pdm_db::LaserNestPartInput {
+            item_id: src.item_id,
+            file_version_id: src.file_version_id,
+            artifact_id: src.artifact_id,
+            dxf_sha: src.dxf_sha.clone(),
+            dxf_size: src.dxf_size,
+            part_number: src.part_number.clone(),
+            revision_label: Some(src.revision_label.clone()),
+            quantity: req.quantity.max(1),
+            layer_cut: src.layer_cut.clone(),
+            layers_mark: src.layers_mark.clone(),
+            unit: src.unit.clone(),
+            mirror: src.mirror,
+            allow_mirror: src.allow_mirror,
+            part_grain: src.part_grain.clone(),
+            ordinal: ordinal as i32,
+        })
+        .collect();
+
+    let (nest, job) =
+        pdm_db::create_laser_nest_run(&state.pool, org, &params, &part_inputs).await?;
+    pdm_db::record_audit(
+        &state.pool,
+        org,
+        Some(user.id),
+        "",
+        "laser_nest.create",
+        "laser_nest",
+        None,
+        Some(serde_json::json!(nest.id)),
+    )
+    .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "nest": nest, "job": job })),
+    )
+        .into_response())
+}
+
+pub async fn list_laser_nests(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Query(q): Query<ListLaserNestsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    let nests =
+        pdm_db::list_laser_nests(&state.pool, org, q.project_id, q.limit.unwrap_or(50)).await?;
+    Ok(serde_json::json!({ "nests": nests }).into())
+}
+
+pub async fn get_laser_nest(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    let detail = pdm_db::get_laser_nest_detail(&state.pool, id, org)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("laser nest".into())))?;
+    Ok(serde_json::json!({ "detail": detail }).into())
+}
+
+/// POST /laser-nests/{id}/cancel — cancel a queued/running nest.
+pub async fn cancel_laser_nest(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user = require_role(&authed, "editor")?;
+    let org = require_org(&authed);
+    let nest = pdm_db::get_laser_nest(&state.pool, id, org)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("laser nest".into())))?;
+    if !matches!(nest.status.as_str(), "queued" | "running") {
+        return Err(AppError(PdmError::Conflict(format!(
+            "nest is {}/can't be cancelled",
+            nest.status
+        ))));
+    }
+    let nest = pdm_db::set_laser_nest_status(&state.pool, org, id, "cancelled", None)
+        .await?
+        .ok_or_else(|| AppError(PdmError::Conflict("nest already terminal".into())))?;
+    pdm_db::record_audit(
+        &state.pool,
+        org,
+        Some(user.id),
+        "",
+        "laser_nest.cancel",
+        "laser_nest",
+        None,
+        Some(serde_json::json!(id)),
+    )
+    .await?;
+    Ok(serde_json::json!({ "nest": nest }).into())
+}
+
+/// POST /laser-nests/{id}/rerun — a new linked run from the same source parts.
+pub async fn rerun_laser_nest(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    let user = require_role(&authed, "editor")?;
+    let org = require_org(&authed);
+    let parent = pdm_db::get_laser_nest(&state.pool, id, org)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("laser nest".into())))?;
+    let parts = pdm_db::list_laser_nest_parts(&state.pool, id, org).await?;
+    let params = pdm_db::LaserNestParams {
+        name: format!("{} (rerun)", parent.name),
+        project_id: parent.project_id,
+        machine_id: parent.machine_id,
+        material: parent.material.clone(),
+        thickness_mm: parent.thickness_mm,
+        stock_width_mm: parent.stock_width_mm,
+        stock_height_mm: parent.stock_height_mm,
+        edge_margin_mm: parent.edge_margin_mm,
+        part_gap_mm: parent.part_gap_mm,
+        spacing_x_mm: parent.spacing_x_mm,
+        spacing_y_mm: parent.spacing_y_mm,
+        grain_direction: parent.grain_direction.clone(),
+        chord_tol_mm: parent.chord_tol_mm,
+        join_tol_mm: parent.join_tol_mm,
+        default_part_unit: parent.default_part_unit.clone(),
+        allowed_rotations: parent.allowed_rotations.0.clone(),
+        time_budget_sec: parent.time_budget_sec,
+        attempt_limit_sec: parent.attempt_limit_sec,
+        max_sheets: parent.max_sheets,
+        seed: None,
+        solver_version: parent.solver_version.clone(),
+        engine_build: parent.engine_build.clone(),
+        created_by: Some(user.id),
+        parent_nest_id: Some(parent.id),
+    };
+    let inputs: Vec<pdm_db::LaserNestPartInput> = parts
+        .iter()
+        .map(|p| pdm_db::LaserNestPartInput {
+            item_id: p.item_id,
+            file_version_id: p.file_version_id,
+            artifact_id: p.artifact_id,
+            dxf_sha: p.dxf_sha.clone(),
+            dxf_size: p.dxf_size,
+            part_number: p.part_number.clone(),
+            revision_label: p.revision_label.clone(),
+            quantity: p.quantity,
+            layer_cut: p.layer_cut.clone(),
+            layers_mark: p.layers_mark.0.clone(),
+            unit: p.unit.clone(),
+            mirror: p.mirror,
+            allow_mirror: p.allow_mirror,
+            part_grain: p.part_grain.clone(),
+            ordinal: p.ordinal,
+        })
+        .collect();
+    let (nest, job) = pdm_db::create_laser_nest_run(&state.pool, org, &params, &inputs).await?;
+    pdm_db::record_audit(
+        &state.pool,
+        org,
+        Some(user.id),
+        "",
+        "laser_nest.rerun",
+        "laser_nest",
+        None,
+        Some(serde_json::json!(nest.id)),
+    )
+    .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "nest": nest, "job": job })),
+    )
+        .into_response())
+}
+
+/// GET /laser-nests/{id}/sheets/{index}/dxf — download one sheet's DXF.
+pub async fn download_laser_nest_sheet_dxf(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path((id, index)): Path<(Uuid, i32)>,
+) -> Result<Response, AppError> {
+    let org = require_org(&authed);
+    let nest = pdm_db::get_laser_nest(&state.pool, id, org)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("laser nest".into())))?;
+    let sheet = pdm_db::get_laser_nest_sheet(&state.pool, id, org, index)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("sheet".into())))?;
+    let sha = sheet
+        .dxf_sha
+        .ok_or_else(|| AppError(PdmError::NotFound("sheet DXF not produced".into())))?;
+    let blob = pdm_db::get_blob_by_sha(&state.pool, org, &sha)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("sheet DXF blob".into())))?;
+    let data = state
+        .store
+        .get_by_sha(&blob.sha256)
+        .await
+        .map_err(|e| AppError(PdmError::Storage(e.to_string())))?;
+    let safe: String = nest
+        .name
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | ' ') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    axum::http::Response::builder()
+        .status(200)
+        .header("content-type", "application/dxf")
+        .header("content-length", data.len().to_string())
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{safe}-sheet{index}.dxf\""),
+        )
+        .body(axum::body::Body::from(data))
+        .map_err(|e| AppError(PdmError::Internal(e.to_string())))
+}
+
+/// GET /laser-nests/{id}/sheets/{index}/preview — one sheet's SVG preview.
+pub async fn download_laser_nest_sheet_preview(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path((id, index)): Path<(Uuid, i32)>,
+) -> Result<Response, AppError> {
+    let org = require_org(&authed);
+    pdm_db::get_laser_nest(&state.pool, id, org)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("laser nest".into())))?;
+    let sheet = pdm_db::get_laser_nest_sheet(&state.pool, id, org, index)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("sheet".into())))?;
+    let sha = sheet
+        .preview_sha
+        .ok_or_else(|| AppError(PdmError::NotFound("sheet preview not produced".into())))?;
+    let blob = pdm_db::get_blob_by_sha(&state.pool, org, &sha)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("preview blob".into())))?;
+    let data = state
+        .store
+        .get_by_sha(&blob.sha256)
+        .await
+        .map_err(|e| AppError(PdmError::Storage(e.to_string())))?;
+    axum::http::Response::builder()
+        .status(200)
+        .header("content-type", "image/svg+xml")
+        .header("content-length", data.len().to_string())
+        .body(axum::body::Body::from(data))
+        .map_err(|e| AppError(PdmError::Internal(e.to_string())))
+}
+
+/// GET /laser-nests/{id}/package — ZIP of every sheet's DXF + preview + manifest.
+pub async fn download_laser_nest_package(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    let org = require_org(&authed);
+    let nest = pdm_db::get_laser_nest(&state.pool, id, org)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("laser nest".into())))?;
+    if nest.status != "completed" {
+        return Err(AppError(PdmError::Conflict(format!(
+            "nest is {}/; only completed nests export",
+            nest.status
+        ))));
+    }
+    let sheets = pdm_db::list_laser_nest_sheets(&state.pool, id, org).await?;
+    let safe: String = nest
+        .name
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | ' ') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut manifest_lines = vec![format!("{safe} laser nest — {} sheets", sheets.len())];
+    for sheet in &sheets {
+        if let Some(sha) = &sheet.dxf_sha {
+            let blob = pdm_db::get_blob_by_sha(&state.pool, org, sha)
+                .await?
+                .ok_or_else(|| AppError(PdmError::NotFound("sheet DXF blob".into())))?;
+            let data = state
+                .store
+                .get_by_sha(&blob.sha256)
+                .await
+                .map_err(|e| AppError(PdmError::Storage(e.to_string())))?;
+            let name = format!("{safe}-sheet{}.dxf", sheet.sheet_index);
+            zip.start_file(&name, zip::write::FileOptions::<()>::default())
+                .map_err(|e| AppError(PdmError::Internal(e.to_string())))?;
+            std::io::Write::write_all(&mut zip, &data)
+                .map_err(|e| AppError(PdmError::Internal(e.to_string())))?;
+            manifest_lines.push(format!(
+                "{} ({} bytes) — {} placements",
+                name,
+                data.len(),
+                sheet.placed_count
+            ));
+        }
+        if let Some(sha) = &sheet.preview_sha {
+            let blob = pdm_db::get_blob_by_sha(&state.pool, org, sha)
+                .await?
+                .ok_or_else(|| AppError(PdmError::NotFound("preview blob".into())))?;
+            let data = state
+                .store
+                .get_by_sha(&blob.sha256)
+                .await
+                .map_err(|e| AppError(PdmError::Storage(e.to_string())))?;
+            let name = format!("{safe}-sheet{}.svg", sheet.sheet_index);
+            zip.start_file(&name, zip::write::FileOptions::<()>::default())
+                .map_err(|e| AppError(PdmError::Internal(e.to_string())))?;
+            std::io::Write::write_all(&mut zip, &data)
+                .map_err(|e| AppError(PdmError::Internal(e.to_string())))?;
+        }
+    }
+    let manifest = manifest_lines.join("\n");
+    zip.start_file("MANIFEST.txt", zip::write::FileOptions::<()>::default())
+        .map_err(|e| AppError(PdmError::Internal(e.to_string())))?;
+    std::io::Write::write_all(&mut zip, manifest.as_bytes())
+        .map_err(|e| AppError(PdmError::Internal(e.to_string())))?;
+    let buf = zip
+        .finish()
+        .map_err(|e| AppError(PdmError::Internal(e.to_string())))?
+        .into_inner();
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    axum::http::Response::builder()
+        .status(200)
+        .header("content-type", "application/zip")
+        .header("content-length", buf.len().to_string())
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{safe}-nest-{stamp}.zip\""),
+        )
+        .body(axum::body::Body::from(buf))
+        .map_err(|e| AppError(PdmError::Internal(e.to_string())))
+}
+
 // ── Router ──────────────────────────────────────────────────────────────
 
 pub fn api_router() -> Router<AppState> {
@@ -3803,6 +5629,8 @@ pub fn api_router() -> Router<AppState> {
         )
         .route("/settings/cad-cli", get(get_cad_cli))
         .route("/settings/cad-cli/update", post(update_cad_cli))
+        .route("/settings/dutchman", get(get_dutchman).put(save_dutchman))
+        .route("/settings/dutchman/update", post(update_dutchman))
         .route("/settings/solidcraft-web", get(get_solidcraft_web))
         .route(
             "/settings/solidcraft-web/update",
@@ -3816,6 +5644,10 @@ pub fn api_router() -> Router<AppState> {
         .route(
             "/settings/onshape",
             get(get_onshape_settings).put(put_onshape_settings),
+        )
+        .route(
+            "/projects/{project_id}/onshape-import",
+            post(onshape_import_request),
         )
         .route("/integrations/onshape/send", post(onshape_send))
         .route("/integrations/onshape/config", get(onshape_config))
@@ -3831,8 +5663,14 @@ pub fn api_router() -> Router<AppState> {
             delete(delete_part_number_prefix),
         )
         .route("/projects", get(list_projects).post(create_project))
-        .route("/projects/{project_id}/onshape-folder", get(get_folder_sync).put(put_folder_sync))
-        .route("/projects/{project_id}/onshape-folder/sync", post(start_folder_sync))
+        .route(
+            "/projects/{project_id}/onshape-folder",
+            get(get_folder_sync).put(put_folder_sync),
+        )
+        .route(
+            "/projects/{project_id}/onshape-folder/sync",
+            post(start_folder_sync),
+        )
         .route(
             "/projects/{project_id}",
             patch(update_project).delete(delete_project),
@@ -3917,6 +5755,30 @@ pub fn api_router() -> Router<AppState> {
         .route("/machines", get(list_machines).post(create_machine))
         .route("/tools", get(list_tools).post(create_tool))
         .route(
+            "/tools/{id}",
+            get(get_tool).put(update_tool).delete(delete_tool),
+        )
+        .route(
+            "/tools/{id}/cutting-data",
+            get(list_tool_cutting_data).post(create_tool_cutting_data),
+        )
+        .route(
+            "/tools/{id}/cutting-data/{cid}",
+            put(update_tool_cutting_data).delete(delete_tool_cutting_data),
+        )
+        .route(
+            "/tools/{id}/documents",
+            get(list_tool_documents).post(add_tool_document),
+        )
+        .route(
+            "/tools/{id}/documents/{doc_id}/download",
+            get(download_tool_document),
+        )
+        .route(
+            "/tools/{id}/documents/{doc_id}",
+            delete(delete_tool_document),
+        )
+        .route(
             "/post-processors",
             get(list_post_processors).post(create_post_processor),
         )
@@ -3950,19 +5812,84 @@ pub fn api_router() -> Router<AppState> {
             "/sheet-metal",
             get(list_sheet_metal).post(create_sheet_metal),
         )
+        .route("/sheet-metal/flat-patterns", get(export_flat_patterns))
+        .route(
+            "/items/{item_id}/sheet-metal",
+            get(item_sheet_metal).post(save_item_sheet_metal),
+        )
+        .route(
+            "/items/{item_id}/flat-pattern",
+            get(download_item_flat_pattern).post(upload_item_flat_pattern),
+        )
+        .route(
+            "/items/{item_id}/flat-pattern/generate",
+            post(generate_item_flat_pattern),
+        )
         .route(
             "/sheet-materials",
             get(list_sheet_materials).post(create_sheet_material_standard),
         )
         .route("/gcode/parse", post(parse_gcode_endpoint))
+        .route("/laser-nests/validate", post(validate_laser_nest))
+        .route(
+            "/laser-nests",
+            get(list_laser_nests).post(create_laser_nest),
+        )
+        .route("/laser-nests/{id}", get(get_laser_nest))
+        .route("/laser-nests/{id}/cancel", post(cancel_laser_nest))
+        .route("/laser-nests/{id}/rerun", post(rerun_laser_nest))
+        .route(
+            "/laser-nests/{id}/sheets/{index}/dxf",
+            get(download_laser_nest_sheet_dxf),
+        )
+        .route(
+            "/laser-nests/{id}/sheets/{index}/preview",
+            get(download_laser_nest_sheet_preview),
+        )
+        .route(
+            "/laser-nests/{id}/package",
+            get(download_laser_nest_package),
+        )
         .route("/auth/login", post(login))
         .route("/auth/logout", post(logout))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_revision_label, version_info};
+    use super::{auto_revision_label, parse_onshape_part_studio_url, version_info};
     use serde::Deserialize;
+
+    #[test]
+    fn onshape_part_studio_url_parsing() {
+        const DOC: &str = "0f3ca7ede7ca9aebc175ccaf";
+        const ELEM: &str = "de5d16d475ff6db2d0a55436";
+        let parsed = parse_onshape_part_studio_url(
+            "https://cad.onshape.com/documents/0f3ca7ede7ca9aebc175ccaf/w/857a2d7bfb309c433ed57d15/e/de5d16d475ff6db2d0a55436",
+        );
+        assert!(
+            matches!(&parsed, Ok((d, e)) if d.as_str() == DOC && e.as_str() == ELEM),
+            "workspace link: {parsed:?}"
+        );
+        // The immutable version-pinned variant is accepted too.
+        let parsed = parse_onshape_part_studio_url(
+            "https://cad.onshape.com/documents/0f3ca7ede7ca9aebc175ccaf/v/abc000000000000000000000/e/de5d16d475ff6db2d0a55436",
+        );
+        assert!(
+            matches!(&parsed, Ok((d, e)) if d.as_str() == DOC && e.as_str() == ELEM),
+            "version link: {parsed:?}"
+        );
+        // Anything that is not a Part Studio link is refused.
+        for url in [
+            "https://cad.onshape.com/documents/0f3ca7ede7ca9aebc175ccaf",
+            "http://cad.onshape.com/documents/0f3ca7ede7ca9aebc175ccaf/w/857a2d7bfb309c433ed57d15/e/de5d16d475ff6db2d0a55436",
+            "https://cad.onshape.com/documents/0f3ca7ede7ca9aebc175ccaf/w/857a2d7bfb309c433ed57d15",
+            "https://cad.onshape.com/documents/0f3ca7ede7ca9aebc175ccaf/w/857a2d7bfb309c433ed57d15/e/de5d16d475ff6db2d0a554",
+            "https://other.example/documents/0f3ca7ede7ca9aebc175ccaf/w/857a2d7bfb309c433ed57d15/e/de5d16d475ff6db2d0a55436",
+            "not a url",
+        ] {
+            assert!(parse_onshape_part_studio_url(url).is_err(), "{url}");
+        }
+    }
 
     /// A client written against the original /version schema still decodes a
     /// response with the additive `latest` / `update_available` fields, and a

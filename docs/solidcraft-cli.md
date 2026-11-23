@@ -1,5 +1,33 @@
 # SolidCraft CLI bundled with PDM
 
+## Native CAD → SolidCraft now runs through Dutchman
+
+Since V.01-40, `Convert to SolidCraft` (`cad.solidcraft` worker job) routes by
+file format:
+
+- **Native CAD** — Fusion (`.f3d`/`.f3z`), Inventor (`.ipt`/`.iam`), SolidWorks
+  (`.sldprt`/`.sldasm`), FreeCAD (`.FCStd`), CATIA (`.CATPart`), Rhino (`.3dm`),
+  Creo View (`.pvz`), ACIS (`.sat`/`.sab`/`.smt`/`.smb`) and STEP
+  (`.step`/`.stp`) — convert through
+  [Dutchman Convert](https://github.com/dutchman-cad/dutchman)
+  (`dutchman convert in <out.sc> --preset standard --quiet --json`), which decodes
+  the native file into a SolidCraft design **with editable feature history where
+  it maps** and verifies it against the PDM's own `solidcraft-cli`
+  (`--solidcraft`). The PDM always uses the newest published Dutchman release:
+  the image bakes one in at build, the server re-checks GitHub on boot and
+  hourly, and a conversion job pulls it on demand when the binary is missing
+  (`PDM_DUTCHMAN_UPDATE=0` opts out, `PDM_DUTCHMAN_CLI` names the binary,
+  `PDM_DUTCHMAN_TIMEOUT_SECS` bounds one run, System › Dutchman shows
+  installed/latest with a check-update button).
+- **Meshes and IGES** (`.stl`/`.obj`/`.3mf`/`.glb`/`.gltf`, `.igs`/`.iges`) —
+  still restate through `solidcraft-cli run` (geometry only: they carry no
+  history). If Dutchman is missing, the native formats it also reads through
+  the CLI (Inventor, FreeCAD, Rhino, STEP) fall back to that path as well.
+
+The derived-artifact storage (`derived_solidcraft_*` on `file_versions`), the
+check-in flow, the public design route and the SolidCraft-web "Edit" button are
+unchanged; only the converter behind `cad.solidcraft` is.
+
 PDM build **V.01-31** upgrades the CAD CLI from **0.21.0** to **0.27.1**.
 The fork's PDM client and Inventor import additions are retained: this is a
 build of the integrated fork, not a replacement with the upstream-only binary.

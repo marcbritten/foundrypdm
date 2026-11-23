@@ -27,6 +27,10 @@ services:
       PDM_STORAGE_LOCAL: /var/lib/pdm/blobs
       PDM_CLI_UPDATE: "0"
       PDM_WEB_UPDATE: "0"
+      # The standalone image ships no Dutchman binary: the server pulls the
+      # newest release itself (boot + hourly + on first conversion). Set
+      # PDM_DUTCHMAN_UPDATE=0 for fully offline hosts.
+      PDM_DUTCHMAN_UPDATE: "1"
     ports:
       - "${PDM_PORT:-8080}:8080"
     volumes:

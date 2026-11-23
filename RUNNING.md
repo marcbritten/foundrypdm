@@ -203,13 +203,37 @@ The image bakes the CLI's provenance into labels (`io.solidcraft.cli.version`,
 carrying features (Inventor editable-history import) that postdate the
 upstream `0.29.x` releases it syncs from — compare behaviour, not the number.
 
-### Keeping the bundled web editors current (runtime)
+### Keeping the bundled tools current (runtime)
 
-The CAD CLI and the SolidCraft web editor ("Edit in SolidCraft web") both
-auto-update at runtime from their public GitHub repos, in the background, on
-boot and on an interval — no reboot, no image rebuild:
+The CAD CLI, Dutchman (the native-CAD → SolidCraft feature-tree converter) and
+the SolidCraft web editor ("Edit in SolidCraft web") all auto-update at
+runtime from their public GitHub repos, in the background, on boot and on an
+interval — no reboot, no image rebuild:
 
 - **CAD CLI** — `PDM_CLI_UPDATE=0` opts out; `PDM_CLI_UPDATE_HOURS` (default 6).
+- **Dutchman** — the PDM converts native CAD (Fusion, Inventor, SolidWorks,
+  FreeCAD, CATIA, Rhino, Creo View, ACIS, STEP, Onshape bundles) with a
+  [dutchman-cad/dutchman](https://github.com/dutchman-cad/dutchman) release
+  picked from a **channel** (System › Dutchman, per org): the newest stable
+  (`latest`), `nightly`, the `onshape-preview` builds (Onshape import), or a
+  pinned tag. The image bakes the newest stable in at build
+  (`docker/install-dutchman.sh`); the server re-checks on boot and hourly
+  (`PDM_DUTCHMAN_UPDATE_HOURS`) — chasing the referenced release, recorded in
+  a `.info` file beside the binary; and a conversion job pulls it on demand
+  when the binary is missing or from another channel. `PDM_DUTCHMAN_UPDATE=0`
+  opts out; `PDM_DUTCHMAN_CLI` names the binary (default
+  `/usr/local/bin/dutchman`); `PDM_DUTCHMAN_CHANNEL` overrides the org choice
+  for the host's update loop; `PDM_DUTCHMAN_TIMEOUT_SECS` (default 1800)
+  bounds one conversion (the org's settings field overrides it).
+- **Onshape import** — project Settings → "Import from Onshape (Dutchman)"
+  (`POST /projects/{id}/onshape-import`): the worker's `onshape.import` job
+  fetches a Part Studio with the org's Onshape API keys
+  (`dutchman onshape fetch`, keys passed as `ONSHAPE_ACCESS_KEY` /
+  `ONSHAPE_SECRET_KEY`), checks the `.onshape-bundle` in as a version, and
+  enqueues the `cad.solidcraft` conversion. The referenced Dutchman build must
+  carry the Onshape reader (Onshape-preview or nightly channel); large Part
+  Studios (over the reader's 256 MiB expanded-bundle limit) fail with a clear
+  report.
 - **SolidCraft web** — the server downloads the newest
   `solidcraft-web-<version>.zip` from
   [tangency-labs/solidcraft](https://github.com/tangency-labs/solidcraft)
@@ -219,11 +243,14 @@ boot and on an interval — no reboot, no image rebuild:
   same-or-older release is a no-op), so a bad release is retried, not
   downgraded. Open editors pick up a new build on the next open.
 
-The System panel shows installed vs latest for both, with a check/update
+The System panel shows installed vs latest for each, with a check/update
 button. `GET /settings/solidcraft-web` (and `POST /settings/solidcraft-web/update`)
-expose the same; `GET /settings/cad-cli` (and `.../update`) for the CLI. The
-image still pins a known-good starting build (`docker/install-web-editors.sh`),
-so a fresh container is functional even with GitHub unreachable.
+expose the same; `GET /settings/cad-cli` (and `.../update`) for the CLI, and
+`GET/PUT /settings/dutchman` (and `POST .../update`) for Dutchman's channel
+and conversion settings. The image still
+pins known-good starting builds (`docker/install-web-editors.sh`,
+`docker/install-dutchman.sh`), so a fresh container is functional even with
+GitHub unreachable.
 
 ## 7. API quick reference
 

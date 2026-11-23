@@ -7,6 +7,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --locked --release -p pdm-server -p pdm-cli \
     && cp target/release/pdm-server target/release/pdm-cli /usr/local/bin/
+# Sparrow nesting engine (pinned commit) for laser.nest jobs.
+ARG SPARROW_REV=b8ef03312b7a195895f6c5332c6674dd78420ede
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone https://github.com/JeroenGar/sparrow /sparrow \
+    && cd /sparrow && git checkout --quiet "$SPARROW_REV" \
+    && cargo build --release -p sparrow-cli --bin sparrow --features only_final_svg \
+    && cp /sparrow/target/release/sparrow /usr/local/bin/sparrow
 
 FROM debian:trixie-slim
 RUN apt-get update \
@@ -14,7 +22,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/pdm-server /usr/local/bin/pdm-server
 COPY --from=builder /usr/local/bin/pdm-cli /usr/local/bin/pdm-cli
+COPY --from=builder /usr/local/bin/sparrow /usr/local/bin/sparrow
 COPY crates/pdm-api/static /opt/pdm/portal
-ENV PDM_PORTAL_DIR=/opt/pdm/portal
+ENV PDM_PORTAL_DIR=/opt/pdm/portal \
+    PDM_SPARROW_CLI=/usr/local/bin/sparrow
 EXPOSE 8080
 CMD ["pdm-server"]

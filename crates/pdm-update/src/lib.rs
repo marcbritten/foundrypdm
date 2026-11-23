@@ -104,6 +104,13 @@ pub struct Release {
     pub html_url: Option<String>,
     #[serde(default)]
     pub published_at: Option<String>,
+    /// When the release (or its assets) was last touched: the change marker for
+    /// rolling tags like `nightly`.
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// GitHub's pre-release flag (the PDM's Gitea releases never set it).
+    #[serde(default)]
+    pub prerelease: bool,
     #[serde(default)]
     pub assets: Vec<Asset>,
 }
@@ -756,6 +763,391 @@ pub async fn loop_cad_cli_update(dest: std::path::PathBuf) {
         boot_cad_cli_update(&current, &dest).await;
         tokio::time::sleep(cad_cli_interval()).await;
     }
+}
+
+// ── Dutchman (dutchman-cad/dutchman): native CAD → SolidCraft with a feature
+//    tree. The PDM converts with the newest published release: the image bakes
+//    one in at build, the server keeps it current on an interval, and a
+//    conversion job pulls it on demand when the binary is missing. ────────────
+
+/// GitHub repo that publishes Dutchman Convert releases.
+pub const DUTCHMAN_GITHUB: &str = "dutchman-cad/dutchman";
+/// Set to `0` to skip pulling the latest Dutchman release (boot loop, on-demand
+/// installs, and the worker's fallback all opt out).
+pub const DUTCHMAN_UPDATE_ENV: &str = "PDM_DUTCHMAN_UPDATE";
+/// The configured Dutchman CLI path.
+pub const DUTCHMAN_CLI_ENV: &str = "PDM_DUTCHMAN_CLI";
+/// Where to install dutchman if `PDM_DUTCHMAN_CLI` is unset.
+pub const DUTCHMAN_DEFAULT_PATH: &str = "/usr/local/bin/dutchman";
+/// The Linux release tarball carries the full native decoder: cap it above the CLI's.
+const DUTCHMAN_MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
+pub fn dutchman_update_disabled() -> bool {
+    std::env::var(DUTCHMAN_UPDATE_ENV).is_ok_and(|v| v == "0")
+}
+
+/// The Dutchman binary path in effect: `PDM_DUTCHMAN_CLI` or the default.
+pub fn dutchman_cli_path() -> String {
+    std::env::var(DUTCHMAN_CLI_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DUTCHMAN_DEFAULT_PATH.to_string())
+}
+
+/// Hours between Dutchman release checks (default 1, tighter than the CLI's):
+/// the PDM converts with the newest published release. `PDM_DUTCHMAN_UPDATE_HOURS`.
+pub fn dutchman_interval() -> Duration {
+    let hours = std::env::var("PDM_DUTCHMAN_UPDATE_HOURS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|h| *h > 0)
+        .unwrap_or(1);
+    Duration::from_secs(hours.saturating_mul(3600))
+}
+
+/// Latest Dutchman release on GitHub (public; no token).
+pub async fn fetch_dutchman_latest() -> Result<Release, Error> {
+    fetch_dutchman_release("latest").await
+}
+
+/// A Dutchman release by tag: `latest` (newest stable) or an exact tag name
+/// (`nightly`, `v0.2.9`, `onshape-preview-2`, …).
+pub async fn fetch_dutchman_release(tag: &str) -> Result<Release, Error> {
+    let url = if tag == "latest" {
+        format!("https://api.github.com/repos/{DUTCHMAN_GITHUB}/releases/latest")
+    } else {
+        format!(
+            "https://api.github.com/repos/{DUTCHMAN_GITHUB}/releases/tags/{}",
+            urlencoding(tag)
+        )
+    };
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "foundry-pdm")
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| Error::Network(e.to_string()))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(Error::NoReleases);
+    }
+    if !status.is_success() {
+        return Err(Error::Network(format!("HTTP {status} from {url}")));
+    }
+    let body = read_capped(resp, MAX_RELEASE_BYTES).await?;
+    parse_release(&body)
+}
+
+/// Minimal percent-encoding for release tags (no query parsing involved).
+fn urlencoding(tag: &str) -> String {
+    let mut out = String::new();
+    for b in tag.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// This machine's Dutchman Linux tarball: the versioned
+/// `dutchman-<version>-<arch>-unknown-linux-gnu.tar.gz` asset first (it has a
+/// `.sha256` sidecar), the unversioned `dutchman-<arch>-unknown-linux-gnu.tar.gz`
+/// name the README links as fallback.
+pub fn dutchman_linux_tarball(rel: &Release) -> Option<&Asset> {
+    let arch = match std::env::consts::ARCH {
+        "aarch64" | "arm64" => "aarch64",
+        "x86_64" | "amd64" => "x86_64",
+        _ => return None,
+    };
+    let versioned = {
+        let tag = rel.tag_name.trim_start_matches('v');
+        (!tag.is_empty())
+            .then(|| {
+                rel.assets
+                    .iter()
+                    .find(|a| a.name == format!("dutchman-{tag}-{arch}-unknown-linux-gnu.tar.gz"))
+            })
+            .flatten()
+    };
+    versioned.or_else(|| {
+        rel.assets
+            .iter()
+            .find(|a| a.name == format!("dutchman-{arch}-unknown-linux-gnu.tar.gz"))
+    })
+}
+
+/// The version token of the installed dutchman (`dutchman --version`), `None`
+/// when the binary is missing or reports no recognizable version.
+pub async fn dutchman_version_of(dest: &Path) -> Option<String> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(dest).arg("--version").output(),
+    )
+    .await
+    .ok()
+    .and_then(|out| out.ok())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().rev().find_map(|line| {
+        line.split_whitespace()
+            .find(|tok| parse_version(tok).is_some())
+            .map(str::to_string)
+    })
+}
+
+/// The expected SHA-256 of a release tarball from its `.sha256` sidecar: the
+/// first 64-hex-digit field of the first line.
+pub fn dutchman_sidecar_sha(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let line = text.lines().next()?;
+    line.split_whitespace()
+        .next()
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|h| h.to_ascii_lowercase())
+}
+
+/// Extract the `dutchman` binary from a release tarball (the top-level
+/// `dutchman-<version>-<target>/` folder) into `dest`.
+pub fn extract_dutchman(bytes: &[u8], dest: &Path) -> Result<std::path::PathBuf, Error> {
+    use flate2::read::GzDecoder;
+    std::fs::create_dir_all(dest).map_err(|e| Error::Parse(format!("create {dest:?}: {e}")))?;
+    let gz = GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(gz);
+    let mut found: Option<std::path::PathBuf> = None;
+    for entry in archive
+        .entries()
+        .map_err(|e| Error::Parse(format!("bad tar.gz: {e}")))?
+    {
+        let mut entry = entry.map_err(|e| Error::Parse(format!("bad tar.gz entry: {e}")))?;
+        let name = entry
+            .path()
+            .map_err(|e| Error::Parse(format!("bad tar.gz entry path: {e}")))?
+            .file_name()
+            .map(|n| n.to_os_string())
+            .and_then(|n| n.into_string().ok());
+        if entry.header().entry_type().is_file()
+            && matches!(name.as_deref(), Some("dutchman" | "dutchman.exe"))
+        {
+            let out = dest.join(name.clone().unwrap_or_else(|| "dutchman".into()));
+            entry
+                .unpack(&out)
+                .map_err(|e| Error::Parse(format!("extract: {e}")))?;
+            found = Some(out);
+            break;
+        }
+    }
+    found.ok_or_else(|| Error::Parse("the .tar.gz contains no dutchman binary".into()))
+}
+
+/// What an installed Dutchman binary came from, recorded in the info file
+/// beside it. `marker` distinguishes builds of a channel: the tag for stable
+/// and pinned releases, the release's `updated_at` for `nightly` (the tag never
+/// changes, the build does).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DutchmanInfo {
+    pub channel: String,
+    pub tag: String,
+    pub marker: String,
+}
+
+/// The info file recording which release the binary at `dest` came from.
+pub fn dutchman_info_path(dest: &Path) -> std::path::PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_os_string())
+        .and_then(|n| n.into_string().ok())
+        .unwrap_or_else(|| "dutchman".into());
+    dest.with_file_name(format!("{name}.info"))
+}
+
+pub fn read_dutchman_info(dest: &Path) -> Option<DutchmanInfo> {
+    let bytes = std::fs::read(dutchman_info_path(dest)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The marker that identifies the current build of a release for a channel:
+/// the tag for `latest`/pinned channels, the release's `updated_at` for
+/// `nightly` (whose tag is constant while its contents change daily).
+fn dutchman_marker(channel: &str, rel: &Release) -> String {
+    if channel == "nightly" {
+        rel.updated_at
+            .clone()
+            .unwrap_or_else(|| rel.published_at.clone().unwrap_or_default())
+    } else {
+        rel.tag_name.clone()
+    }
+}
+
+/// Download a Dutchman release (verified against its `.sha256` sidecar) and
+/// install its `dutchman` binary at `dest`, recording where it came from.
+/// `tag` is the release to install; `channel` the settings channel it satisfies.
+pub async fn apply_dutchman_tag(dest: &Path, tag: &str, channel: &str) -> Result<Release, Error> {
+    static DUTCHMAN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = DUTCHMAN_LOCK.lock().await;
+    let rel = fetch_dutchman_release(tag).await?;
+    let asset = dutchman_linux_tarball(&rel).ok_or_else(|| {
+        Error::Parse("no linux tar.gz for this architecture in the Dutchman release".into())
+    })?;
+    let url = asset
+        .download_url()
+        .ok_or_else(|| Error::Parse("release asset has no download URL".into()))?
+        .to_string();
+    if !url.starts_with("https://github.com/dutchman-cad/dutchman/releases/download/") {
+        return Err(Error::Parse(
+            "refusing download URL outside GitHub Dutchman releases".into(),
+        ));
+    }
+    let sidecar = download(&format!("{url}.sha256"), 16 * 1024).await?;
+    let want = dutchman_sidecar_sha(&sidecar)
+        .ok_or_else(|| Error::Parse(".sha256 sidecar has no usable hash".into()))?;
+    let bytes = download(&url, DUTCHMAN_MAX_DOWNLOAD_BYTES).await?;
+    let got = sha256_hex(&bytes);
+    if !got.eq_ignore_ascii_case(&want) {
+        return Err(Error::Parse(format!(
+            "dutchman tarball sha256 mismatch (sidecar {want}, got {got})"
+        )));
+    }
+    let dir = std::env::temp_dir().join(format!("pdm-dutchman-{}", std::process::id()));
+    let extracted = extract_dutchman(&bytes, &dir)?;
+    install_file(&extracted, dest)?;
+    let _ = std::fs::remove_dir_all(&dir);
+    let info = DutchmanInfo {
+        channel: channel.to_string(),
+        tag: rel.tag_name.clone(),
+        marker: dutchman_marker(channel, &rel),
+    };
+    if let Err(e) = std::fs::write(
+        dutchman_info_path(dest),
+        serde_json::to_vec(&info).unwrap_or_else(|_| b"{}".to_vec()),
+    ) {
+        tracing::debug!(%e, "could not write the Dutchman info file");
+    }
+    Ok(rel)
+}
+
+/// Download the newest stable Dutchman release and install it at `dest`.
+pub async fn apply_dutchman(dest: &Path) -> Result<String, Error> {
+    let rel = apply_dutchman_tag(dest, "latest", "latest").await?;
+    Ok(rel.tag_name)
+}
+
+/// Whether the installed binary satisfies `channel`: the info file's channel and
+/// marker match the newest release of that channel.
+async fn dutchman_satisfied(dest: &Path, channel: &str) -> Result<bool, Error> {
+    let info = match read_dutchman_info(dest) {
+        Some(i) => i,
+        None => return Ok(false),
+    };
+    if info.channel != channel {
+        return Ok(false);
+    }
+    let rel = if channel == "latest" {
+        fetch_dutchman_latest().await?
+    } else {
+        fetch_dutchman_release(channel).await?
+    };
+    Ok(info.marker == dutchman_marker(channel, &rel))
+}
+
+/// Make sure the dutchman binary at `dest` satisfies `channel`, pulling the
+/// referenced release when it does not (the worker's on-demand install). Returns
+/// the release tag when it downloaded, `None` when satisfied or updates are
+/// disabled.
+pub async fn ensure_dutchman_for(dest: &Path, channel: &str) -> Result<Option<String>, Error> {
+    if dutchman_update_disabled() {
+        return Ok(None);
+    }
+    if dest.exists() && dutchman_satisfied(dest, channel).await.unwrap_or(false) {
+        return Ok(None);
+    }
+    let tag = if channel == "latest" {
+        "latest".to_string()
+    } else {
+        channel.to_string()
+    };
+    let rel = apply_dutchman_tag(dest, &tag, channel).await?;
+    tracing::info!(channel, tag = %rel.tag_name, "installed the referenced Dutchman release");
+    Ok(Some(rel.tag_name))
+}
+
+/// Install or update the Dutchman binary at `dest` to satisfy `channel` (the
+/// boot/interval check). Silent when satisfied; a missing binary installs the
+/// referenced release.
+pub async fn boot_dutchman_update(dest: &Path, channel: &str) {
+    if dutchman_update_disabled() {
+        return;
+    }
+    match ensure_dutchman_for(dest, channel).await {
+        Ok(Some(tag)) => tracing::info!(channel, "Dutchman updated to {tag}"),
+        Ok(None) => tracing::debug!(channel, "Dutchman is current for the channel"),
+        Err(e) => tracing::warn!(channel, "Dutchman update failed: {e}"),
+    }
+}
+
+/// The System-panel channel menu: `latest`, `nightly`, the onshape-preview
+/// builds, and the recent stable tags.
+pub async fn dutchman_channels() -> Result<Vec<(String, String)>, Error> {
+    let client = reqwest::Client::new();
+    let url = format!("https://api.github.com/repos/{DUTCHMAN_GITHUB}/releases?per_page=20");
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "foundry-pdm")
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| Error::Network(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(Error::Network(format!("HTTP {} from {url}", resp.status())));
+    }
+    let body = read_capped(resp, MAX_RELEASE_BYTES).await?;
+    let releases: Vec<Release> =
+        serde_json::from_slice(&body).map_err(|e| Error::Parse(format!("release list: {e}")))?;
+    let mut options: Vec<(String, String)> = Vec::new();
+    let mut stable: Vec<&Release> = Vec::new();
+    for rel in &releases {
+        if rel.prerelease && rel.tag_name == "nightly" {
+            let date = rel
+                .name
+                .as_deref()
+                .and_then(|n| n.rsplit(' ').next())
+                .unwrap_or("");
+            options.push((
+                "nightly".into(),
+                format!("Nightly {date} (includes unreleased work)"),
+            ));
+        } else if rel.prerelease && rel.tag_name.starts_with("onshape-preview") {
+            options.push((
+                rel.tag_name.clone(),
+                rel.name.clone().unwrap_or_else(|| rel.tag_name.clone()),
+            ));
+        } else if !rel.prerelease {
+            stable.push(rel);
+        }
+    }
+    if let Some(latest) = stable.first() {
+        options.insert(
+            0,
+            (
+                "latest".into(),
+                format!(
+                    "Latest stable ({})",
+                    latest.tag_name.trim_start_matches('v')
+                ),
+            ),
+        );
+    }
+    // Recent stable tags for pinning (newest first), after the channels above.
+    for rel in stable.iter().skip(1).take(5) {
+        options.push((
+            rel.tag_name.clone(),
+            format!("Pinned {}", rel.tag_name.trim_start_matches('v')),
+        ));
+    }
+    Ok(options)
 }
 
 // ── SolidCraft web build (the "Edit in SolidCraft web" app bundled in the
@@ -1635,5 +2027,159 @@ mod tests {
             Some("0.40.1")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Dutchman ─────────────────────────────────────────────────────────
+
+    fn dutchman_rel() -> Option<Release> {
+        let arch = match std::env::consts::ARCH {
+            "x86_64" | "aarch64" => std::env::consts::ARCH,
+            _ => return None, // the picker only claims this machine's linux tarball
+        };
+        let mut rel = Release {
+            tag_name: "v0.2.9".into(),
+            ..Default::default()
+        };
+        for name in [
+            format!("dutchman-0.2.9-{arch}-unknown-linux-gnu.tar.gz"),
+            format!("dutchman-0.2.9-{arch}-unknown-linux-gnu.tar.gz.sha256"),
+            format!("dutchman-{arch}-unknown-linux-gnu.tar.gz"),
+            "dutchman-0.2.9-macos-universal.tar.gz".to_string(),
+        ] {
+            rel.assets.push(Asset {
+                browser_download_url: Some(format!(
+                    "https://github.com/dutchman-cad/dutchman/releases/download/v0.2.9/{name}"
+                )),
+                url: None,
+                size: None,
+                name,
+            });
+        }
+        Some(rel)
+    }
+
+    #[test]
+    fn dutchman_tarball_prefers_the_versioned_asset() {
+        let Some(mut rel) = dutchman_rel() else {
+            return;
+        };
+        let pick = dutchman_linux_tarball(&rel).expect("a linux tarball");
+        assert!(pick.name.starts_with("dutchman-0.2.9-"), "{}", pick.name);
+        // No versioned asset: the unversioned README name is the fallback.
+        rel.assets
+            .retain(|a| !a.name.starts_with("dutchman-0.2.9-"));
+        let pick = dutchman_linux_tarball(&rel).expect("the unversioned tarball");
+        assert!(
+            pick.name.ends_with("-unknown-linux-gnu.tar.gz") && !pick.name.contains("0.2.9"),
+            "{}",
+            pick.name
+        );
+        // No linux assets at all.
+        rel = dutchman_rel().expect("release");
+        rel.assets
+            .retain(|a| a.name.contains("macos") && !a.name.ends_with(".sha256"));
+        assert!(dutchman_linux_tarball(&rel).is_none());
+    }
+
+    #[test]
+    fn dutchman_marker_tracks_the_channel_build() {
+        let mut rel = Release {
+            tag_name: "v0.2.9".into(),
+            ..Default::default()
+        };
+        assert_eq!(dutchman_marker("latest", &rel), "v0.2.9");
+        assert_eq!(dutchman_marker("onshape-preview-2", &rel), "v0.2.9");
+        // A rolling tag is identified by its last update, not its constant tag.
+        rel.tag_name = "nightly".into();
+        rel.updated_at = Some("2026-11-15T14:39:31Z".into());
+        assert_eq!(dutchman_marker("nightly", &rel), "2026-11-15T14:39:31Z");
+        rel.updated_at = Some("2026-11-16T08:00:00Z".into());
+        assert_ne!(dutchman_marker("nightly", &rel), "2026-11-15T14:39:31Z");
+    }
+
+    #[test]
+    fn dutchman_sidecar_sha_takes_the_first_hex_field() {
+        assert_eq!(
+            dutchman_sidecar_sha(
+                b"56f34583c3a966067e816bf25fff559b77add5f56a1bf25a0d8bd0e2d7dd1b2f  dutchman-0.2.9-x86_64-unknown-linux-gnu.tar.gz\n"
+            ),
+            Some("56f34583c3a966067e816bf25fff559b77add5f56a1bf25a0d8bd0e2d7dd1b2f".into())
+        );
+        assert_eq!(dutchman_sidecar_sha(b"not-a-hash  name.tar.gz"), None);
+        assert_eq!(dutchman_sidecar_sha(b"short"), None);
+        assert_eq!(dutchman_sidecar_sha(b""), None);
+    }
+
+    #[test]
+    fn extract_dutchman_pulls_the_binary_from_the_release_folder() {
+        use flate2::write::GzEncoder;
+        let dir = tempfile::tempdir().unwrap();
+        let entries: [(&str, &[u8]); 3] = [
+            (
+                "dutchman-0.2.9-x86_64-unknown-linux-gnu/dutchman",
+                b"#!/bin/sh\necho dutchman 0.2.9\n",
+            ),
+            (
+                "dutchman-0.2.9-x86_64-unknown-linux-gnu/dutchman-gui",
+                b"gui",
+            ),
+            (
+                "dutchman-0.2.9-x86_64-unknown-linux-gnu/README.md",
+                b"# dutchman",
+            ),
+        ];
+        let mut gz = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        {
+            let mut builder = tar::Builder::new(&mut gz);
+            for (name, body) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o755);
+                header.set_cksum();
+                builder.append_data(&mut header, name, body).unwrap();
+            }
+        }
+        let bytes = gz.finish().unwrap();
+        let bin = extract_dutchman(&bytes, dir.path()).unwrap();
+        assert!(bin.file_name().unwrap() == "dutchman");
+        assert!(
+            std::fs::read_to_string(&bin)
+                .unwrap()
+                .starts_with("#!/bin/sh")
+        );
+        // A tarball without the binary is an error, not a panic.
+        let mut gz = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        {
+            let mut builder = tar::Builder::new(&mut gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(3);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(
+                    &mut header,
+                    "dutchman-0.2.9-x86_64-unknown-linux-gnu/dutchman-gui",
+                    &b"gui"[..],
+                )
+                .unwrap();
+        }
+        let bytes = gz.finish().unwrap();
+        assert!(extract_dutchman(&bytes, dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dutchman_version_parsed_from_cli_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("dutchman");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n[ \"$1\" = --version ] && echo 'dutchman 0.2.9'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(dutchman_version_of(&script).await.as_deref(), Some("0.2.9"));
+        assert_eq!(dutchman_version_of(&dir.path().join("missing")).await, None);
     }
 }

@@ -187,9 +187,10 @@
       await new Promise(r => setTimeout(r, 400));
     }
   }
-  async function openSolidcraft({ version, name, designUrl, checkin, onSaved }){
+  async function openSolidcraft({ version, name, designUrl, checkin, createNew, onSaved }){
     if (active) return;
     active = true;
+    const isNew = !version; // blank session: Save to PDM creates the item (createNew)
     const dialog = document.createElement("dialog");
     dialog.className = "web-editor";
     dialog.setAttribute("aria-label", "SolidCraft web editor");
@@ -202,12 +203,15 @@
     const find = s => dialog.querySelector(s);
     const frame = find("iframe"), status = find("[role=status]");
     const edited = find("[data-edited]"), save = find("[data-checkin]");
-    find("strong").textContent = "SolidCraft — " + name + " · v" + version.seq;
-    frame.title = "SolidCraft — " + name;
+    const downloadName = name || "new-part.sc";
+    let displayName = name;
+    find("strong").textContent = isNew ? "SolidCraft — new design" : "SolidCraft — " + displayName + " · v" + version.seq;
+    frame.title = isNew ? "SolidCraft — new design" : "SolidCraft — " + displayName;
+    find("[data-original]").hidden = isNew;
     let original = null, pending = null, busy = false, closed = false;
     const update = () => {
       edited.disabled = busy;
-      save.disabled = busy || !checkin;
+      save.disabled = busy || !(checkin || createNew);
     };
     const close = () => {
       if (busy) return;
@@ -226,19 +230,56 @@
       busy = true; update();
       try {
         const snapshot = await scEditedBytes(frame, "pdm-checkin-" + Date.now() + ".sc");
-        download(snapshot, name);
+        download(snapshot, downloadName);
         status.textContent = "Edited file downloaded." + (checkin ? " Use Save to PDM to check in the current design." : "");
       } catch(e){
         if (pending){
-          download(pending, name);
+          download(pending, downloadName);
           status.textContent = "Downloaded the last collected design. Could not collect the latest edits: " + e.message;
         } else status.textContent = "Download failed: " + e.message;
       } finally { busy = false; update(); }
     };
     edited.onclick = grab;
-    save.hidden = !checkin;
+    save.hidden = !(checkin || createNew);
     save.onclick = async () => {
-      if (busy || !checkin) return;
+      if (busy) return;
+      if (isNew && createNew){
+        busy = true; update();
+        status.textContent = "Collecting the edited design…";
+        let snapshot;
+        try { snapshot = await scEditedBytes(frame, "pdm-checkin-" + Date.now() + ".sc"); }
+        catch(e){
+          busy = false; update();
+          status.textContent = "Could not collect the design: " + e.message;
+          return;
+        }
+        pending = snapshot;
+        status.textContent = "Saving to PDM…";
+        try {
+          const result = await createNew(snapshot, dialog);
+          if (result === null){
+            busy = false; update();
+            status.textContent = "Save cancelled. Use Download edited file to keep a copy, or Save to PDM again.";
+            return;
+          }
+          if (pending === snapshot) pending = null;
+          // First save made the item: later saves check in new versions of it.
+          createNew = null;
+          checkin = result.checkin || null;
+          displayName = result.item.part_number;
+          status.textContent = "Saved to PDM: " + result.item.part_number + " v" + result.version.seq + "." +
+            (result.checkin ? " Save to PDM again to check in more versions of this item." : "");
+          find("strong").textContent = "SolidCraft — " + result.item.part_number + " · v" + result.version.seq;
+          if (onSaved) onSaved();
+        } catch(e){
+          busy = false; update();
+          status.textContent = "Save failed: " + e.message + "\nYour edited file is still available to download or retry.";
+          return;
+        }
+        busy = false; update();
+        return;
+      }
+      if (!checkin) return;
       const message = prompt("Commit message", "Edited in SolidCraft web");
       if (message === null) return;
       busy = true; update();
@@ -250,7 +291,7 @@
         const result = await checkin(snapshot, message);
         if (pending === snapshot) pending = null;
         status.textContent = "Saved to PDM as v" + result.seq + ".";
-        find("strong").textContent = "SolidCraft — " + name + " · v" + result.seq;
+        find("strong").textContent = "SolidCraft — " + displayName + " · v" + result.seq;
         if (onSaved) onSaved();
       } catch(e){
         busy = false; update();
@@ -261,13 +302,18 @@
     };
     document.body.appendChild(dialog); dialog.showModal(); update();
     status.textContent = "Loading SolidCraft…";
-    const url = "/static/editors/solidcraft/index.html?open=" + encodeURIComponent(designUrl);
+    // A blank session (no ?open=) starts on the app's home screen, where the
+    // user creates the new design before saving it to PDM.
+    const url = isNew
+      ? "/static/editors/solidcraft/index.html"
+      : "/static/editors/solidcraft/index.html?open=" + encodeURIComponent(designUrl);
     try {
       const response = await fetch("/static/editors/solidcraft/index.html", { method:"HEAD" });
       if (closed) return;
       if (!response.ok) throw new Error("web build is not installed (HTTP " + response.status + ")");
       frame.src = url;
-    } catch(e){ status.textContent = "Cannot load SolidCraft: " + e.message + " — Download original is still available."; }
+      if (isNew) status.textContent = "Create a design in SolidCraft, then use Save to PDM to store it as a new item (auto part number when left blank).";
+    } catch(e){ status.textContent = "Cannot load SolidCraft: " + e.message + (isNew ? "" : " — Download original is still available."); }
     dialog.addEventListener("close", () => { active = false; });
   }
 

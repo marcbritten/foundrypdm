@@ -244,12 +244,15 @@ const PAGE: &str = r##"<!DOCTYPE html>
         <button id="co">Check out</button>
         <button id="uc">Undo checkout</button>
         <button id="ci">Check in (upload)</button>
+        <label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--dim)" title="Tick to start a new major version (V3 - R1); unticked saves a new revision of the current version">
+          <input type="checkbox" id="cinewver"> new version
+        </label>
         <button id="rel">Release revision</button>
         <button id="itemkebab" class="kebab" title="Item actions">⋮</button>
       </div>
       <h2>Versions</h2>
       <table id="vers" class="ver"><thead><tr>
-        <th>Preview</th><th>Seq</th><th>Type</th><th>SHA-256</th><th>Author</th><th>When</th><th>Message</th><th></th>
+        <th>Preview</th><th>Version</th><th>Type</th><th>SHA-256</th><th>Author</th><th>When</th><th>Message</th><th></th>
       </tr></thead><tbody></tbody></table>
     </div>
 
@@ -322,6 +325,11 @@ function typeBadge(mime, filename){
 }
 function revBadge(label){
   return label ? "<span class='rev'>" + esc(label) + "</span>" : "<span class='rev wip'>WIP</span>";
+}
+function verLabel(version, revision, seq){
+  if (version != null && revision != null) return "V" + version + " - R" + revision;
+  if (seq != null) return "V" + seq;
+  return "—";
 }
 function fmtTime(iso){
   if (!iso) return "—";
@@ -725,7 +733,7 @@ function renderTable(list){
       "<td>" + nameCell(it) + "</td>" +
       "<td class='mono'>" + esc(it.part_number) + "</td>" +
       "<td class='muted'>" + esc(it.lifecycle_state) + "</td>" +
-      "<td>" + (it.head_version_seq != null ? it.head_version_seq : "—") + "</td>" +
+       "<td>" + (it.head_version_seq != null ? verLabel(it.head_version, it.head_revision, it.head_version_seq) : "—") + "</td>" +
       "<td class='muted'>" + fmtTime(it.modified_at) + "</td>" +
       "<td class='muted'>" + esc(it.modified_by || "—") + "</td>" +
       "<td class='muted'>" + esc(it.owner_name || "—") + "</td>" +
@@ -810,7 +818,7 @@ async function loadVersions(d){
     const tr = document.createElement("tr");
     tr.innerHTML =
       "<td>" + (v.thumbnail_sha256 ? thumbCell("/versions/" + v.id + "/thumbnail") : "") + "</td>" +
-      "<td>" + v.seq + "</td>" +
+      "<td>" + verLabel(v.version, v.revision, v.seq) + "</td>" +
       "<td>" + typeBadge(v.mime_type, v.native_format) + "</td>" +
       "<td class='mono muted'>" + esc(v.sha256 || "").slice(0,16) + "…</td>" +
       "<td class='muted'>" + esc(v.author_name || "—") + "</td>" +
@@ -856,7 +864,7 @@ async function checkout(){
   if (!CUR_ITEM) return;
   try {
     const d = await api("POST", "/items/" + CUR_ITEM + "/checkout", { workstation: location.hostname });
-    LOCK = d.lock; ok("Checked out (base v" + (d.base_version ? d.base_version.seq : "—") + ")");
+    LOCK = d.lock; ok("Checked out (base " + (d.base_version ? verLabel(d.base_version.version, d.base_version.revision, d.base_version.seq) : "—") + ")");
     loadAudit();
     const fresh = await api("GET", "/items/" + CUR_ITEM); openItem(CUR_ITEM, null);
   } catch(e){ err("checkout: " + e.message); }
@@ -880,14 +888,16 @@ async function checkin(){
     const sha = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2,"0")).join("");
     const up = await api("PUT", "/blobs", null, new Uint8Array(buf));
     const base = (await api("GET", "/items/" + CUR_ITEM)).head_version;
+    const newVersion = $("cinewver").checked;
     const d = await api("POST", "/items/" + CUR_ITEM + "/checkin", {
       sha256: up.blob.sha256, size: up.blob.size_bytes,
       base_version: base ? base.seq : null,
       commit_message: $("dmsg").value || "", filename: f.name,
       mime_type: f.type || null,
+      new_version: newVersion,
     });
-    ok("Checked in v" + d.version.seq + "  (" + sha.slice(0,12) + "…)");
-    LOCK = null; $("dmsg").value = "";
+    ok("Checked in " + verLabel(d.version.version, d.version.revision, d.version.seq) + "  (" + sha.slice(0,12) + "…)");
+    LOCK = null; $("dmsg").value = ""; $("cinewver").checked = false;
     loadAudit();
     const fresh = await api("GET", "/items/" + CUR_ITEM); openItem(CUR_ITEM, null);
   } catch(e){ err("checkin: " + e.message); }

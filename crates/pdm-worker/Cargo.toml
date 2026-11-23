@@ -7,7 +7,9 @@ version.workspace = true
 [dependencies]
 pdm-core = { workspace = true }
 pdm-db = { workspace = true }
+pdm-nesting = { workspace = true }
 pdm-storage = { workspace = true }
+pdm-update = { workspace = true }
 tokio = { workspace = true }
 sqlx = { workspace = true }
 serde_json = { workspace = true }

@@ -188,10 +188,22 @@ pub struct ItemSummary {
     pub locked_by: Option<String>,
     /// Seq of the head (max seq) file version, if any.
     pub head_version_seq: Option<i32>,
+    /// Major version of the head file version (bumped only on "save as new version").
+    pub head_version: Option<i32>,
+    /// Per-save revision of the head file version within its major version.
+    pub head_revision: Option<i32>,
     /// Filename recorded on the item's file, if a file exists.
     pub filename: Option<String>,
     /// MIME type recorded at check-in, if a file exists.
     pub mime_type: Option<String>,
+    /// True when the item has a `sheet_metal_specs` row (it is a sheet-metal part).
+    pub sheet_metal: Option<bool>,
+    /// Material of the item's sheet-metal spec, if any.
+    pub sheet_metal_material: Option<String>,
+    /// Thickness in mm of the item's sheet-metal spec, if any.
+    pub sheet_metal_thickness_mm: Option<f64>,
+    /// True when the item's sheet-metal spec has a generated flat-pattern DXF.
+    pub sheet_metal_flat_pattern: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -217,7 +229,12 @@ pub struct Blob {
 pub struct FileVersion {
     pub id: Uuid,
     pub file_id: Uuid,
+    /// Global monotonic per-save counter (head = max seq; used for stale-base checks).
     pub seq: i32,
+    /// Major version, bumped only when the user checks in "as a new version".
+    pub version: i32,
+    /// Per-save revision within the major version (V2 - R5 = fifth save in version 2).
+    pub revision: i32,
     pub blob_id: Uuid,
     pub author_id: Uuid,
     pub committed_at: DateTime<Utc>,
@@ -241,6 +258,8 @@ pub struct VersionDetail {
     pub id: Uuid,
     pub file_id: Uuid,
     pub seq: i32,
+    pub version: i32,
+    pub revision: i32,
     pub blob_id: Uuid,
     pub author_id: Uuid,
     pub committed_at: DateTime<Utc>,
@@ -359,16 +378,188 @@ pub fn preview_plan(filename: &str) -> PreviewPlan {
     PreviewPlan::Skip
 }
 
-/// Formats admitted for conversion into a native `.sc` artifact. Scripts and
-/// existing native designs are deliberately not offered as CAD conversions.
-pub fn can_convert_to_solidcraft(filename: &str) -> bool {
+/// Feature-timeline types the SolidCraft engine reports for sheet-metal
+/// features (`solidcraft-cli eval` `timeline[].type`). A design whose
+/// timeline carries any of these was built with sheet-metal tools, so the
+/// PDM can flag its item as a sheet-metal part on its own.
+pub const SHEET_METAL_FEATURE_TYPES: &[&str] = &[
+    "BaseFlangeFeature",
+    "ContourFlangeFeature",
+    "EdgeFlangeFeature",
+    "PathFlangeFeature",
+    "HemFeature",
+    "PerforateFeature",
+    "FoldFeature",
+    "UnfoldFeature",
+    "RefoldFeature",
+    "ConvertToSheetMetalFeature",
+    "CoilFeature",
+];
+
+/// True when `solvecraft-cli eval` measurements JSON contains a sheet-metal
+/// feature in the design's timeline. Imported B-rep files (STEP and the like)
+/// carry only a `BaseFeature` timeline and are never flagged by this.
+pub fn measurements_have_sheet_metal_features(measurements: &serde_json::Value) -> bool {
+    measurements
+        .get("timeline")
+        .and_then(|t| t.as_array())
+        .is_some_and(|timeline| {
+            timeline.iter().any(|f| {
+                f.get("type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| SHEET_METAL_FEATURE_TYPES.contains(&t))
+            })
+        })
+}
+
+/// File extensions Dutchman (the dutchman-cad/dutchman release) decodes into a
+/// SolidCraft `.sc` design, keeping editable feature history where it maps
+/// (lower case): Fusion, Inventor, SolidWorks, FreeCAD, CATIA, Rhino,
+/// Creo View, ACIS, STEP and Onshape bundles.
+pub const DUTCHMAN_EXTS: [&str; 17] = [
+    "f3d",
+    "f3z",
+    "ipt",
+    "iam",
+    "sldprt",
+    "sldasm",
+    "fcstd",
+    "catpart",
+    "pvz",
+    "3dm",
+    "sat",
+    "sab",
+    "smt",
+    "smb",
+    "step",
+    "stp",
+    "onshape-bundle",
+];
+
+/// Organization Dutchman settings: which release channel to convert with, and
+/// which conversion options to pass to the CLI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DutchmanSettings {
+    /// Release channel: `latest` (newest stable), `nightly`, or a pinned tag
+    /// such as `v0.2.9` / `onshape-preview-2`.
+    pub channel: String,
+    /// `fast` | `standard` | `full`.
+    pub preset: String,
+    /// `smart` | `last-shown` | `first-placed`.
+    pub part_positions: String,
+    /// Verify a rebuilt feature history in the SolidCraft CLI.
+    pub verify: bool,
+    /// Wall-clock limit for one conversion in seconds; `0` = the worker default.
+    pub timeout_secs: u64,
+    /// `dutchman onshape fetch --max-calls`; `0` = the default of 200.
+    pub onshape_max_calls: u32,
+}
+
+impl Default for DutchmanSettings {
+    fn default() -> Self {
+        Self {
+            channel: "latest".into(),
+            preset: "standard".into(),
+            part_positions: "smart".into(),
+            verify: true,
+            timeout_secs: 0,
+            onshape_max_calls: 0,
+        }
+    }
+}
+
+impl DutchmanSettings {
+    /// Reject values the CLI would refuse or the update logic cannot reason about.
+    pub fn validate(&self) -> Result<(), PdmError> {
+        let ok_channel = self.channel == "latest"
+            || self.channel == "nightly"
+            || (4..=40).contains(&self.channel.len())
+                && self.channel.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-')
+                })
+                && self
+                    .channel
+                    .bytes()
+                    .any(|b| b.is_ascii_digit() || b == b'n');
+        if !ok_channel {
+            return Err(PdmError::BadRequest(
+                "dutchman channel must be 'latest', 'nightly' or a release tag (v0.2.9, onshape-preview-2)".into(),
+            ));
+        }
+        match self.preset.as_str() {
+            "fast" | "standard" | "full" => {}
+            _ => {
+                return Err(PdmError::BadRequest(
+                    "dutchman preset must be fast, standard or full".into(),
+                ));
+            }
+        }
+        match self.part_positions.as_str() {
+            "smart" | "last-shown" | "first-placed" => {}
+            _ => {
+                return Err(PdmError::BadRequest(
+                    "dutchman part_positions must be smart, last-shown or first-placed".into(),
+                ));
+            }
+        }
+        if self.timeout_secs > 0 && !(60..=7200).contains(&self.timeout_secs) {
+            return Err(PdmError::BadRequest(
+                "dutchman timeout_secs must be 0 or between 60 and 7200".into(),
+            ));
+        }
+        if self.onshape_max_calls != 0 && !(10..=10000).contains(&self.onshape_max_calls) {
+            return Err(PdmError::BadRequest(
+                "dutchman onshape_max_calls must be 0 or between 10 and 10000".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `--max-calls` for `dutchman onshape fetch` (0 stores the default of 200).
+    pub fn onshape_call_budget(&self) -> u32 {
+        if self.onshape_max_calls == 0 {
+            200
+        } else {
+            self.onshape_max_calls
+        }
+    }
+}
+
+/// Mesh extensions the SolidCraft CLI restates into a design (lower case); meshes
+/// carry no history, so Dutchman does not handle them.
+pub const MESH_EXTS: [&str; 5] = ["stl", "obj", "3mf", "glb", "gltf"];
+
+/// Which converter turns a checked-in file into a native `.sc` artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScConverter {
+    /// Dutchman: decodes native CAD into a SolidCraft design with feature history.
+    Dutchman,
+    /// The SolidCraft CLI: restates meshes and IGES into a design (geometry only).
+    SolidcraftCli,
+}
+
+/// Pick the converter from a file name (extension, any case): Dutchman for the
+/// native formats it decodes, the SolidCraft CLI for the rest it admits.
+pub fn sc_converter(filename: &str) -> Option<ScConverter> {
     let ext = std::path::Path::new(filename)
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    CAD_CONVERT_EXTS.contains(&ext.as_str())
-        || ["stl", "obj", "3mf", "glb", "gltf"].contains(&ext.as_str())
+    if DUTCHMAN_EXTS.contains(&ext.as_str()) {
+        return Some(ScConverter::Dutchman);
+    }
+    if CAD_CONVERT_EXTS.contains(&ext.as_str()) || MESH_EXTS.contains(&ext.as_str()) {
+        return Some(ScConverter::SolidcraftCli);
+    }
+    None
+}
+
+/// Formats admitted for conversion into a native `.sc` artifact. Scripts and
+/// existing native designs are deliberately not offered as CAD conversions.
+pub fn can_convert_to_solidcraft(filename: &str) -> bool {
+    sc_converter(filename).is_some()
 }
 
 /// A safe downloadable name, retaining the source version in the derived file.
@@ -497,11 +688,68 @@ pub struct Tool {
     pub org_id: Uuid,
     pub name: String,
     pub kind: String,
+    /// General: free-text description.
+    pub description: Option<String>,
+    /// General: tool vendor.
+    pub vendor: Option<String>,
+    /// General: vendor part number.
+    pub part_number: Option<String>,
+    /// General: link (vendor page, datasheet, ...).
+    pub link: Option<String>,
+    /// Cutter: measurement system for the geometry values.
+    pub units: String,
+    /// Cutter: rotation direction.
+    pub rotation: String,
+    /// Cutter: number of flutes / cutting edges.
+    pub flutes: Option<i32>,
+    /// Cutter: the tool's own material (carbide, HSS, ...).
+    pub tool_material: Option<String>,
+    /// Post processor: the tool number assigned on the machine.
+    pub tool_number: Option<i32>,
+    /// Cutter: geometry specific to the tool kind.
     pub dimensions: Option<serde_json::Value>,
     pub cutting_params: Option<serde_json::Value>,
     pub material_compatibility: Vec<String>,
     pub inventory: i32,
     pub tool_life: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A cutting-data set (speeds + feedrates) for a tool, scoped to a material and
+/// a required finish. All values are in the tool's units.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ToolCuttingData {
+    pub id: Uuid,
+    pub tool_id: Uuid,
+    pub label: Option<String>,
+    pub material: Option<String>,
+    pub finish: Option<String>,
+    pub spindle_speed: Option<f64>,
+    pub surface_speed: Option<f64>,
+    pub ramp_spindle_speed: Option<f64>,
+    pub cutting_feedrate: Option<f64>,
+    pub feed_per_tooth: Option<f64>,
+    pub lead_in_feedrate: Option<f64>,
+    pub lead_out_feedrate: Option<f64>,
+    pub transition_feedrate: Option<f64>,
+    pub ramp_feedrate: Option<f64>,
+    pub ramp_angle: Option<f64>,
+    pub plunge_feedrate: Option<f64>,
+    pub plunge_feed_per_rev: Option<f64>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A document attached to a tool (datasheet, drawing, vendor page file, ...).
+/// The bytes live in a content-addressed blob.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ToolDocument {
+    pub id: Uuid,
+    pub tool_id: Uuid,
+    pub filename: String,
+    pub blob_id: Uuid,
+    pub size_bytes: i64,
+    pub content_type: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -619,6 +867,142 @@ pub struct SheetMetalSpec {
     pub cutting_operation: Option<String>,
     pub forming_operation: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+// ── Laser nesting (Sparrow integration) ──────────────────────────────────
+
+/// An immutable, revision-bound flat-pattern DXF: the exact CAD version,
+/// generator and units a DXF was produced from.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct FlatPatternArtifact {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub item_id: Uuid,
+    pub file_version_id: Uuid,
+    pub sha256: String,
+    pub size_bytes: i64,
+    /// 'generated' | 'uploaded' | 'version'
+    pub source_kind: String,
+    pub generator: String,
+    /// 'mm' | 'inch' | 'unknown'
+    pub unit: String,
+    pub notes: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A laser nesting run (settings snapshot + status).
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LaserNest {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub name: String,
+    /// 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+    pub status: String,
+    pub machine_id: Option<Uuid>,
+    pub material: Option<String>,
+    pub thickness_mm: Option<f64>,
+    pub stock_width_mm: f64,
+    pub stock_height_mm: f64,
+    pub edge_margin_mm: f64,
+    pub part_gap_mm: f64,
+    /// Horizontal (x-axis) spacing between parts, mm.
+    pub spacing_x_mm: f64,
+    /// Vertical (y-axis) spacing between parts, mm.
+    pub spacing_y_mm: f64,
+    /// Sheet grain direction: "along_length" | "along_width" | "any".
+    pub grain_direction: String,
+    pub chord_tol_mm: f64,
+    pub join_tol_mm: f64,
+    /// Default source unit for parts whose DXF declares no `$INSUNITS`
+    /// ("mm" | "in" | "inch").
+    pub default_part_unit: String,
+    pub allowed_rotations: sqlx::types::Json<Vec<f64>>,
+    pub time_budget_sec: i32,
+    pub attempt_limit_sec: i32,
+    pub max_sheets: i32,
+    pub seed: Option<i64>,
+    pub solver_version: Option<String>,
+    pub engine_build: Option<String>,
+    pub job_id: Option<Uuid>,
+    pub error: Option<String>,
+    pub manifest_sha: Option<String>,
+    pub stale: bool,
+    pub stale_reason: Option<String>,
+    pub parent_nest_id: Option<Uuid>,
+    pub created_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// One part in a nest (exact source snapshot + quantity).
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LaserNestPart {
+    pub id: Uuid,
+    pub nest_id: Uuid,
+    pub org_id: Uuid,
+    pub item_id: Uuid,
+    pub file_version_id: Uuid,
+    pub artifact_id: Option<Uuid>,
+    pub dxf_sha: String,
+    pub dxf_size: i64,
+    pub part_number: String,
+    pub revision_label: Option<String>,
+    pub quantity: i32,
+    pub layer_cut: String,
+    pub layers_mark: sqlx::types::Json<Vec<String>>,
+    pub unit: String,
+    /// This line uses a mirror of the original geometry.
+    pub mirror: bool,
+    /// The solver may flip copies of this line.
+    pub allow_mirror: bool,
+    /// Part grain preference: "along_length" | "along_width" | "any".
+    pub part_grain: String,
+    /// Stable line order (the part_index used by placements).
+    pub ordinal: i32,
+}
+
+/// A produced sheet and its output blobs.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LaserNestSheet {
+    pub id: Uuid,
+    pub nest_id: Uuid,
+    pub org_id: Uuid,
+    pub sheet_index: i32,
+    pub dxf_sha: Option<String>,
+    pub dxf_size: Option<i64>,
+    pub preview_sha: Option<String>,
+    pub strip_width_mm: Option<f64>,
+    pub utilization: Option<f64>,
+    pub solver_input_sha: Option<String>,
+    pub solver_output_sha: Option<String>,
+    pub placed_count: i32,
+}
+
+/// One placed copy and its rigid transform (stock coordinates).
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LaserNestPlacement {
+    pub id: Uuid,
+    pub sheet_id: Uuid,
+    pub nest_id: Uuid,
+    pub org_id: Uuid,
+    pub part_index: i32,
+    pub copy_index: i32,
+    pub item_id: Uuid,
+    pub file_version_id: Uuid,
+    pub reflected: bool,
+    pub rotation_deg: f64,
+    pub tx: f64,
+    pub ty: f64,
+}
+
+/// A nest with its parts, sheets and placements (the detail endpoint).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaserNestDetail {
+    pub nest: LaserNest,
+    pub parts: Vec<LaserNestPart>,
+    pub sheets: Vec<LaserNestSheet>,
+    pub placements: Vec<LaserNestPlacement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -855,6 +1239,33 @@ mod tests {
     }
 
     #[test]
+    fn sheet_metal_detection_reads_the_timeline() {
+        let sheet = serde_json::json!({
+            "body_count": 1,
+            "timeline": [
+                {"type": "Sketch"},
+                {"type": "BaseFlangeFeature"},
+                {"type": "EdgeFlangeFeature"}
+            ]
+        });
+        assert!(measurements_have_sheet_metal_features(&sheet));
+        let solid = serde_json::json!({
+            "body_count": 1,
+            "timeline": [
+                {"type": "Sketch"},
+                {"type": "ExtrudeFeature"},
+                {"type": "FilletFeature"}
+            ]
+        });
+        assert!(!measurements_have_sheet_metal_features(&solid));
+        let imported = serde_json::json!({ "timeline": [{"type": "BaseFeature"}] });
+        assert!(!measurements_have_sheet_metal_features(&imported));
+        let skipped =
+            serde_json::json!({ "skipped": true, "reason": "solvecraft-cli not configured" });
+        assert!(!measurements_have_sheet_metal_features(&skipped));
+    }
+
+    #[test]
     fn preview_plan_classifies_by_extension() {
         for name in [
             "native.SC",
@@ -910,6 +1321,21 @@ mod tests {
         assert!(can_convert_to_solidcraft("plate.STEP"));
         assert!(can_convert_to_solidcraft("part.ipt"));
         assert!(can_convert_to_solidcraft("mesh.3mf"));
+        // Dutchman's native formats: Fusion, SolidWorks, CATIA, Creo View, ACIS.
+        for name in [
+            "printer.f3d",
+            "archive.F3Z",
+            "bracket.sldprt",
+            "machine.SLDASM",
+            "housings.CATPart",
+            "view.pvz",
+            "acis.sat",
+            "acis.sab",
+            "acis.smt",
+            "acis.smb",
+        ] {
+            assert!(can_convert_to_solidcraft(name), "{name}");
+        }
         for name in [
             "already.sc",
             "script.json",
@@ -928,6 +1354,88 @@ mod tests {
         assert_eq!(version_filename("plate.sc", "step"), "plate.step");
         let name = solidcraft_artifact_filename("../evil\r\n\".step", 2);
         assert!(!name.contains(['\r', '\n', '"', '/', '\\']));
+    }
+
+    #[test]
+    fn converter_selection_prefers_dutchman() {
+        for name in [
+            "printer.f3d",
+            "part.ipt",
+            "assy.IAM",
+            "block.FCStd",
+            "model.3DM",
+            "plate.STEP",
+            "plate.stp",
+            "bracket.sldprt",
+            "casing.CATPart",
+            "scan.pvz",
+            "solid.sat",
+            "intake.onshape-bundle",
+        ] {
+            assert_eq!(sc_converter(name), Some(ScConverter::Dutchman), "{name}");
+        }
+        // Geometry-only formats stay on the SolidCraft CLI.
+        for name in [
+            "mesh.stl",
+            "mesh.OBJ",
+            "thing.3mf",
+            "scene.glb",
+            "scene.gltf",
+            "wire.igs",
+            "wire.IGES",
+        ] {
+            assert_eq!(
+                sc_converter(name),
+                Some(ScConverter::SolidcraftCli),
+                "{name}"
+            );
+        }
+        for name in ["already.sc", "script.json", "drawing.pdf", "noext"] {
+            assert_eq!(sc_converter(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn dutchman_settings_defaults_and_validation() {
+        let s = DutchmanSettings::default();
+        assert!(s.validate().is_ok());
+        assert_eq!(s.channel, "latest");
+        assert_eq!(s.onshape_call_budget(), 200);
+
+        let s = DutchmanSettings {
+            channel: "onshape-preview-2".into(),
+            preset: "full".into(),
+            part_positions: "last-shown".into(),
+            verify: false,
+            timeout_secs: 900,
+            onshape_max_calls: 500,
+        };
+        assert!(s.validate().is_ok());
+        assert_eq!(s.onshape_call_budget(), 500);
+
+        let long = "x".repeat(60);
+        for channel in ["", "Latest", "v 0.2.9", "tags/nightly", long.as_str()] {
+            let s = DutchmanSettings {
+                channel: channel.into(),
+                ..Default::default()
+            };
+            assert!(s.validate().is_err(), "{channel}");
+        }
+        let s = DutchmanSettings {
+            preset: "turbo".into(),
+            ..Default::default()
+        };
+        assert!(s.validate().is_err());
+        let s = DutchmanSettings {
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        assert!(s.validate().is_err());
+        let s = DutchmanSettings {
+            onshape_max_calls: 3,
+            ..Default::default()
+        };
+        assert!(s.validate().is_err());
     }
 
     #[test]

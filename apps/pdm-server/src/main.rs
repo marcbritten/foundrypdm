@@ -113,6 +113,32 @@ async fn main() -> Result<(), MainError> {
             pdm_update::loop_cad_cli_update(std::path::PathBuf::from(dest)).await;
         });
     }
+    // Keep Dutchman (native CAD → SolidCraft with a feature tree) on the release
+    // the org's settings reference: check at boot, then on an interval
+    // (PDM_DUTCHMAN_UPDATE=0 opts out; PDM_DUTCHMAN_CLI names the binary,
+    // default /usr/local/bin/dutchman; PDM_DUTCHMAN_CHANNEL overrides the org
+    // choice for this host). Conversion and Onshape-import jobs also pull the
+    // referenced release on demand.
+    if !pdm_update::dutchman_update_disabled() {
+        let dest = std::path::PathBuf::from(pdm_update::dutchman_cli_path());
+        let pool = pool.clone();
+        let env_channel = std::env::var("PDM_DUTCHMAN_CHANNEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        tokio::spawn(async move {
+            loop {
+                let channel = env_channel
+                    .clone()
+                    .or(pdm_db::first_org_dutchman_channel(&pool).await);
+                let channel = match channel {
+                    Some(c) if !c.trim().is_empty() => c,
+                    _ => "latest".to_string(),
+                };
+                pdm_update::boot_dutchman_update(&dest, &channel).await;
+                tokio::time::sleep(pdm_update::dutchman_interval()).await;
+            }
+        });
+    }
     // Keep the bundled SolidCraft web build ("Edit in SolidCraft web") on the
     // newest GitHub release, the way the CLI is kept current. Only where the
     // portal actually ships it (the image's PDM_PORTAL_DIR); PDM_WEB_UPDATE=0

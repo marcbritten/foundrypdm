@@ -38,6 +38,20 @@ with the user's existing authentication and passed as bytes to a same-origin
 iframe using the upstream `?host=parent` bridge. API tokens are not passed to
 the editor. Files are processed in the browser.
 
+## New part in SolidCraft web (unreleased)
+
+The project explorer's **✎ New part in SolidCraft web** button (editor role)
+opens the same editor **without** a `?open=` design link — a blank session on
+the app's home screen. The user models a part, then **Save to PDM** collects
+the design the same way as above and asks for the new item's metadata
+(description, classification, folder, part number — blank means auto-assign
+from the org's part-number prefix, e.g. `BE-000116`). The item is created and
+the design is checked in as its first immutable version; afterwards the same
+**Save to PDM** button checks in new versions of that item (the original
+"Download original" button is absent, and "Download edited file" keeps a copy
+of the design while a save is in flight). Cancelling the item form keeps the
+editor open for retry or download.
+
 ## Saving
 
 Use the editor's **Save** command to return the edited bytes to PDM. Then choose

@@ -11,8 +11,10 @@
 use std::path::Path;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{get, get_service};
+use tower::Layer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
@@ -50,18 +52,30 @@ pub fn build_router(state: AppState) -> Router {
     router = router.merge(api);
 
     if let Some(dir) = portal_dir() {
+        // `no-cache` makes browsers revalidate on every load so a redeployed
+        // portal (new app.js / style.css) is not hidden behind a stale cache.
+        let no_cache = || {
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-cache"),
+            )
+        };
         let index = dir.join("index.html");
         if index.is_file() {
-            router = router.route("/", get_service(ServeFile::new(index)));
+            router = router.route("/", get_service(no_cache().layer(ServeFile::new(index))));
         } else {
             router = router.route("/", get(portal::default_index));
         }
-        router = router.nest_service("/static", ServeDir::new(dir));
+        router = router.nest_service("/static", no_cache().layer(ServeDir::new(dir)));
     } else {
         router = router.route("/", get(portal::default_index));
     }
 
+    // Axum's default request-body limit is 2 MiB; raise it to the configured
+    // upload cap so large files are not rejected before the handlers run.
+    let body_limit = usize::try_from(state.max_upload).unwrap_or(usize::MAX);
     router = router
+        .layer(DefaultBodyLimit::max(body_limit))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

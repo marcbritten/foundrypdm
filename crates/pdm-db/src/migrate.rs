@@ -21,6 +21,11 @@ const MIGRATION_0015: &str = include_str!("../migrations/0015_project_image.sql"
 const MIGRATION_0016: &str = include_str!("../migrations/0016_solidcraft_artifacts.sql");
 const MIGRATION_0017: &str = include_str!("../migrations/0017_main_assembly.sql");
 const MIGRATION_0018: &str = include_str!("../migrations/0018_onshape_folder_sync.sql");
+const MIGRATION_0019: &str = include_str!("../migrations/0019_version_revisions.sql");
+const MIGRATION_0020: &str = include_str!("../migrations/0020_tool_library.sql");
+const MIGRATION_0021: &str = include_str!("../migrations/0021_nesting.sql");
+const MIGRATION_0022: &str = include_str!("../migrations/0022_nest_default_unit.sql");
+const MIGRATION_0023: &str = include_str!("../migrations/0023_nest_grain_spacing.sql");
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), PdmError> {
     let mut tx = pool.begin().await.map_err(PdmError::Db)?;
@@ -64,6 +69,11 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), PdmError> {
         (16, MIGRATION_0016),
         (17, MIGRATION_0017),
         (18, MIGRATION_0018),
+        (19, MIGRATION_0019),
+        (20, MIGRATION_0020),
+        (21, MIGRATION_0021),
+        (22, MIGRATION_0022),
+        (23, MIGRATION_0023),
     ];
     for (version, sql) in migrations {
         if !applied.contains(version) {

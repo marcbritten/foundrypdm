@@ -7,6 +7,7 @@ version.workspace = true
 [dependencies]
 pdm-core = { workspace = true }
 pdm-db = { workspace = true }
+pdm-nesting = { workspace = true }
 pdm-storage = { workspace = true }
 pdm-update = { workspace = true }
 axum = { workspace = true }
@@ -28,6 +29,7 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 lettre = { workspace = true }
 rand = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

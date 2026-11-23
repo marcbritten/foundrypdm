@@ -176,7 +176,8 @@ async fn e2e_mfg_full_workflow() {
         "dashboard counts the completed part"
     );
 
-    // 9. A new design revision flags the NC program as outdated (data integrity).
+    // 9. A new design *major version* flags the NC program as outdated (data
+    //    integrity). Plain revisions within a version stay compatible.
     let design2 = br#"{"format":"solvecraft/5","name":"mfg-e2e-v2","units":"mm"}"#;
     let sha2 = sha256_hex(design2);
     assert_eq!(
@@ -190,8 +191,16 @@ async fn e2e_mfg_full_workflow() {
         json!({ "workstation": "mfg-e2e" }),
     )
     .await;
-    let v2 = post(&client, &format!("/items/{item_id}/checkin"), json!({ "sha256": sha2, "commit_message": "bracket rev B", "base_version": 1, "filename": "bracket.solidcraft" })).await;
-    assert_eq!(v2["version"]["seq"], 2, "second version is seq 2");
+    let v2 = post(&client, &format!("/items/{item_id}/checkin"), json!({ "sha256": sha2, "commit_message": "bracket rev B", "base_version": 1, "filename": "bracket.solidcraft", "new_version": true })).await;
+    assert_eq!(v2["version"]["seq"], 2, "second save is seq 2");
+    assert_eq!(
+        v2["version"]["version"], 2,
+        "new_version save bumps the major version"
+    );
+    assert_eq!(
+        v2["version"]["revision"], 1,
+        "new_version save resets the revision"
+    );
     let ncs = get(&client, "/nc-programs").await;
     let outdated = ncs["nc_programs"]
         .as_array()

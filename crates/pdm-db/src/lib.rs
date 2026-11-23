@@ -195,6 +195,59 @@ pub async fn set_preview_style(
     Ok(style.to_string())
 }
 
+/// The org's Dutchman settings (release channel + conversion options), stored in
+/// `organizations.settings`; absent or malformed values fall back to the defaults.
+pub async fn get_dutchman_settings(
+    pool: &PgPool,
+    org_id: Uuid,
+) -> Result<pdm_core::DutchmanSettings, PdmError> {
+    let v: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT settings->'dutchman' FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(PdmError::Db)?
+            .flatten();
+    let parsed = v
+        .as_ref()
+        .and_then(|v| serde_json::from_value::<pdm_core::DutchmanSettings>(v.clone()).ok());
+    let settings = match parsed {
+        Some(s) if s.validate().is_ok() => s,
+        _ => pdm_core::DutchmanSettings::default(),
+    };
+    Ok(settings)
+}
+
+/// The Dutchman channel of the org created first (`None` when no org has a
+/// channel set): the boot-time update loop has no org of its own, so it keeps
+/// the oldest org's choice current on this host.
+pub async fn first_org_dutchman_channel(pool: &PgPool) -> Option<String> {
+    let v: Option<String> = sqlx::query_scalar(
+        "SELECT settings->'dutchman'->>'channel' FROM organizations ORDER BY created_at LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+    v
+}
+
+/// Store the org's Dutchman settings (validated; replaces the whole object).
+pub async fn set_dutchman_settings(
+    pool: &PgPool,
+    org_id: Uuid,
+    settings: &pdm_core::DutchmanSettings,
+) -> Result<(), PdmError> {
+    settings.validate()?;
+    let json = serde_json::to_value(settings).map_err(|e| PdmError::Internal(e.to_string()))?;
+    sqlx::query("UPDATE organizations SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{dutchman}', $1, true) WHERE id = $2")
+        .bind(json)
+        .bind(org_id)
+        .execute(pool)
+        .await
+        .map_err(PdmError::Db)?;
+    Ok(())
+}
+
 pub async fn get_mail_settings(pool: &PgPool, org_id: Uuid) -> Result<serde_json::Value, PdmError> {
     let v: Option<serde_json::Value> = sqlx::query_scalar::<_, Option<serde_json::Value>>(
         "SELECT settings->'mail' FROM organizations WHERE id = $1",
@@ -812,7 +865,8 @@ fn kind_filename_patterns(kind: &str) -> Option<Vec<&'static str>> {
 /// `project_id: None` means org-wide (replaces the per-project fan-out).
 ///
 /// Filters: `classification`, `state` (lifecycle_state), `kind` (filename
-/// glob), `owner`, `folder`, `q` (full-text + part number + description).
+/// glob), `owner`, `folder`, `q` (full-text + part number + description),
+/// `sheet_metal` (only items with a sheet-metal spec / all other items).
 /// `sort` may be one of part_number/created_at/modified_at/classification;
 /// `dir` is asc|desc.
 #[allow(clippy::too_many_arguments)]
@@ -827,6 +881,7 @@ pub async fn list_items_paginated(
     owner: Option<Uuid>,
     folder: Option<Uuid>,
     q: Option<&str>,
+    sheet_metal: Option<bool>,
     sort: Option<&str>,
     dir: Option<&str>,
     page: u32,
@@ -891,6 +946,13 @@ pub async fn list_items_paginated(
              OR i.description ILIKE '%' || ${param} || '%')"
         ));
         param += 1;
+    }
+    if let Some(sm) = sheet_metal {
+        where_clauses.push(if sm {
+            "AND EXISTS (SELECT 1 FROM sheet_metal_specs s WHERE s.item_id = i.id)".into()
+        } else {
+            "AND NOT EXISTS (SELECT 1 FROM sheet_metal_specs s WHERE s.item_id = i.id)".into()
+        });
     }
 
     let where_sql = where_clauses.join(" ");
@@ -997,6 +1059,7 @@ pub async fn list_items(
         None,
         None,
         None,
+        None,
         1,
         500,
     )
@@ -1017,6 +1080,7 @@ pub async fn search_items_paginated(
     kind: Option<&str>,
     owner: Option<Uuid>,
     folder: Option<Uuid>,
+    sheet_metal: Option<bool>,
     sort: Option<&str>,
     dir: Option<&str>,
     page: u32,
@@ -1033,6 +1097,7 @@ pub async fn search_items_paginated(
         owner,
         folder,
         Some(query),
+        sheet_metal,
         sort,
         dir,
         page,
@@ -1148,7 +1213,7 @@ pub async fn get_item(pool: &PgPool, id: Uuid, org_id: Uuid) -> Result<Option<It
 
 /// Summary SELECT shared by the item listing endpoints: item columns plus the
 /// owner's name, the head version's commit time/author, the highest revision
-/// label, the live lock holder, and the head version seq.
+/// label, the live lock holder, and the head version seq / version / revision.
 const ITEM_SUMMARY_COLUMNS: &str = "SELECT i.id, i.org_id, i.project_id, i.folder_id, i.part_number,
                i.description, i.classification, i.doc_id, i.lifecycle_state, i.owner_id,
                i.created_at, i.updated_at, i.archived_at,
@@ -1156,15 +1221,24 @@ const ITEM_SUMMARY_COLUMNS: &str = "SELECT i.id, i.org_id, i.project_id, i.folde
                hv.committed_at AS modified_at,
                COALESCE(NULLIF(mu.display_name, ''), mu.email) AS modified_by,
                (SELECT MAX(fr.label) FROM file_revisions fr WHERE fr.item_id = i.id) AS latest_revision,
-               COALESCE(NULLIF(lk.display_name, ''), lk.email) AS locked_by,
-               hv.seq AS head_version_seq,
-               (SELECT f.filename FROM files f WHERE f.item_id = i.id LIMIT 1) AS filename,
-               (SELECT f.mime_type FROM files f WHERE f.item_id = i.id LIMIT 1) AS mime_type
-        FROM items i
+                COALESCE(NULLIF(lk.display_name, ''), lk.email) AS locked_by,
+                hv.seq AS head_version_seq,
+                hv.version AS head_version,
+                hv.revision AS head_revision,
+                (SELECT f.filename FROM files f WHERE f.item_id = i.id LIMIT 1) AS filename,
+                (SELECT f.mime_type FROM files f WHERE f.item_id = i.id LIMIT 1) AS mime_type,
+                (SELECT EXISTS (SELECT 1 FROM sheet_metal_specs sm WHERE sm.item_id = i.id)) AS sheet_metal,
+                (SELECT sm.material FROM sheet_metal_specs sm WHERE sm.item_id = i.id
+                 ORDER BY sm.created_at DESC LIMIT 1) AS sheet_metal_material,
+                (SELECT sm.thickness_mm FROM sheet_metal_specs sm WHERE sm.item_id = i.id
+                 ORDER BY sm.created_at DESC LIMIT 1) AS sheet_metal_thickness_mm,
+                (SELECT sm.flat_pattern_sha IS NOT NULL FROM sheet_metal_specs sm
+                 WHERE sm.item_id = i.id ORDER BY sm.created_at DESC LIMIT 1) AS sheet_metal_flat_pattern
+         FROM items i
         LEFT JOIN users ou ON ou.id = i.owner_id
-        LEFT JOIN LATERAL (
-            SELECT v.seq, v.committed_at, v.author_id
-            FROM file_versions v
+         LEFT JOIN LATERAL (
+             SELECT v.seq, v.version, v.revision, v.committed_at, v.author_id
+             FROM file_versions v
             WHERE v.file_id = (SELECT f.id FROM files f WHERE f.item_id = i.id LIMIT 1)
             ORDER BY v.seq DESC
             LIMIT 1
@@ -1447,6 +1521,19 @@ pub async fn get_file(pool: &PgPool, item_id: Uuid) -> Result<Option<FileRecord>
     .map_err(PdmError::Db)
 }
 
+pub async fn get_file_by_id(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<pdm_core::FileRecord>, PdmError> {
+    sqlx::query_as::<_, pdm_core::FileRecord>(
+        "SELECT id, item_id, filename, mime_type, created_at FROM files WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
 pub async fn upload_blob(
     pool: &PgPool,
     org_id: Uuid,
@@ -1512,6 +1599,13 @@ pub async fn get_blob_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Blob>, Pdm
 
 // ── File Versions ────────────────────────────────────────────────────────
 
+/// Create the next version row for a file.
+///
+/// Every check-in advances `seq` (the global per-save order). With
+/// `new_version = false` the save is a new *revision* of the current major
+/// version; with `new_version = true` the major version is bumped and the
+/// revision resets to 1.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_version(
     pool: &PgPool,
     file_id: Uuid,
@@ -1520,27 +1614,34 @@ pub async fn create_version(
     commit_message: &str,
     base_version_id: Option<Uuid>,
     native_format: &str,
+    new_version: bool,
 ) -> Result<FileVersion, PdmError> {
-    // Get current head seq
-    let head_seq: Option<i32> =
-        sqlx::query_scalar("SELECT MAX(seq) FROM file_versions WHERE file_id = $1")
-            .bind(file_id)
-            .fetch_one(pool)
-            .await
-            .map_err(PdmError::Db)?;
+    let head: Option<(i32, i32, i32)> = sqlx::query_as(
+        "SELECT seq, version, revision FROM file_versions WHERE file_id = $1 ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(file_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(PdmError::Db)?;
 
-    let next_seq = head_seq.map(|h| h + 1).unwrap_or(1);
+    let (next_seq, version, revision) = match head {
+        None => (1, 1, 1),
+        Some((s, v, _)) if new_version => (s + 1, v + 1, 1),
+        Some((s, v, r)) => (s + 1, v, r + 1),
+    };
 
     sqlx::query_as::<_, FileVersion>(
-        "INSERT INTO file_versions (file_id, seq, blob_id, author_id, commit_message, base_version_id, native_format)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id, file_id, seq, blob_id, author_id, committed_at, commit_message,
+        "INSERT INTO file_versions (file_id, seq, version, revision, blob_id, author_id, commit_message, base_version_id, native_format)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id, file_id, seq, version, revision, blob_id, author_id, committed_at, commit_message,
                    base_version_id, native_format, measurements,
                    thumbnail_sha256, thumbnail_size_bytes,
                    thumbnail_error",
     )
     .bind(file_id)
     .bind(next_seq)
+    .bind(version)
+    .bind(revision)
     .bind(blob_id)
     .bind(author_id)
     .bind(commit_message)
@@ -1556,7 +1657,7 @@ pub async fn get_head_version(
     file_id: Uuid,
 ) -> Result<Option<FileVersion>, PdmError> {
     sqlx::query_as::<_, FileVersion>(
-        "SELECT id, file_id, seq, blob_id, author_id, committed_at, commit_message,
+        "SELECT id, file_id, seq, version, revision, blob_id, author_id, committed_at, commit_message,
                     base_version_id, native_format, measurements,
                     thumbnail_sha256, thumbnail_size_bytes,
                     thumbnail_error
@@ -1570,7 +1671,7 @@ pub async fn get_head_version(
 
 pub async fn list_versions(pool: &PgPool, file_id: Uuid) -> Result<Vec<FileVersion>, PdmError> {
     sqlx::query_as::<_, FileVersion>(
-        "SELECT id, file_id, seq, blob_id, author_id, committed_at, commit_message,
+        "SELECT id, file_id, seq, version, revision, blob_id, author_id, committed_at, commit_message,
                     base_version_id, native_format, measurements,
                     thumbnail_sha256, thumbnail_size_bytes,
                     thumbnail_error
@@ -1588,7 +1689,7 @@ pub async fn list_version_details(
     file_id: Uuid,
 ) -> Result<Vec<pdm_core::VersionDetail>, PdmError> {
     let mut versions = sqlx::query_as::<_, pdm_core::VersionDetail>(
-        "SELECT v.id, v.file_id, v.seq, v.blob_id, v.author_id, v.committed_at,
+        "SELECT v.id, v.file_id, v.seq, v.version, v.revision, v.blob_id, v.author_id, v.committed_at,
                 v.commit_message, v.base_version_id, v.native_format,
                 b.sha256, b.size_bytes, v.thumbnail_sha256,
                 v.thumbnail_error,
@@ -1616,7 +1717,7 @@ pub async fn list_version_details(
 
 pub async fn get_version(pool: &PgPool, id: Uuid) -> Result<Option<FileVersion>, PdmError> {
     sqlx::query_as::<_, FileVersion>(
-        "SELECT id, file_id, seq, blob_id, author_id, committed_at, commit_message,
+        "SELECT id, file_id, seq, version, revision, blob_id, author_id, committed_at, commit_message,
                     base_version_id, native_format, measurements,
                     thumbnail_sha256, thumbnail_size_bytes,
                     thumbnail_error
@@ -1634,7 +1735,7 @@ pub async fn get_version_by_seq(
     seq: i32,
 ) -> Result<Option<FileVersion>, PdmError> {
     sqlx::query_as::<_, FileVersion>(
-        "SELECT id, file_id, seq, blob_id, author_id, committed_at, commit_message,
+        "SELECT id, file_id, seq, version, revision, blob_id, author_id, committed_at, commit_message,
                     base_version_id, native_format, measurements,
                     thumbnail_sha256, thumbnail_size_bytes,
                     thumbnail_error
@@ -2854,6 +2955,15 @@ pub async fn create_tool(
     org_id: Uuid,
     name: &str,
     kind: &str,
+    description: Option<&str>,
+    vendor: Option<&str>,
+    part_number: Option<&str>,
+    link: Option<&str>,
+    units: &str,
+    rotation: &str,
+    flutes: Option<i32>,
+    tool_material: Option<&str>,
+    tool_number: Option<i32>,
     dimensions: Option<&serde_json::Value>,
     cutting_params: Option<&serde_json::Value>,
     material_compatibility: &[String],
@@ -2861,13 +2971,24 @@ pub async fn create_tool(
     tool_life: Option<&serde_json::Value>,
 ) -> Result<Tool, PdmError> {
     sqlx::query_as::<_, Tool>(
-        "INSERT INTO tools (org_id, name, kind, dimensions, cutting_params, material_compatibility,
-                            inventory, tool_life)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
+        "INSERT INTO tools (org_id, name, kind, description, vendor, part_number, link, units,
+                            rotation, flutes, tool_material, tool_number, dimensions,
+                            cutting_params, material_compatibility, inventory, tool_life)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+         RETURNING *",
     )
     .bind(org_id)
     .bind(name)
     .bind(kind)
+    .bind(description)
+    .bind(vendor)
+    .bind(part_number)
+    .bind(link)
+    .bind(units)
+    .bind(rotation)
+    .bind(flutes)
+    .bind(tool_material)
+    .bind(tool_number)
     .bind(dimensions)
     .bind(cutting_params)
     .bind(material_compatibility)
@@ -2885,6 +3006,263 @@ pub async fn get_tool(pool: &PgPool, org_id: Uuid, id: Uuid) -> Result<Option<To
         .fetch_optional(pool)
         .await
         .map_err(PdmError::Db)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_tool(
+    pool: &PgPool,
+    org_id: Uuid,
+    id: Uuid,
+    name: &str,
+    kind: &str,
+    description: Option<&str>,
+    vendor: Option<&str>,
+    part_number: Option<&str>,
+    link: Option<&str>,
+    units: &str,
+    rotation: &str,
+    flutes: Option<i32>,
+    tool_material: Option<&str>,
+    tool_number: Option<i32>,
+    dimensions: Option<&serde_json::Value>,
+    cutting_params: Option<&serde_json::Value>,
+    material_compatibility: &[String],
+    inventory: i32,
+    tool_life: Option<&serde_json::Value>,
+) -> Result<Tool, PdmError> {
+    sqlx::query_as::<_, Tool>(
+        "UPDATE tools SET name = $3, kind = $4, description = $5, vendor = $6, part_number = $7,
+                          link = $8, units = $9, rotation = $10, flutes = $11, tool_material = $12,
+                          tool_number = $13, dimensions = $14, cutting_params = $15,
+                          material_compatibility = $16, inventory = $17, tool_life = $18,
+                          updated_at = now()
+         WHERE org_id = $1 AND id = $2 RETURNING *",
+    )
+    .bind(org_id)
+    .bind(id)
+    .bind(name)
+    .bind(kind)
+    .bind(description)
+    .bind(vendor)
+    .bind(part_number)
+    .bind(link)
+    .bind(units)
+    .bind(rotation)
+    .bind(flutes)
+    .bind(tool_material)
+    .bind(tool_number)
+    .bind(dimensions)
+    .bind(cutting_params)
+    .bind(material_compatibility)
+    .bind(inventory)
+    .bind(tool_life)
+    .fetch_one(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+pub async fn delete_tool(pool: &PgPool, org_id: Uuid, id: Uuid) -> Result<(), PdmError> {
+    let res = sqlx::query("DELETE FROM tools WHERE org_id = $1 AND id = $2")
+        .bind(org_id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(PdmError::Db)?;
+    if res.rows_affected() == 0 {
+        return Err(PdmError::NotFound("tool".into()));
+    }
+    Ok(())
+}
+
+// ── Tool cutting data (speeds + feedrates per material/finish) ──────────
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_cutting_data(
+    pool: &PgPool,
+    tool_id: Uuid,
+    label: Option<&str>,
+    material: Option<&str>,
+    finish: Option<&str>,
+    spindle_speed: Option<f64>,
+    surface_speed: Option<f64>,
+    ramp_spindle_speed: Option<f64>,
+    cutting_feedrate: Option<f64>,
+    feed_per_tooth: Option<f64>,
+    lead_in_feedrate: Option<f64>,
+    lead_out_feedrate: Option<f64>,
+    transition_feedrate: Option<f64>,
+    ramp_feedrate: Option<f64>,
+    ramp_angle: Option<f64>,
+    plunge_feedrate: Option<f64>,
+    plunge_feed_per_rev: Option<f64>,
+) -> Result<ToolCuttingData, PdmError> {
+    sqlx::query_as::<_, ToolCuttingData>(
+        "INSERT INTO tool_cutting_data (tool_id, label, material, finish, spindle_speed,
+             surface_speed, ramp_spindle_speed, cutting_feedrate, feed_per_tooth,
+             lead_in_feedrate, lead_out_feedrate, transition_feedrate, ramp_feedrate,
+             ramp_angle, plunge_feedrate, plunge_feed_per_rev)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+         RETURNING *",
+    )
+    .bind(tool_id)
+    .bind(label)
+    .bind(material)
+    .bind(finish)
+    .bind(spindle_speed)
+    .bind(surface_speed)
+    .bind(ramp_spindle_speed)
+    .bind(cutting_feedrate)
+    .bind(feed_per_tooth)
+    .bind(lead_in_feedrate)
+    .bind(lead_out_feedrate)
+    .bind(transition_feedrate)
+    .bind(ramp_feedrate)
+    .bind(ramp_angle)
+    .bind(plunge_feedrate)
+    .bind(plunge_feed_per_rev)
+    .fetch_one(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+pub async fn list_cutting_data(
+    pool: &PgPool,
+    tool_id: Uuid,
+) -> Result<Vec<ToolCuttingData>, PdmError> {
+    sqlx::query_as::<_, ToolCuttingData>(
+        "SELECT * FROM tool_cutting_data WHERE tool_id = $1 ORDER BY created_at",
+    )
+    .bind(tool_id)
+    .fetch_all(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_cutting_data(
+    pool: &PgPool,
+    tool_id: Uuid,
+    id: Uuid,
+    label: Option<&str>,
+    material: Option<&str>,
+    finish: Option<&str>,
+    spindle_speed: Option<f64>,
+    surface_speed: Option<f64>,
+    ramp_spindle_speed: Option<f64>,
+    cutting_feedrate: Option<f64>,
+    feed_per_tooth: Option<f64>,
+    lead_in_feedrate: Option<f64>,
+    lead_out_feedrate: Option<f64>,
+    transition_feedrate: Option<f64>,
+    ramp_feedrate: Option<f64>,
+    ramp_angle: Option<f64>,
+    plunge_feedrate: Option<f64>,
+    plunge_feed_per_rev: Option<f64>,
+) -> Result<ToolCuttingData, PdmError> {
+    sqlx::query_as::<_, ToolCuttingData>(
+        "UPDATE tool_cutting_data SET label = $3, material = $4, finish = $5, spindle_speed = $6,
+             surface_speed = $7, ramp_spindle_speed = $8, cutting_feedrate = $9, feed_per_tooth = $10,
+             lead_in_feedrate = $11, lead_out_feedrate = $12, transition_feedrate = $13,
+             ramp_feedrate = $14, ramp_angle = $15, plunge_feedrate = $16,
+             plunge_feed_per_rev = $17, updated_at = now()
+         WHERE tool_id = $1 AND id = $2 RETURNING *",
+    )
+    .bind(tool_id)
+    .bind(id)
+    .bind(label)
+    .bind(material)
+    .bind(finish)
+    .bind(spindle_speed)
+    .bind(surface_speed)
+    .bind(ramp_spindle_speed)
+    .bind(cutting_feedrate)
+    .bind(feed_per_tooth)
+    .bind(lead_in_feedrate)
+    .bind(lead_out_feedrate)
+    .bind(transition_feedrate)
+    .bind(ramp_feedrate)
+    .bind(ramp_angle)
+    .bind(plunge_feedrate)
+    .bind(plunge_feed_per_rev)
+    .fetch_one(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+pub async fn delete_cutting_data(pool: &PgPool, tool_id: Uuid, id: Uuid) -> Result<(), PdmError> {
+    let res = sqlx::query("DELETE FROM tool_cutting_data WHERE tool_id = $1 AND id = $2")
+        .bind(tool_id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(PdmError::Db)?;
+    if res.rows_affected() == 0 {
+        return Err(PdmError::NotFound("cutting data".into()));
+    }
+    Ok(())
+}
+
+// ── Tool documents ──────────────────────────────────────────────────────
+
+pub async fn create_tool_document(
+    pool: &PgPool,
+    tool_id: Uuid,
+    filename: &str,
+    blob_id: Uuid,
+    size_bytes: i64,
+    content_type: Option<&str>,
+) -> Result<ToolDocument, PdmError> {
+    sqlx::query_as::<_, ToolDocument>(
+        "INSERT INTO tool_documents (tool_id, filename, blob_id, size_bytes, content_type)
+         VALUES ($1, $2, $3, $4, $5) RETURNING *",
+    )
+    .bind(tool_id)
+    .bind(filename)
+    .bind(blob_id)
+    .bind(size_bytes)
+    .bind(content_type)
+    .fetch_one(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+pub async fn list_tool_documents(
+    pool: &PgPool,
+    tool_id: Uuid,
+) -> Result<Vec<ToolDocument>, PdmError> {
+    sqlx::query_as::<_, ToolDocument>(
+        "SELECT * FROM tool_documents WHERE tool_id = $1 ORDER BY created_at",
+    )
+    .bind(tool_id)
+    .fetch_all(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+pub async fn get_tool_document(
+    pool: &PgPool,
+    tool_id: Uuid,
+    id: Uuid,
+) -> Result<Option<ToolDocument>, PdmError> {
+    sqlx::query_as::<_, ToolDocument>("SELECT * FROM tool_documents WHERE tool_id = $1 AND id = $2")
+        .bind(tool_id)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(PdmError::Db)
+}
+
+pub async fn delete_tool_document(pool: &PgPool, tool_id: Uuid, id: Uuid) -> Result<(), PdmError> {
+    let res = sqlx::query("DELETE FROM tool_documents WHERE tool_id = $1 AND id = $2")
+        .bind(tool_id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(PdmError::Db)?;
+    if res.rows_affected() == 0 {
+        return Err(PdmError::NotFound("document".into()));
+    }
+    Ok(())
 }
 
 pub async fn list_post_processors(
@@ -3273,6 +3651,712 @@ pub async fn create_sheet_metal(
     .map_err(PdmError::Db)
 }
 
+/// Auto-flag an item as a sheet-metal part after analysis found sheet-metal
+/// features in its design. Creates an empty spec row only when the item has
+/// none yet, so it never overwrites a spec an engineer has filled in.
+/// Returns `true` when a spec was created.
+pub async fn auto_flag_sheet_metal(
+    pool: &PgPool,
+    org_id: Uuid,
+    item_id: Uuid,
+) -> Result<bool, PdmError> {
+    if get_item_sheet_metal(pool, org_id, item_id).await?.is_some() {
+        return Ok(false);
+    }
+    create_sheet_metal(
+        pool, org_id, item_id, None, None, None, None, None, None, None, None, None,
+    )
+    .await?;
+    Ok(true)
+}
+
+/// The item's most recent sheet-metal spec, if it has one.
+pub async fn get_item_sheet_metal(
+    pool: &PgPool,
+    org_id: Uuid,
+    item_id: Uuid,
+) -> Result<Option<SheetMetalSpec>, PdmError> {
+    sqlx::query_as::<_, SheetMetalSpec>(
+        "SELECT * FROM sheet_metal_specs
+         WHERE org_id = $1 AND item_id = $2
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(org_id)
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+/// Set (or create) the item's sheet-metal spec. Updates the most recent
+/// existing row when one is present; otherwise inserts a new row.
+pub async fn upsert_item_sheet_metal(
+    pool: &PgPool,
+    org_id: Uuid,
+    item_id: Uuid,
+    material: Option<&str>,
+    thickness_mm: Option<f64>,
+    bend_radius_mm: Option<f64>,
+    k_factor: Option<f64>,
+) -> Result<SheetMetalSpec, PdmError> {
+    match get_item_sheet_metal(pool, org_id, item_id).await? {
+        Some(s) => sqlx::query_as::<_, SheetMetalSpec>(
+            "UPDATE sheet_metal_specs
+                 SET material = $3, thickness_mm = $4, bend_radius_mm = $5, k_factor = $6,
+                     updated_at = now()
+                 WHERE id = $1 RETURNING *",
+        )
+        .bind(s.id)
+        .bind(org_id)
+        .bind(material)
+        .bind(thickness_mm)
+        .bind(bend_radius_mm)
+        .bind(k_factor)
+        .fetch_one(pool)
+        .await
+        .map_err(PdmError::Db),
+        None => sqlx::query_as::<_, SheetMetalSpec>(
+            "INSERT INTO sheet_metal_specs
+                    (org_id, item_id, material, thickness_mm, bend_radius_mm, k_factor)
+                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
+        )
+        .bind(org_id)
+        .bind(item_id)
+        .bind(material)
+        .bind(thickness_mm)
+        .bind(bend_radius_mm)
+        .bind(k_factor)
+        .fetch_one(pool)
+        .await
+        .map_err(PdmError::Db),
+    }
+}
+
+/// Record a flat-pattern DXF (content-addressed sha) on the item's
+/// sheet-metal spec, creating the spec row when missing.
+pub async fn set_item_flat_pattern(
+    pool: &PgPool,
+    org_id: Uuid,
+    item_id: Uuid,
+    flat_pattern_sha: &str,
+) -> Result<SheetMetalSpec, PdmError> {
+    match get_item_sheet_metal(pool, org_id, item_id).await? {
+        Some(s) => sqlx::query_as::<_, SheetMetalSpec>(
+            "UPDATE sheet_metal_specs SET flat_pattern_sha = $3, updated_at = now()
+                 WHERE id = $1 RETURNING *",
+        )
+        .bind(s.id)
+        .bind(org_id)
+        .bind(flat_pattern_sha)
+        .fetch_one(pool)
+        .await
+        .map_err(PdmError::Db),
+        None => sqlx::query_as::<_, SheetMetalSpec>(
+            "INSERT INTO sheet_metal_specs (org_id, item_id, flat_pattern_sha)
+                 VALUES ($1, $2, $3) RETURNING *",
+        )
+        .bind(org_id)
+        .bind(item_id)
+        .bind(flat_pattern_sha)
+        .fetch_one(pool)
+        .await
+        .map_err(PdmError::Db),
+    }
+}
+
+/// Clear the flat pattern from the item's sheet-metal spec.
+pub async fn clear_item_flat_pattern(
+    pool: &PgPool,
+    org_id: Uuid,
+    item_id: Uuid,
+) -> Result<Option<SheetMetalSpec>, PdmError> {
+    match get_item_sheet_metal(pool, org_id, item_id).await? {
+        Some(s) => {
+            let updated = sqlx::query_as::<_, SheetMetalSpec>(
+                "UPDATE sheet_metal_specs SET flat_pattern_sha = NULL, updated_at = now()
+                 WHERE id = $1 RETURNING *",
+            )
+            .bind(s.id)
+            .bind(org_id)
+            .fetch_one(pool)
+            .await
+            .map_err(PdmError::Db)?;
+            Ok(Some(updated))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Resolve several items' flat patterns at once: for each item in order,
+/// its part number, revision label, and the flat-pattern blob (if present).
+#[derive(Debug, sqlx::FromRow)]
+pub struct FlatPatternEntry {
+    pub item_id: Uuid,
+    pub part_number: String,
+    pub revision: Option<String>,
+    pub flat_pattern_sha: Option<String>,
+    pub flat_pattern_size: Option<i64>,
+}
+
+pub async fn list_flat_patterns(
+    pool: &PgPool,
+    org_id: Uuid,
+    item_ids: &[Uuid],
+) -> Result<Vec<FlatPatternEntry>, PdmError> {
+    if item_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders: Vec<String> = item_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("${}", i + 1))
+        .collect();
+    let org_param = item_ids.len() + 1;
+    let spec_sha_sql = format!(
+        "(SELECT sm.flat_pattern_sha FROM sheet_metal_specs sm
+          WHERE sm.item_id = i.id AND sm.org_id = ${org_param}
+          ORDER BY sm.created_at DESC LIMIT 1)"
+    );
+    let sql = format!(
+        "SELECT i.id AS item_id, i.part_number,
+                (SELECT MAX(fr.label) FROM file_revisions fr WHERE fr.item_id = i.id) AS revision,
+                {spec_sha_sql} AS flat_pattern_sha,
+                (SELECT fb.size_bytes FROM file_blobs fb
+                 WHERE fb.org_id = ${org_param} AND fb.sha256 = {spec_sha_sql}) AS flat_pattern_size
+         FROM items i
+         WHERE i.org_id = ${org_param} AND i.id IN ({placeholders})",
+        placeholders = placeholders.join(", ")
+    );
+    let mut q = sqlx::query_as::<_, FlatPatternEntry>(&sql);
+    for id in item_ids {
+        q = q.bind(*id);
+    }
+    q = q.bind(org_id).bind(org_id);
+    q.fetch_all(pool).await.map_err(PdmError::Db)
+}
+
+// ── Laser nesting (Sparrow integration) ─────────────────────────────────
+
+/// Inputs for creating a nesting run (the settings snapshot).
+#[derive(Debug, Clone)]
+pub struct LaserNestParams {
+    pub name: String,
+    pub project_id: Option<Uuid>,
+    pub machine_id: Option<Uuid>,
+    pub material: Option<String>,
+    pub thickness_mm: Option<f64>,
+    pub stock_width_mm: f64,
+    pub stock_height_mm: f64,
+    pub edge_margin_mm: f64,
+    pub part_gap_mm: f64,
+    pub spacing_x_mm: f64,
+    pub spacing_y_mm: f64,
+    pub grain_direction: String,
+    pub chord_tol_mm: f64,
+    pub join_tol_mm: f64,
+    pub default_part_unit: String,
+    pub allowed_rotations: Vec<f64>,
+    pub time_budget_sec: i32,
+    pub attempt_limit_sec: i32,
+    pub max_sheets: i32,
+    pub seed: Option<i64>,
+    pub solver_version: Option<String>,
+    pub engine_build: Option<String>,
+    pub created_by: Option<Uuid>,
+    pub parent_nest_id: Option<Uuid>,
+}
+
+/// A source part for a nesting run (exact version + flat-pattern snapshot).
+#[derive(Debug, Clone)]
+pub struct LaserNestPartInput {
+    pub item_id: Uuid,
+    pub file_version_id: Uuid,
+    pub artifact_id: Option<Uuid>,
+    pub dxf_sha: String,
+    pub dxf_size: i64,
+    pub part_number: String,
+    pub revision_label: Option<String>,
+    pub quantity: i32,
+    pub layer_cut: String,
+    pub layers_mark: Vec<String>,
+    pub unit: String,
+    pub mirror: bool,
+    pub allow_mirror: bool,
+    pub part_grain: String,
+    pub ordinal: i32,
+}
+
+/// Create a nesting run: the nest row, its part snapshots, and the queued
+/// `laser.nest` job — atomically. Returns the nest and the job.
+pub async fn create_laser_nest_run(
+    pool: &PgPool,
+    org_id: Uuid,
+    params: &LaserNestParams,
+    parts: &[LaserNestPartInput],
+) -> Result<(pdm_core::LaserNest, pdm_core::Job), PdmError> {
+    if parts.is_empty() {
+        return Err(PdmError::Validation(
+            "a nest needs at least one part".into(),
+        ));
+    }
+    let mut tx = pool.begin().await.map_err(PdmError::Db)?;
+
+    let nest: pdm_core::LaserNest = sqlx::query_as(
+        r#"INSERT INTO laser_nests (
+              org_id, project_id, name, machine_id, material, thickness_mm,
+              stock_width_mm, stock_height_mm, edge_margin_mm, part_gap_mm,
+              spacing_x_mm, spacing_y_mm, grain_direction,
+              chord_tol_mm, join_tol_mm, default_part_unit, allowed_rotations,
+              time_budget_sec, attempt_limit_sec, max_sheets, seed,
+              solver_version, engine_build, created_by, parent_nest_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+           RETURNING *"#,
+    )
+    .bind(org_id)
+    .bind(params.project_id)
+    .bind(&params.name)
+    .bind(params.machine_id)
+    .bind(&params.material)
+    .bind(params.thickness_mm)
+    .bind(params.stock_width_mm)
+    .bind(params.stock_height_mm)
+    .bind(params.edge_margin_mm)
+    .bind(params.part_gap_mm)
+    .bind(params.spacing_x_mm)
+    .bind(params.spacing_y_mm)
+    .bind(&params.grain_direction)
+    .bind(params.chord_tol_mm)
+    .bind(params.join_tol_mm)
+    .bind(&params.default_part_unit)
+    .bind(serde_json::json!(params.allowed_rotations))
+    .bind(params.time_budget_sec)
+    .bind(params.attempt_limit_sec)
+    .bind(params.max_sheets)
+    .bind(params.seed)
+    .bind(&params.solver_version)
+    .bind(&params.engine_build)
+    .bind(params.created_by)
+    .bind(params.parent_nest_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?;
+
+    for p in parts {
+        sqlx::query(
+            r#"INSERT INTO laser_nest_parts (
+                 nest_id, org_id, item_id, file_version_id, artifact_id,
+                 dxf_sha, dxf_size, part_number, revision_label, quantity,
+                 layer_cut, layers_mark, unit, mirror, allow_mirror, part_grain, ordinal)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)"#,
+        )
+        .bind(nest.id)
+        .bind(org_id)
+        .bind(p.item_id)
+        .bind(p.file_version_id)
+        .bind(p.artifact_id)
+        .bind(&p.dxf_sha)
+        .bind(p.dxf_size)
+        .bind(&p.part_number)
+        .bind(&p.revision_label)
+        .bind(p.quantity)
+        .bind(&p.layer_cut)
+        .bind(serde_json::json!(p.layers_mark))
+        .bind(&p.unit)
+        .bind(p.mirror)
+        .bind(p.allow_mirror)
+        .bind(&p.part_grain)
+        .bind(p.ordinal)
+        .execute(&mut *tx)
+        .await
+        .map_err(PdmError::Db)?;
+    }
+
+    let payload = serde_json::json!({ "nest_id": nest.id });
+    let job: pdm_core::Job = sqlx::query_as(
+        "INSERT INTO jobs (org_id, kind, payload) VALUES ($1, 'laser.nest', $2)
+         RETURNING id, org_id, kind, payload, status, attempts, max_attempts, last_error, created_at",
+    )
+    .bind(org_id)
+    .bind(&payload)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?;
+
+    sqlx::query("UPDATE laser_nests SET job_id = $2 WHERE id = $1")
+        .bind(nest.id)
+        .bind(job.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(PdmError::Db)?;
+
+    tx.commit().await.map_err(PdmError::Db)?;
+    let mut nest = nest;
+    nest.job_id = Some(job.id);
+    Ok((nest, job))
+}
+
+pub async fn get_laser_nest(
+    pool: &PgPool,
+    id: Uuid,
+    org_id: Uuid,
+) -> Result<Option<pdm_core::LaserNest>, PdmError> {
+    sqlx::query_as::<_, pdm_core::LaserNest>(
+        "SELECT * FROM laser_nests WHERE id = $1 AND org_id = $2",
+    )
+    .bind(id)
+    .bind(org_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+pub async fn list_laser_nests(
+    pool: &PgPool,
+    org_id: Uuid,
+    project_id: Option<Uuid>,
+    limit: i32,
+) -> Result<Vec<pdm_core::LaserNest>, PdmError> {
+    let sql = format!(
+        "SELECT * FROM laser_nests WHERE org_id = $1 {} ORDER BY created_at DESC LIMIT ${}",
+        if project_id.is_some() {
+            "AND project_id = $2"
+        } else {
+            ""
+        },
+        if project_id.is_some() { 3 } else { 2 }
+    );
+    let mut q = sqlx::query_as::<_, pdm_core::LaserNest>(&sql).bind(org_id);
+    if let Some(p) = project_id {
+        q = q.bind(p);
+    }
+    q = q.bind(limit);
+    q.fetch_all(pool).await.map_err(PdmError::Db)
+}
+
+/// Transition a nest's status. `completed` sets completed_at. Idempotent-safe:
+/// a terminal nest (completed/cancelled) is not overwritten by running/queued.
+pub async fn set_laser_nest_status(
+    pool: &PgPool,
+    org_id: Uuid,
+    id: Uuid,
+    status: &str,
+    error: Option<&str>,
+) -> Result<Option<pdm_core::LaserNest>, PdmError> {
+    let terminal = matches!(status, "completed" | "failed" | "cancelled");
+    // Never overwrite a user-cancelled nest; a terminal target may settle a
+    // queued/running/failed nest, a non-terminal one may only advance it.
+    sqlx::query_as::<_, pdm_core::LaserNest>(
+        r#"UPDATE laser_nests SET
+             status = $3,
+             error = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE error END,
+             completed_at = CASE WHEN $3 IN ('completed','failed') THEN now() ELSE completed_at END
+          WHERE org_id = $1 AND id = $2
+            AND status <> 'cancelled'
+            AND ($5 OR status NOT IN ('completed','failed'))
+          RETURNING *"#,
+    )
+    .bind(org_id)
+    .bind(id)
+    .bind(status)
+    .bind(error)
+    .bind(terminal)
+    .fetch_optional(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+/// Mark nests that reference a given CAD version as stale (a newer revision or
+/// a replaced flat pattern invalidates the result, but does not rewrite it).
+pub async fn mark_laser_nests_stale_for_version(
+    pool: &PgPool,
+    org_id: Uuid,
+    version_id: Uuid,
+    reason: &str,
+) -> Result<u64, PdmError> {
+    let res = sqlx::query(
+        r#"UPDATE laser_nests SET stale = TRUE, stale_reason = $3
+          WHERE org_id = $1 AND status NOT IN ('cancelled')
+            AND id IN (
+               SELECT nest_id FROM laser_nest_parts
+               WHERE org_id = $1 AND file_version_id = $2
+            )"#,
+    )
+    .bind(org_id)
+    .bind(version_id)
+    .bind(reason)
+    .execute(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    Ok(res.rows_affected())
+}
+
+pub async fn list_laser_nest_parts(
+    pool: &PgPool,
+    nest_id: Uuid,
+    org_id: Uuid,
+) -> Result<Vec<pdm_core::LaserNestPart>, PdmError> {
+    sqlx::query_as::<_, pdm_core::LaserNestPart>(
+        "SELECT * FROM laser_nest_parts WHERE nest_id = $1 AND org_id = $2
+         ORDER BY ordinal, item_id",
+    )
+    .bind(nest_id)
+    .bind(org_id)
+    .fetch_all(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+pub async fn list_laser_nest_sheets(
+    pool: &PgPool,
+    nest_id: Uuid,
+    org_id: Uuid,
+) -> Result<Vec<pdm_core::LaserNestSheet>, PdmError> {
+    sqlx::query_as::<_, pdm_core::LaserNestSheet>(
+        "SELECT * FROM laser_nest_sheets WHERE nest_id = $1 AND org_id = $2 ORDER BY sheet_index",
+    )
+    .bind(nest_id)
+    .bind(org_id)
+    .fetch_all(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+pub async fn get_laser_nest_sheet(
+    pool: &PgPool,
+    nest_id: Uuid,
+    org_id: Uuid,
+    sheet_index: i32,
+) -> Result<Option<pdm_core::LaserNestSheet>, PdmError> {
+    sqlx::query_as::<_, pdm_core::LaserNestSheet>(
+        "SELECT * FROM laser_nest_sheets WHERE nest_id = $1 AND org_id = $2 AND sheet_index = $3",
+    )
+    .bind(nest_id)
+    .bind(org_id)
+    .bind(sheet_index)
+    .fetch_optional(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+pub async fn list_laser_nest_placements(
+    pool: &PgPool,
+    nest_id: Uuid,
+    org_id: Uuid,
+) -> Result<Vec<pdm_core::LaserNestPlacement>, PdmError> {
+    sqlx::query_as::<_, pdm_core::LaserNestPlacement>(
+        r#"SELECT pl.* FROM laser_nest_placements pl
+           JOIN laser_nest_sheets sh ON sh.id = pl.sheet_id
+           WHERE pl.nest_id = $1 AND pl.org_id = $2
+           ORDER BY sh.sheet_index, pl.part_index, pl.copy_index"#,
+    )
+    .bind(nest_id)
+    .bind(org_id)
+    .fetch_all(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+/// The full nest detail (nest + parts + sheets + placements).
+pub async fn get_laser_nest_detail(
+    pool: &PgPool,
+    nest_id: Uuid,
+    org_id: Uuid,
+) -> Result<Option<pdm_core::LaserNestDetail>, PdmError> {
+    let nest = match get_laser_nest(pool, nest_id, org_id).await? {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    let parts = list_laser_nest_parts(pool, nest_id, org_id).await?;
+    let sheets = list_laser_nest_sheets(pool, nest_id, org_id).await?;
+    let placements = list_laser_nest_placements(pool, nest_id, org_id).await?;
+    Ok(Some(pdm_core::LaserNestDetail {
+        nest,
+        parts,
+        sheets,
+        placements,
+    }))
+}
+
+// Sheet outputs (written by the worker after a validated solve).
+
+pub async fn create_laser_nest_sheet(
+    pool: &PgPool,
+    org_id: Uuid,
+    nest_id: Uuid,
+    sheet_index: i32,
+) -> Result<pdm_core::LaserNestSheet, PdmError> {
+    sqlx::query_as::<_, pdm_core::LaserNestSheet>(
+        r#"INSERT INTO laser_nest_sheets (nest_id, org_id, sheet_index)
+           VALUES ($1,$2,$3) RETURNING *"#,
+    )
+    .bind(nest_id)
+    .bind(org_id)
+    .bind(sheet_index)
+    .fetch_one(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn set_laser_nest_sheet_output(
+    pool: &PgPool,
+    org_id: Uuid,
+    sheet_id: Uuid,
+    dxf_sha: &str,
+    dxf_size: i64,
+    preview_sha: Option<&str>,
+    strip_width_mm: Option<f64>,
+    utilization: Option<f64>,
+    solver_input_sha: Option<&str>,
+    solver_output_sha: Option<&str>,
+    placed_count: i32,
+) -> Result<(), PdmError> {
+    sqlx::query(
+        r#"UPDATE laser_nest_sheets SET
+             dxf_sha = $3, dxf_size = $4, preview_sha = $5,
+             strip_width_mm = $6, utilization = $7,
+             solver_input_sha = $8, solver_output_sha = $9, placed_count = $10
+          WHERE org_id = $1 AND id = $2"#,
+    )
+    .bind(org_id)
+    .bind(sheet_id)
+    .bind(dxf_sha)
+    .bind(dxf_size)
+    .bind(preview_sha)
+    .bind(strip_width_mm)
+    .bind(utilization)
+    .bind(solver_input_sha)
+    .bind(solver_output_sha)
+    .bind(placed_count)
+    .execute(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_laser_nest_placement(
+    pool: &PgPool,
+    org_id: Uuid,
+    sheet_id: Uuid,
+    nest_id: Uuid,
+    part_index: i32,
+    copy_index: i32,
+    item_id: Uuid,
+    file_version_id: Uuid,
+    reflected: bool,
+    rotation_deg: f64,
+    tx: f64,
+    ty: f64,
+) -> Result<(), PdmError> {
+    sqlx::query(
+        r#"INSERT INTO laser_nest_placements
+             (sheet_id, nest_id, org_id, part_index, copy_index,
+              item_id, file_version_id, reflected, rotation_deg, tx, ty)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)"#,
+    )
+    .bind(sheet_id)
+    .bind(nest_id)
+    .bind(org_id)
+    .bind(part_index)
+    .bind(copy_index)
+    .bind(item_id)
+    .bind(file_version_id)
+    .bind(reflected)
+    .bind(rotation_deg)
+    .bind(tx)
+    .bind(ty)
+    .execute(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    Ok(())
+}
+
+// Revision-bound flat-pattern artifacts.
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_flat_pattern_artifact(
+    pool: &PgPool,
+    org_id: Uuid,
+    item_id: Uuid,
+    file_version_id: Uuid,
+    sha256: &str,
+    size_bytes: i64,
+    source_kind: &str,
+    generator: &str,
+    unit: &str,
+    notes: &str,
+) -> Result<pdm_core::FlatPatternArtifact, PdmError> {
+    sqlx::query_as::<_, pdm_core::FlatPatternArtifact>(
+        r#"INSERT INTO flat_pattern_artifacts
+             (org_id, item_id, file_version_id, sha256, size_bytes,
+              source_kind, generator, unit, notes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *"#,
+    )
+    .bind(org_id)
+    .bind(item_id)
+    .bind(file_version_id)
+    .bind(sha256)
+    .bind(size_bytes)
+    .bind(source_kind)
+    .bind(generator)
+    .bind(unit)
+    .bind(notes)
+    .fetch_one(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+pub async fn get_flat_pattern_artifact(
+    pool: &PgPool,
+    id: Uuid,
+    org_id: Uuid,
+) -> Result<Option<pdm_core::FlatPatternArtifact>, PdmError> {
+    sqlx::query_as::<_, pdm_core::FlatPatternArtifact>(
+        "SELECT * FROM flat_pattern_artifacts WHERE id = $1 AND org_id = $2",
+    )
+    .bind(id)
+    .bind(org_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+/// The newest artifact for an item's exact version (for nest part resolution).
+pub async fn latest_flat_pattern_artifact(
+    pool: &PgPool,
+    org_id: Uuid,
+    item_id: Uuid,
+    file_version_id: Uuid,
+) -> Result<Option<pdm_core::FlatPatternArtifact>, PdmError> {
+    sqlx::query_as::<_, pdm_core::FlatPatternArtifact>(
+        r#"SELECT * FROM flat_pattern_artifacts
+           WHERE org_id = $1 AND item_id = $2 AND file_version_id = $3
+           ORDER BY created_at DESC LIMIT 1"#,
+    )
+    .bind(org_id)
+    .bind(item_id)
+    .bind(file_version_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+pub async fn list_flat_pattern_artifacts(
+    pool: &PgPool,
+    org_id: Uuid,
+    item_id: Uuid,
+) -> Result<Vec<pdm_core::FlatPatternArtifact>, PdmError> {
+    sqlx::query_as::<_, pdm_core::FlatPatternArtifact>(
+        "SELECT * FROM flat_pattern_artifacts WHERE org_id = $1 AND item_id = $2 ORDER BY created_at DESC",
+    )
+    .bind(org_id)
+    .bind(item_id)
+    .fetch_all(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
 // ── Sheet-metal standards library (MFG reference data) ──────────────────
 
 /// Idempotently seed an organization's sheet-metal standards library from the
@@ -3550,11 +4634,18 @@ mod tests {
             eprintln!("setup: upload_blob failed");
             return;
         };
-        let Some(version) =
-            create_version(&pool, file.id, blob.id, user.id, "thumb test", None, "")
-                .await
-                .ok()
-        else {
+        let Some(version) = create_version(
+            &pool,
+            file.id,
+            blob.id,
+            user.id,
+            "thumb test",
+            None,
+            "",
+            false,
+        )
+        .await
+        .ok() else {
             eprintln!("setup: create_version failed");
             return;
         };

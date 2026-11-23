@@ -178,6 +178,8 @@ th.sortable:hover { color:var(--fg); }
 .badge.img { color:var(--warn); border-color:var(--warn); }
 .badge.pdf { color:var(--err); border-color:var(--err); }
 .badge.dxf { color:var(--ok); border-color:var(--ok); }
+.badge.sm { color:var(--ok); border-color:var(--ok); }
+.smtype { color:var(--ok); }
 .rev { display:inline-block; padding:1px 6px; margin-left:6px; border:1px solid var(--acc);
   color:var(--acc); border-radius:4px; font:11px ui-monospace,monospace; vertical-align:middle; }
 .rev.wip { border-color:var(--line); color:var(--dim); }
@@ -539,3 +541,62 @@ table.dense th, html.dense table th { font-size:10.5px; }
 .stepper .s.queued, .stepper .s.scheduled { color:var(--warn); border-color:var(--warn); }
 .stepper .s.failed { color:var(--err); border-color:var(--err); }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.55} }
+
+/* ── Tool library editor ── */
+.tfield { margin-bottom:12px; }
+.tfield label { display:block; font-size:11px; text-transform:uppercase;
+  letter-spacing:.05em; color:var(--dim); margin-bottom:4px; }
+.tfield input, .tfield select, .tfield textarea { width:100%; }
+.tgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:0 14px; }
+.tsec { margin-top:14px; padding:14px; border:1px solid var(--line);
+  border-radius:8px; background:var(--panel); }
+.tsec h3 { font-size:12px; text-transform:uppercase; letter-spacing:.05em;
+  color:var(--dim); margin-bottom:10px; }
+
+/* ── Laser nests (Sparrow) ── */
+.ln-list { display:flex; flex-direction:column; gap:0; }
+.ln-row { padding:10px 12px; border-bottom:1px solid var(--line); cursor:pointer; }
+.ln-row:hover { background:var(--hover); }
+.ln-row:last-child { border-bottom:none; }
+.ln-top { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:13px; }
+.ln-status { font:600 10px ui-monospace,monospace; letter-spacing:.03em; padding:1px 6px;
+  border:1px solid var(--line); border-radius:4px; text-transform:uppercase; }
+.ln-status.ok { color:var(--ok); border-color:var(--ok); }
+.ln-status.run { color:var(--acc); border-color:var(--acc); }
+.ln-status.err { color:var(--err); border-color:var(--err); }
+.ln-status.dim { color:var(--dim); }
+.ln-err { margin-top:4px; font-size:12px; }
+.ln-detail { margin-top:8px; }
+.ln-meta { font-size:12px; margin-bottom:8px; }
+.ln-partlines { font-size:12px; margin:-4px 0 8px; display:flex; flex-direction:column; gap:2px; }
+.ln-partline { display:flex; align-items:center; gap:4px; }
+.ln-sheets { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:10px; }
+.ln-sheet { border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--bg); }
+.ln-preview { width:100%; height:160px; object-fit:contain; background:#f6f8fb; display:block; }
+.ln-sheetmeta { font-size:12px; padding:6px 8px; color:var(--dim);
+  display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+.ln-sheetmeta .badge { margin-left:0; }
+.ln-sheet button { margin:0 8px 8px 0; }
+.ln-actions { margin-top:10px; display:flex; gap:8px; }
+
+/* Laser nest create panel */
+.nc { padding:14px 16px; }
+.nc-sec { margin:6px 0 10px; font-size:13px; text-transform:uppercase;
+  letter-spacing:.04em; color:var(--dim); }
+.nc-parts-title { margin-top:18px; }
+.nc-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr));
+  gap:10px 14px; margin-bottom:8px; }
+.nc-grid label { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--dim); }
+.nc-grid input, .nc-grid select { font-size:13px; }
+.nc-line { display:grid; grid-template-columns:minmax(160px,1.4fr) 64px 130px 130px minmax(150px,1fr) 28px;
+  gap:8px; align-items:center; padding:6px 0; border-bottom:1px solid var(--line); }
+.nc-head { font-size:11px; text-transform:uppercase; letter-spacing:.03em;
+  color:var(--dim); border-bottom:1px solid var(--line); padding-bottom:6px; }
+.nc-line select, .nc-line input[type=number] { font-size:13px; }
+.nc-check { display:flex; align-items:center; gap:5px; font-size:12px; color:var(--dim);
+  white-space:nowrap; cursor:pointer; }
+.nc-check input { accent-color:var(--acc); }
+.nc-rm { border:1px solid var(--line); background:transparent; color:var(--dim);
+  border-radius:4px; width:24px; height:24px; line-height:1; cursor:pointer; }
+.nc-rm:hover { color:var(--err); border-color:var(--err); }
+.nc-foot { display:flex; align-items:center; gap:10px; margin-top:16px; }

@@ -1,0 +1,743 @@
+//! Building a nested sheet from a solver solution: compose transforms, validate
+//! the layout independently of the solver, render stock-space geometry, and
+//! export DXF.
+
+use crate::GrainDir;
+use crate::NestConfig;
+use crate::dxf;
+use crate::geom::{BBox, Point, Transform};
+use crate::part::Part;
+use crate::solver::{Placed, SolverSolution};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// A small numerical epsilon added to the chord allowance so exact-fit
+/// boundaries are not demanded of the solver.
+const SEPARATION_EPS: f64 = 0.05;
+
+/// Layout safety buffer (mm) added to the strip offset. The solver's
+/// edge-inset for `min_item_separation` is not a clean constant for
+/// rotated / concave shapes (a part can poke up to ~1 mm past the virtual
+/// strip edge), so this buffer guarantees the nominal parts still respect
+/// the requested stock margin.
+const LAYOUT_SAFETY: f64 = 1.0;
+
+/// The stock<->strip mapping derived from the config.
+///
+/// Part spacing is enforced directionally: the solver outline is the nominal
+/// tessellation dilated by the box with half-extents (gap_x/2, gap_y/2), and a
+/// small isotropic `separation` covers arc chord error on both sides of a
+/// boundary. The offset places the strip so nominal parts sit exactly
+/// `edge_margin` from the stock edges.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StockMapping {
+    /// Solver `min_item_separation` (isotropic epsilon: 2·chord_tol + eps).
+    pub separation: f64,
+    /// Strip<->stock translation offset.
+    pub offset: Point,
+    /// Solver `strip_height`.
+    pub strip_height: f64,
+    /// Required horizontal spacing between parts (nominal).
+    pub gap_x: f64,
+    /// Required vertical spacing between parts (nominal).
+    pub gap_y: f64,
+}
+
+impl StockMapping {
+    pub fn from_config(cfg: &NestConfig) -> Result<Self, SheetError> {
+        let margin = cfg.edge_margin;
+        let separation = 2.0 * cfg.chord_tol + SEPARATION_EPS;
+        // The collision box is symmetric (the larger half-extent on both axes)
+        // so it is invariant to the part's rotation: a 90°-turned part would
+        // otherwise swap its x/y clearance. This guarantees at least
+        // max(gap_x, gap_y) of separation between parts in both stock axes;
+        // the directional validation below then re-checks the per-axis values.
+        //
+        // Margin: the nominal tessellation sits `m` inside the dilated
+        // outline; the true part bulges up to `chord_tol` outside the
+        // tessellation; and the solver's rotated edge-inset can under-shoot by
+        // up to ~LAYOUT_SAFETY. offset = M - m + c + safety puts the true
+        // boundary at >= M for all shapes and rotations.
+        let m = cfg.gap_x.max(cfg.gap_y) / 2.0;
+        let inset = margin - m + cfg.chord_tol + LAYOUT_SAFETY;
+        let offset = Point::new(inset, inset);
+        let strip_height = cfg.stock_height - 2.0 * offset.y;
+        if strip_height <= 0.0 {
+            return Err(SheetError::Mapping("strip height non-positive".into()));
+        }
+        Ok(Self {
+            separation,
+            offset,
+            strip_height,
+            gap_x: cfg.gap_x,
+            gap_y: cfg.gap_y,
+        })
+    }
+
+    /// The conservative solver outline for a part: its nominal outer
+    /// tessellation dilated by the symmetric spacing box.
+    pub fn solver_outline(&self, part: &crate::part::Part) -> Vec<Point> {
+        let m = self.gap_x.max(self.gap_y) / 2.0;
+        crate::part::dilate_box(&part.outer.points, m, m)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum SheetError {
+    #[error("{0}")]
+    Mapping(String),
+    #[error("quantity mismatch for part {0}: placed {1}, expected {2}")]
+    QuantityMismatch(usize, usize, usize),
+    #[error("unknown solver item id {0}")]
+    UnknownItem(u64),
+    #[error("part {part} (copy {copy}) exceeds the stock margins in stock space")]
+    OutOfBounds { part: usize, copy: usize },
+    #[error("parts {a} and {b} are closer than the required gap")]
+    TooClose { a: usize, b: usize },
+    #[error("solver strip width {0} leaves a part past the right margin")]
+    StripTooWide(f64),
+}
+
+/// One placed copy on a sheet, in stock coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetPlacement {
+    /// Index into the part list.
+    pub part_index: usize,
+    /// Which copy of that part (0-based).
+    pub copy_index: usize,
+    /// The stable solver item id used in this sheet's instance.
+    pub item_id: u64,
+    /// Nominal part -> stock transform.
+    pub transform: Transform,
+}
+
+/// A validated nested sheet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetLayout {
+    pub placements: Vec<SheetPlacement>,
+    /// Achieved solver strip width (strip coords).
+    pub strip_width: f64,
+    /// Nominal material utilization: sum(part areas) / stock area.
+    pub utilization: f64,
+}
+
+/// A reference to one demanded copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyRef {
+    pub part: usize,
+    pub copy: usize,
+}
+
+/// Build and validate a sheet layout from a solver solution.
+///
+/// `copies` must be exactly the set of copies the solver was asked to place, and
+/// `item_id` assignment is `copied[0].part * 1000 + ...` — see
+/// [`assign_item_ids`].
+pub fn build_sheet(
+    solution: &SolverSolution,
+    item_ids: &[u64],
+    parts: &[Part],
+    cfg: &NestConfig,
+    mapping: &StockMapping,
+) -> Result<SheetLayout, SheetError> {
+    if solution.placed.len() != item_ids.len() {
+        return Err(SheetError::QuantityMismatch(
+            0,
+            solution.placed.len(),
+            item_ids.len(),
+        ));
+    }
+    let eps = 1e-3;
+    let mut placed: Vec<(usize, usize, Transform)> = Vec::new();
+    let mut seen = vec![0usize; item_ids.len()];
+    for p in &solution.placed {
+        let pos = item_ids
+            .iter()
+            .position(|&id| id == p.item_id)
+            .ok_or(SheetError::UnknownItem(p.item_id))?;
+        seen[pos] += 1;
+        let (part, copy) = decode_item_id(p.item_id);
+        if part >= parts.len() {
+            return Err(SheetError::UnknownItem(p.item_id));
+        }
+        let t = solver_to_stock(p, mapping.offset);
+        placed.push((part, copy, t));
+    }
+    for (i, &want) in item_ids.iter().enumerate() {
+        if seen[i] != 1 {
+            return Err(SheetError::QuantityMismatch(i, seen[i], 1));
+        }
+        let _ = want;
+    }
+
+    // Per-placement nominal outline in stock space, for bounds + spacing.
+    let outlines: Vec<Vec<Point>> = placed
+        .iter()
+        .map(|(part, _, t)| {
+            let base = &parts[*part].outer.points;
+            base.iter().map(|p| t.apply(*p)).collect()
+        })
+        .collect();
+
+    // Bounds check.
+    let (w, h) = (cfg.stock_width, cfg.stock_height);
+    let m = cfg.edge_margin;
+    for (i, ((part, copy, _), ol)) in placed.iter().zip(outlines.iter()).enumerate() {
+        if let Some(bb) = BBox::from_points(ol.iter().copied()) {
+            if bb.min_x < m - eps
+                || bb.min_y < m - eps
+                || bb.max_x > w - m + eps
+                || bb.max_y > h - m + eps
+            {
+                return Err(SheetError::OutOfBounds {
+                    part: *part,
+                    copy: *copy,
+                });
+            }
+        } else {
+            return Err(SheetError::OutOfBounds {
+                part: *part,
+                copy: *copy,
+            });
+        }
+        let _ = i;
+    }
+
+    // Minimum separation. The solver keeps the dilated outlines (nominal
+    // tessellation ⊕ symmetric box) >= `separation` apart, which implies the
+    // nominal tessellations are >= `separation` apart in Euclidean distance and
+    // >= max(gap_x,gap_y) + separation apart along any axis whose ranges
+    // overlap. Re-check the Euclidean floor directly — it is shape-independent,
+    // whereas a bounding-box check is too strict for concave parts that nest
+    // into each other's notches (small bbox gap, large real gap).
+    let boxes: Vec<BBox> = outlines
+        .iter()
+        .map(|o| BBox::from_points(o.iter().copied()).unwrap_or_default())
+        .collect();
+    for i in 0..outlines.len() {
+        for j in (i + 1)..outlines.len() {
+            let (bi, bj) = (&boxes[i], &boxes[j]);
+            // If separated by more than `separation` in either axis, the rings
+            // are too far apart to violate the floor — skip the O(n^2) check.
+            let x_gap = bi.min_x.max(bj.min_x) - bi.max_x.min(bj.max_x);
+            let y_gap = bi.min_y.max(bj.min_y) - bi.max_y.min(bj.max_y);
+            if x_gap > mapping.separation || y_gap > mapping.separation {
+                continue;
+            }
+            let d = min_ring_distance(&outlines[i], &outlines[j]);
+            if d < mapping.separation - 1e-3 {
+                return Err(SheetError::TooClose { a: i, b: j });
+            }
+        }
+    }
+
+    // Strip width sanity: the solver's used width plus the offset must leave the
+    // right margin.
+    if mapping.offset.x + solution.strip_width > w + eps {
+        return Err(SheetError::StripTooWide(solution.strip_width));
+    }
+
+    let utilization: f64 = placed
+        .iter()
+        .map(|(part, _, _)| parts[*part].area)
+        .sum::<f64>()
+        / (w * h);
+
+    Ok(SheetLayout {
+        placements: placed
+            .iter()
+            .enumerate()
+            .map(|(i, (part, copy, t))| SheetPlacement {
+                part_index: *part,
+                copy_index: *copy,
+                item_id: item_ids[i],
+                transform: *t,
+            })
+            .collect(),
+        strip_width: solution.strip_width,
+        utilization,
+    })
+}
+
+/// Map a solver placement into a stock-space transform.
+pub fn solver_to_stock(p: &Placed, offset: Point) -> Transform {
+    crate::solver::placed_transform(p, offset)
+}
+
+/// Assign a stable, decodable item id to each copy. Layout: high bytes = part
+/// index, low bytes = copy index. `part` fits in the upper 32 bits, `copy` in
+/// the lower 32 bits.
+pub fn assign_item_ids(copies: &[CopyRef]) -> Vec<u64> {
+    copies
+        .iter()
+        .map(|c| ((c.part as u64) << 32) | (c.copy as u64))
+        .collect()
+}
+
+pub fn decode_item_id(id: u64) -> (usize, usize) {
+    ((id >> 32) as usize, (id & 0xFFFF_FFFF) as usize)
+}
+
+/// Minimum distance between two closed rings (tessellated), in mm.
+fn min_ring_distance(a: &[Point], b: &[Point]) -> f64 {
+    let na = a.len();
+    let nb = b.len();
+    let mut best = f64::INFINITY;
+    for i in 0..na {
+        let p1 = a[i];
+        let p2 = a[(i + 1) % na];
+        for j in 0..nb {
+            let q1 = b[j];
+            let q2 = b[(j + 1) % nb];
+            best = best.min(seg_seg_dist(p1, p2, q1, q2));
+        }
+    }
+    best
+}
+
+/// Minimum distance between segments p1-p2 and q1-q2.
+fn seg_seg_dist(p1: Point, p2: Point, q1: Point, q2: Point) -> f64 {
+    // If the segments intersect, distance is 0. Otherwise min of the 4
+    // point-to-segment distances.
+    if segments_intersect(p1, p2, q1, q2) {
+        return 0.0;
+    }
+    [
+        point_seg_dist(p1, q1, q2),
+        point_seg_dist(p2, q1, q2),
+        point_seg_dist(q1, p1, p2),
+        point_seg_dist(q2, p1, p2),
+    ]
+    .into_iter()
+    .fold(f64::INFINITY, f64::min)
+}
+
+fn point_seg_dist(p: Point, a: Point, b: Point) -> f64 {
+    let abx = b.x - a.x;
+    let aby = b.y - a.y;
+    let len2 = abx * abx + aby * aby;
+    if len2 < 1e-18 {
+        return p.minus(a).len();
+    }
+    let t = ((p.x - a.x) * abx + (p.y - a.y) * aby) / len2;
+    let t = t.clamp(0.0, 1.0);
+    let proj = Point::new(a.x + t * abx, a.y + t * aby);
+    p.minus(proj).len()
+}
+
+fn segments_intersect(p1: Point, p2: Point, q1: Point, q2: Point) -> bool {
+    fn orient(a: Point, b: Point, c: Point) -> f64 {
+        (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+    }
+    let d1 = orient(q1, q2, p1);
+    let d2 = orient(q1, q2, p2);
+    let d3 = orient(p1, p2, q1);
+    let d4 = orient(p1, p2, q2);
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+}
+
+/// Render the stock-space primitives (outer + holes + marks) for a sheet.
+pub fn sheet_primitives(layout: &SheetLayout, parts: &[Part]) -> Vec<dxf::Primitive> {
+    let mut prims: Vec<dxf::Primitive> = Vec::new();
+    for pl in &layout.placements {
+        let part = &parts[pl.part_index];
+        for c in &part.outer.edges {
+            prims.push(transform_edge_to_primitive(
+                c,
+                &pl.transform,
+                &part.outer.layer,
+            ));
+        }
+        for hole in &part.holes {
+            for c in &hole.edges {
+                prims.push(transform_edge_to_primitive(c, &pl.transform, &hole.layer));
+            }
+        }
+        for mark in &part.marks {
+            for c in &mark.edges {
+                prims.push(transform_edge_to_primitive(c, &pl.transform, &mark.layer));
+            }
+        }
+    }
+    prims
+}
+
+fn transform_edge_to_primitive(
+    e: &crate::part::Edge,
+    t: &Transform,
+    layer: &str,
+) -> dxf::Primitive {
+    match e {
+        crate::part::Edge::Line { a, b } => {
+            let a2 = t.apply(*a);
+            let b2 = t.apply(*b);
+            dxf::Primitive::Line {
+                layer: layer.to_string(),
+                start: a2,
+                end: b2,
+            }
+        }
+        crate::part::Edge::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => {
+            // A full turn exports as a circle (its start/end coincide).
+            if full_turn(*start, *end) {
+                let c2 = t.apply(*center);
+                let p1 = t.apply(Point::new(center.x + radius, center.y));
+                let r = c2.minus(p1).len();
+                return dxf::Primitive::Circle {
+                    layer: layer.to_string(),
+                    center: c2,
+                    radius: r,
+                };
+            }
+            // Apply the transform to the center and two points on the arc to
+            // recover the transformed center/radius/angles.
+            let c2 = t.apply(*center);
+            let p0 = crate::part::edge_point_on_arc(*center, *radius, *start);
+            let p1 = crate::part::edge_point_on_arc(*center, *radius, *end);
+            let p02 = t.apply(p0);
+            let p12 = t.apply(p1);
+            let mid = crate::part::edge_point_on_arc(*center, *radius, (*start + *end) / 2.0);
+            let mid2 = t.apply(mid);
+            // Reconstruct the circle through the three transformed points.
+            match circle_from_three(c2, p02, p12) {
+                Some((cc, r)) => {
+                    let s = angle_of(cc, p02);
+                    let e2 = angle_of(cc, p12);
+                    let _ = mid2;
+                    // Determine sweep direction (CCW) via the mid point.
+                    let m_ang = angle_of(cc, mid2);
+                    let (s, e2, _) = orient_arc(s, e2, m_ang);
+                    dxf::Primitive::Arc {
+                        layer: layer.to_string(),
+                        center: cc,
+                        radius: r,
+                        start_deg: s,
+                        end_deg: e2,
+                    }
+                }
+                None => {
+                    // Degenerate (very small arc) -> treat as a polyline of the
+                    // arc's points.
+                    dxf::Primitive::Line {
+                        layer: layer.to_string(),
+                        start: p02,
+                        end: p12,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether an arc from `start` to `end` (CCW) is a full turn. The representation
+/// keeps `end - start` equal to the sweep, so a full turn reads as ~360.
+fn full_turn(start: f64, end: f64) -> bool {
+    end - start >= 360.0 - 1e-6
+}
+
+fn circle_from_three(a: Point, b: Point, c: Point) -> Option<(Point, f64)> {
+    let d = 2.0 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    let a2 = a.x * a.x + a.y * a.y;
+    let b2 = b.x * b.x + b.y * b.y;
+    let c2 = c.x * c.x + c.y * c.y;
+    let ux = (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d;
+    let uy = (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d;
+    let center = Point::new(ux, uy);
+    let r = center.minus(a).len();
+    Some((center, r))
+}
+
+fn angle_of(center: Point, p: Point) -> f64 {
+    (p.y - center.y)
+        .atan2(p.x - center.x)
+        .to_degrees()
+        .rem_euclid(360.0)
+}
+
+/// Given start, end, and a mid angle (all CCW from start), normalize to a
+/// counter-clockwise (start, end) pair with the mid lying on the sweep.
+fn orient_arc(start: f64, end: f64, mid: f64) -> (f64, f64, bool) {
+    let norm = |a: f64| a.rem_euclid(360.0);
+    let s = norm(start);
+    let e = norm(end);
+    let m = norm(mid);
+    // The CCW sweep from s to e is (e - s) mod 360 (0 -> 360 treated as full).
+    let sweep = if e >= s { e - s } else { e - s + 360.0 };
+    // mid should be within (s, s+sweep).
+    let rel = norm(m - s);
+    if sweep <= 1e-9 {
+        return (s, s + 360.0, true);
+    }
+    if rel <= sweep + 1e-6 {
+        (s, s + sweep, true)
+    } else {
+        // mid is on the other side: the arc actually goes the long way.
+        (s, s + (360.0 - sweep), false)
+    }
+}
+
+/// Render the full sheet as a DXF string (mm, $INSUNITS=4) with a stock outline.
+pub fn export_sheet_dxf(layout: &SheetLayout, parts: &[Part], cfg: &NestConfig) -> String {
+    let prims = sheet_primitives(layout, parts);
+    dxf::write(&prims, Some((cfg.stock_width, cfg.stock_height)), "STOCK")
+}
+
+/// Render the sheet as a preview SVG: stock outline, nominal outer contours,
+/// holes (dashed), and a per-copy label. Labels and the stock border are drawn
+/// as overlays (not cutting geometry).
+pub fn export_sheet_svg(layout: &SheetLayout, parts: &[Part], cfg: &NestConfig) -> String {
+    let w = cfg.stock_width;
+    let h = cfg.stock_height;
+    let pad = 8.0;
+    let neg_pad = -pad;
+    let sw = w + 2.0 * pad;
+    let sh = h + 2.0 * pad;
+    let mut s = String::new();
+    s.push_str(&format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:.0}\" height=\"{h:.0}\" \
+         viewBox=\"{neg_pad:.0} {neg_pad:.0} {sw:.0} {sh:.0}\">\n"
+    ));
+    // Stock border.
+    s.push_str(&format!(
+        "<rect x=\"0\" y=\"0\" width=\"{w:.1}\" height=\"{h:.1}\" fill=\"#fafafa\" stroke=\"#999\" stroke-width=\"1\"/>\n"
+    ));
+    // Grain direction indicator (top-left corner, low emphasis).
+    match cfg.sheet_grain {
+        GrainDir::AlongLength => {
+            s.push_str(
+                "<g opacity=\"0.5\"><line x1=\"10\" y1=\"10\" x2=\"10\" y2=\"54\" stroke=\"#6a5\" stroke-width=\"1.5\"/>
+                 <polygon points=\"10,58 7,50 13,50\" fill=\"#6a5\"/>
+                 <polygon points=\"10,6 7,14 13,14\" fill=\"#6a5\"/>
+                 <text x=\"16\" y=\"36\" font-size=\"9\" fill=\"#6a5\">GRAIN (length)</text></g>\n",
+            );
+        }
+        GrainDir::AlongWidth => {
+            s.push_str(
+                "<g opacity=\"0.5\"><line x1=\"10\" y1=\"10\" x2=\"54\" y2=\"10\" stroke=\"#6a5\" stroke-width=\"1.5\"/>
+                 <polygon points=\"58,10 50,7 50,13\" fill=\"#6a5\"/>
+                 <polygon points=\"6,10 14,7 14,13\" fill=\"#6a5\"/>
+                 <text x=\"16\" y=\"24\" font-size=\"9\" fill=\"#6a5\">GRAIN (width)</text></g>\n",
+            );
+        }
+        GrainDir::Any => {}
+    }
+    for pl in &layout.placements {
+        let part = &parts[pl.part_index];
+        // Outer contour.
+        let outer: String = part
+            .outer
+            .points
+            .iter()
+            .map(|p| {
+                let t = pl.transform.apply(*p);
+                format!("{:.2},{:.2}", t.x, t.y)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        s.push_str(&format!(
+            "<polygon points=\"{}\" fill=\"rgba(40,120,200,0.15)\" stroke=\"#1f6feb\" stroke-width=\"1.2\"/>\n",
+            outer
+        ));
+        // Holes.
+        for hole in &part.holes {
+            let pts: String = hole
+                .points
+                .iter()
+                .map(|p| {
+                    let t = pl.transform.apply(*p);
+                    format!("{:.2},{:.2}", t.x, t.y)
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            s.push_str(&format!(
+                "<polygon points=\"{}\" fill=\"rgba(255,255,255,0.9)\" stroke=\"#1f6feb\" stroke-width=\"0.8\" stroke-dasharray=\"3,2\"/>\n",
+                pts
+            ));
+        }
+        // Label at the part centroid.
+        let c = pl
+            .transform
+            .apply(crate::geom::centroid(&part.outer.points));
+        s.push_str(&format!(
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" fill=\"#333\" text-anchor=\"middle\">{}</text>\n",
+            c.x,
+            c.y,
+            label_for(pl)
+        ));
+    }
+    s.push_str("</svg>\n");
+    s
+}
+
+fn label_for(pl: &SheetPlacement) -> String {
+    format!("P{}-C{}", pl.part_index + 1, pl.copy_index + 1)
+}
+
+/// Convenience: the part's nominal outer polygon in its local (untransformed)
+/// coordinates, for building solver instances.
+pub fn part_outline(part: &Part) -> &[Point] {
+    &part.outer.points
+}
+
+/// Total nominal demand area across all copies (for utilization reporting).
+pub fn demand_area(parts: &[Part], copies: &[CopyRef]) -> f64 {
+    copies.iter().map(|c| parts[c.part].area).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dxf::Primitive as P;
+    use crate::part::assemble;
+
+    fn square_part() -> Part {
+        let prim = P::Polyline {
+            layer: "cut".into(),
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(10.0, 10.0),
+                Point::new(0.0, 10.0),
+            ],
+            bulges: vec![None; 4],
+            closed: true,
+        };
+        assemble(&[prim], &["cut".to_string()], &[], 0.05, 0.01)
+            .unwrap()
+            .parts
+            .pop()
+            .unwrap()
+    }
+
+    #[test]
+    fn item_id_roundtrip() {
+        let id = ((7u64) << 32) | 3u64;
+        let (p, c) = decode_item_id(id);
+        assert_eq!(p, 7);
+        assert_eq!(c, 3);
+    }
+
+    #[test]
+    fn mapping_derivation() {
+        let cfg = NestConfig {
+            stock_width: 200.0,
+            stock_height: 100.0,
+            edge_margin: 10.0,
+            gap_x: 5.0,
+            gap_y: 5.0,
+            chord_tol: 0.05,
+            ..Default::default()
+        };
+        let m = StockMapping::from_config(&cfg).unwrap();
+        // S = 2*chord_tol + 0.05 = 0.15; inset = M - gap_max/2 + c + safety
+        // = 10 - 2.5 + 0.05 + 1.0 = 8.55.
+        assert!((m.separation - 0.15).abs() < 1e-9);
+        assert!((m.offset.x - 8.55).abs() < 1e-9);
+        assert!((m.offset.y - 8.55).abs() < 1e-9);
+        assert!((m.strip_height - (100.0 - 2.0 * 8.55)).abs() < 1e-9);
+    }
+
+    fn bounds_cfg() -> (NestConfig, StockMapping) {
+        let cfg = NestConfig {
+            stock_width: 100.0,
+            stock_height: 100.0,
+            edge_margin: 10.0,
+            gap_x: 5.0,
+            gap_y: 5.0,
+            chord_tol: 0.05,
+            ..Default::default()
+        };
+        let mapping = StockMapping::from_config(&cfg).unwrap();
+        (cfg, mapping)
+    }
+
+    #[test]
+    fn build_sheet_accepts_separation_inset_placement() {
+        let part = square_part();
+        let parts = vec![part];
+        let (cfg, mapping) = bounds_cfg();
+        // A 10x10 part placed at strip (5.1, 5.1) lands at stock [13.65, 23.65]
+        // (offset 8.55), inside the 10 mm margins.
+        let solution = SolverSolution {
+            strip_width: 25.0,
+            placed: vec![Placed {
+                item_id: assign_item_ids(&[CopyRef { part: 0, copy: 0 }])[0],
+                reflected: false,
+                rotation_deg: 0.0,
+                translation: [5.1, 5.1],
+            }],
+        };
+        let ids = assign_item_ids(&[CopyRef { part: 0, copy: 0 }]);
+        let layout = build_sheet(&solution, &ids, &parts, &cfg, &mapping).unwrap();
+        assert_eq!(layout.placements.len(), 1);
+    }
+
+    #[test]
+    fn build_sheet_rejects_placement_at_strip_origin() {
+        let part = square_part();
+        let parts = vec![part];
+        let (cfg, mapping) = bounds_cfg();
+        // A placement at the strip origin (not inset) is closer to the stock edge
+        // than the mapping allows -> out of bounds.
+        let solution = SolverSolution {
+            strip_width: 25.0,
+            placed: vec![Placed {
+                item_id: assign_item_ids(&[CopyRef { part: 0, copy: 0 }])[0],
+                reflected: false,
+                rotation_deg: 0.0,
+                translation: [0.0, 0.0],
+            }],
+        };
+        let ids = assign_item_ids(&[CopyRef { part: 0, copy: 0 }]);
+        assert!(matches!(
+            build_sheet(&solution, &ids, &parts, &cfg, &mapping),
+            Err(SheetError::OutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn export_sheet_dxf_writes_mm() {
+        let part = square_part();
+        let parts = vec![part];
+        let cfg = NestConfig {
+            stock_width: 100.0,
+            stock_height: 100.0,
+            edge_margin: 10.0,
+            gap_x: 5.0,
+            gap_y: 5.0,
+            chord_tol: 0.05,
+            ..Default::default()
+        };
+        let mapping = StockMapping::from_config(&cfg).unwrap();
+        let ids = assign_item_ids(&[CopyRef { part: 0, copy: 0 }]);
+        let solution = SolverSolution {
+            strip_width: 30.0,
+            placed: vec![Placed {
+                item_id: ids[0],
+                reflected: false,
+                rotation_deg: 0.0,
+                translation: [10.0, 10.0],
+            }],
+        };
+        let layout = build_sheet(&solution, &ids, &parts, &cfg, &mapping).unwrap();
+        let dxf_text = export_sheet_dxf(&layout, &parts, &cfg);
+        let parsed = dxf::parse(&dxf_text).unwrap();
+        assert_eq!(parsed.units, dxf::Unit::Mm);
+        // stock + one part outline (4 edges) -> >= 5 primitives.
+        assert!(parsed.primitives.len() >= 5);
+    }
+}

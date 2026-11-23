@@ -11,6 +11,18 @@ jobs and sheet-metal specs (migration 0008, V.01-12), and the read-only G-code p
 **Remaining:** G-code read-only visualization (web-side, consumes the parser output),
 released-package immutability hardening.
 
+## Laser nesting (Sparrow)
+
+Flat patterns for sheet-metal parts are nested onto rectangular stock with the
+pinned [Sparrow](https://github.com/JeroenGar/sparrow) engine and exported as
+per-sheet DXF for the laser's CAM import. The nest pins exact CAD versions and
+flat-pattern blobs (immutability), runs as a `laser.nest` worker job, validates
+each sheet independently, and stores DXF + SVG preview + manifest. A source
+revision supersedure flags a nest stale without rewriting it. Full design, API,
+stock mapping, configuration, and the pinned engine are in
+[`laser-nesting.md`](laser-nesting.md); the verified engine I/O contract is in
+[`sparrow-compatibility.md`](sparrow-compatibility.md).
+
 ## The data chain
 ```
 Part → Revision → CAD Model → Manufacturing Setup → CAM Project → NC Program
