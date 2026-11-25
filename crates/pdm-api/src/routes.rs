@@ -1856,7 +1856,7 @@ pub async fn checkin(
     let org = require_org(&authed);
     let user = require_user(&authed)?.clone();
 
-    // 1. Verify lock is held by this user
+    // 1. Verify lock is held by this user (a quick refusal; checked again in step 4)
     let lock = pdm_db::get_lock(&state.pool, item_id)
         .await?
         .ok_or_else(|| AppError(PdmError::Conflict("no active checkout".into())))?;
@@ -1866,18 +1866,13 @@ pub async fn checkin(
         )));
     }
 
-    // 2. Verify base version. Ensure the file record exists (created on first check-in).
     let filename = body.filename.clone().unwrap_or_default();
     let mime = body
         .mime_type
         .clone()
         .unwrap_or_else(|| "application/octet-stream".to_string());
-    let file = pdm_db::ensure_file(&state.pool, item_id, &filename, &mime).await?;
-    let head = pdm_db::get_head_version(&state.pool, file.id).await?;
-    pdm_core::validate_checkin(body.base_version, head.as_ref().map(|v| v.seq))
-        .map_err(AppError)?;
 
-    // 3. Verify blob integrity
+    // 3. Verify blob integrity (the store, before the transaction)
     let blob = pdm_db::get_blob_by_sha(&state.pool, org, &body.sha256)
         .await?
         .ok_or_else(|| {
@@ -1893,7 +1888,8 @@ pub async fn checkin(
         })
     })?;
 
-    // 4. Create version
+    // 4. The lease check, the base check (step 2), the file record, the version and the lease
+    //    release (step 5), as one transaction: parallel check-ins of one item run one at a time.
     let commit_msg = body.commit_message.unwrap_or_default();
     let native_format = std::path::Path::new(&filename)
         .extension()
@@ -1901,17 +1897,21 @@ pub async fn checkin(
         .unwrap_or_default()
         .to_ascii_lowercase();
     let new_version = body.new_version.unwrap_or(false);
-    let version = pdm_db::create_version(
+    let checked_in = pdm_db::checkin_version(
         &state.pool,
-        file.id,
-        blob.id,
+        item_id,
         user.id,
+        &filename,
+        &mime,
+        body.base_version,
+        blob.id,
         &commit_msg,
-        head.as_ref().map(|v| v.id),
         &native_format,
         new_version,
     )
     .await?;
+    let version = checked_in.version;
+    let head = checked_in.previous_head;
 
     // 4b. Enqueue background analysis (measurements via `solvecraft-cli eval`) and
     //     thumbnail rendering (`solvecraft-cli snapshot`). The jobs are independent
@@ -1945,8 +1945,7 @@ pub async fn checkin(
         }
     }
 
-    // 5. Release lock
-    pdm_db::release_lock(&state.pool, item_id, user.id).await?;
+    // 5. (The lease was released in step 4's transaction.)
 
     // 6. Audit
     pdm_db::record_audit(
