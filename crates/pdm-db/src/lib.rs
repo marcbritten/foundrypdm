@@ -2442,6 +2442,36 @@ pub async fn list_comments(pool: &PgPool, item_id: Uuid) -> Result<Vec<ItemComme
 
 // ── Item updates (web workspace: edit metadata, move, reassign owner) ───
 
+/// The SET clauses of [`update_item`], numbered as it binds them: `$1` is the item and `$2` the
+/// organization, so the values start at `$3`. (They started at `$2`, so the first value was the
+/// organization's id: a move wrote it into `folder_id` and every change failed.)
+fn item_update_sets(
+    description: bool,
+    folder_id: Option<Option<Uuid>>,
+    owner_id: Option<Option<Uuid>>,
+) -> Vec<String> {
+    let mut sets: Vec<String> = vec!["updated_at = now()".to_string()];
+    let mut param = 3usize;
+    if description {
+        sets.push(format!("description = ${param}"));
+        param += 1;
+    }
+    match folder_id {
+        Some(Some(_)) => {
+            sets.push(format!("folder_id = ${param}"));
+            param += 1;
+        }
+        Some(None) => sets.push("folder_id = NULL".into()),
+        None => {}
+    }
+    match owner_id {
+        Some(Some(_)) => sets.push(format!("owner_id = ${param}")),
+        Some(None) => sets.push("owner_id = NULL".into()),
+        None => {}
+    }
+    sets
+}
+
 /// Update an item's mutable metadata. `None` fields are left unchanged;
 /// `Some(None)` clears an optional field (folder / owner).
 pub async fn update_item(
@@ -2452,32 +2482,39 @@ pub async fn update_item(
     folder_id: Option<Option<Uuid>>,
     owner_id: Option<Option<Uuid>>,
 ) -> Result<ItemSummary, PdmError> {
-    let mut sets: Vec<String> = vec!["updated_at = now()".to_string()];
-    let mut param = 2usize; // $1 is item_id, $2 is org_id
-    let mut bind_description: Option<String> = None;
-    let mut bind_folder: Option<Uuid> = None;
-    let mut bind_owner: Option<Uuid> = None;
-    if let Some(d) = description {
-        sets.push(format!("description = ${param}"));
-        bind_description = Some(d.to_string());
-        param += 1;
-    }
-    if let Some(f) = folder_id {
-        match f {
-            Some(fid) => {
-                sets.push(format!("folder_id = ${param}"));
-                bind_folder = Some(fid);
-                param += 1;
-            }
-            None => sets.push("folder_id = NULL".into()),
+    // A folder must be in the item's own project and an owner in its organization: the foreign
+    // keys alone accept any organization's.
+    if let Some(Some(fid)) = folder_id {
+        let in_project: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM folders f JOIN items i ON i.project_id = f.project_id
+                             WHERE f.id = $1 AND f.org_id = $2 AND i.id = $3 AND i.org_id = $2)",
+        )
+        .bind(fid)
+        .bind(org_id)
+        .bind(item_id)
+        .fetch_one(pool)
+        .await
+        .map_err(PdmError::Db)?;
+        if !in_project {
+            return Err(PdmError::Validation("the folder is not in this item's project".into()));
         }
     }
-    if let Some(oid) = owner_id.and_then(|o| o) {
-        sets.push(format!("owner_id = ${param}"));
-        bind_owner = Some(oid);
-    } else if matches!(owner_id, Some(None)) {
-        sets.push("owner_id = NULL".into());
+    if let Some(Some(oid)) = owner_id {
+        let in_org: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND org_id = $2)")
+                .bind(oid)
+                .bind(org_id)
+                .fetch_one(pool)
+                .await
+                .map_err(PdmError::Db)?;
+        if !in_org {
+            return Err(PdmError::Validation("the owner is not in this organization".into()));
+        }
     }
+    let sets = item_update_sets(description.is_some(), folder_id, owner_id);
+    let bind_description: Option<String> = description.map(str::to_string);
+    let bind_folder: Option<Uuid> = folder_id.flatten();
+    let bind_owner: Option<Uuid> = owner_id.flatten();
     if sets.len() == 1 {
         return get_item_summary(pool, item_id, org_id)
             .await?
@@ -2504,6 +2541,27 @@ pub async fn update_item(
     get_item_summary(pool, item_id, org_id)
         .await?
         .ok_or_else(|| PdmError::NotFound(format!("item {item_id}")))
+}
+
+#[cfg(test)]
+mod item_update_tests {
+    use super::*;
+
+    #[test]
+    fn values_are_numbered_after_the_item_and_the_organization() {
+        let f = Some(Uuid::nil());
+        assert_eq!(
+            item_update_sets(true, Some(f), Some(f)),
+            vec!["updated_at = now()", "description = $3", "folder_id = $4", "owner_id = $5"]
+        );
+        assert_eq!(item_update_sets(false, Some(f), None), vec!["updated_at = now()", "folder_id = $3"]);
+        assert_eq!(
+            item_update_sets(false, Some(None), Some(f)),
+            vec!["updated_at = now()", "folder_id = NULL", "owner_id = $3"]
+        );
+        assert_eq!(item_update_sets(true, None, Some(None)), vec!["updated_at = now()", "description = $3", "owner_id = NULL"]);
+        assert_eq!(item_update_sets(false, None, None), vec!["updated_at = now()"]);
+    }
 }
 
 // ── Approvals (dashboard widget) ────────────────────────────────────────
