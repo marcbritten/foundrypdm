@@ -155,11 +155,12 @@ test("native Onshape failures remain visible with their job ID and offer STEP fa
 });
 
 test("SolidCraft supports successive saves and rejects a changed vault head", async () => {
-  let head = { id:"v1", seq:1 }, options;
+  let head = { id:"v1", seq:1 }, options, links = 0;
   const bases = [];
   const context = loadFunctions(["openSolidcraftWeb", "scCheckin", "makeScCheckin"], {
     api: async (method, url, body) => {
       if (method === "GET") return { head_version:head, item:{}, file:{} };
+      if (url === "/versions/v1/design-link") return { url:"/public/design/v1/design.sc?expires=1&signature=s" + ++links };
       if (url === "/blobs") return { blob:{ sha256:"edited" } };
       if (url.endsWith("/checkin")){
         bases.push(body.base_version);
@@ -173,6 +174,9 @@ test("SolidCraft supports successive saves and rejects a changed vault head", as
     toast:message => assert.fail(message), Uint8Array,
   });
   await context.openSolidcraftWeb("item");
+  // The editor opens a signed link, and each later call makes a fresh one.
+  assert.equal(options.designUrl, "/public/design/v1/design.sc?expires=1&signature=s1");
+  assert.equal(await options.designLink(), "/public/design/v1/design.sc?expires=1&signature=s2");
   await options.checkin(new ArrayBuffer(1), "first");
   await options.checkin(new ArrayBuffer(1), "second");
   assert.deepEqual(bases, [1, 2]);
@@ -235,7 +239,7 @@ test("native conversions deduplicate by content and never silently rebase confli
 
 // A small browser bridge double: storage and download bytes are real, while
 // dialog elements expose only the DOM methods the editor host needs.
-function editorHarness(config){
+function editorHarness(config, { fetch:fetchImpl } = {}){
   const storage = new Map(), downloads = [], blobs = [];
   let dialog, design = "first design", collectError = false;
   function element(tag){
@@ -264,7 +268,7 @@ function editorHarness(config){
     window, document:{ createElement:element, body:{ appendChild(){} } },
     navigator:{}, location:{ origin:"http://test" }, Blob, TextEncoder, Uint8Array, ArrayBuffer,
     URL:{ createObjectURL:blob => { blobs.push(blob); return "blob:test"; }, revokeObjectURL(){} },
-    setTimeout:() => 0, clearTimeout(){}, fetch:async () => ({ ok:true }),
+    setTimeout:() => 0, clearTimeout(){}, fetch:fetchImpl || (async () => ({ ok:true })),
     confirm:() => true, prompt:() => "Edit",
   });
   vm.runInContext(editors, context);
@@ -295,6 +299,25 @@ test("SolidCraft edited download releases busy state and saves collect fresh byt
   await harness.button("[data-checkin]").onclick();
   assert.deepEqual(saves, ["newer design", "third design"]);
   assert.match(harness.button("strong").textContent, /v3/);
+});
+
+test("SolidCraft Download original fetches a fresh design link", async () => {
+  const fetched = [];
+  let links = 0;
+  const harness = editorHarness({
+    version:{ seq:1 }, name:"design.sc", checkin:null,
+    designUrl:"/public/design/v1/design.sc?expires=1&signature=opened",
+    designLink:async () => "/public/design/v1/design.sc?expires=2&signature=fresh" + ++links,
+  }, { fetch:async url => {
+    fetched.push(url);
+    return { ok:true, arrayBuffer:async () => new TextEncoder().encode("original").buffer };
+  } });
+  await harness.open();
+  await harness.button("[data-original]").onclick();
+  assert.deepEqual(fetched.filter(url => url.startsWith("/public/")),
+    ["/public/design/v1/design.sc?expires=2&signature=fresh1"]);
+  assert.equal(harness.downloads.length, 1);
+  assert.equal(await harness.downloads[0].blob.text(), "original");
 });
 
 test("failed SolidCraft saves retain downloadable bytes when the editor stops responding", async () => {

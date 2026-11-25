@@ -11,6 +11,7 @@ use pdm_core::{PdmError, User};
 use tokio::process::Command;
 
 use crate::auth::{Authed, require_user};
+use crate::design_link;
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -2201,16 +2202,12 @@ struct PublicDesignRow {
     derived_solidcraft_sha256: Option<String>,
 }
 
-/// GET /public/design/{version_id}/{filename} — unauthenticated design download for the
-/// bundled SolidCraft web editor: the app runs in a same-origin iframe and its design-link
-/// fetch sends no credentials, so the URL names the exact immutable file instead of a token.
-/// With a derived .sc artifact the filename must match that artifact; otherwise it must match
-/// the version's own source file. Versions and blobs are immutable, so a stale or shared link
-/// can only re-read the same bytes.
-pub async fn public_design_download(
-    State(state): State<AppState>,
-    Path((version_id, filename)): Path<(Uuid, String)>,
-) -> Result<Response, AppError> {
+/// The file a design link serves for a version: the derived .sc artifact's name and bytes when
+/// one exists, otherwise the version's own source file.
+async fn design_link_file(
+    state: &AppState,
+    version_id: Uuid,
+) -> Result<(String, String), AppError> {
     let row = sqlx::query_as::<_, PublicDesignRow>(
         "SELECT v.seq, v.blob_id, v.native_format, f.filename, v.derived_solidcraft_sha256 \
          FROM file_versions v JOIN files f ON f.id = v.file_id WHERE v.id = $1",
@@ -2221,7 +2218,7 @@ pub async fn public_design_download(
     .map_err(|e| AppError(PdmError::Db(e)))?
     .ok_or_else(|| AppError(PdmError::NotFound(format!("version {version_id}"))))?;
     let source = pdm_core::version_filename(&row.filename, &row.native_format);
-    let (expected, sha) = match row.derived_solidcraft_sha256 {
+    Ok(match row.derived_solidcraft_sha256 {
         Some(sha) => (
             pdm_core::solidcraft_artifact_filename(&source, row.seq),
             sha,
@@ -2232,9 +2229,74 @@ pub async fn public_design_download(
                 .ok_or_else(|| AppError(PdmError::NotFound("blob for version".into())))?;
             (source, blob.sha256)
         }
-    };
+    })
+}
+
+/// POST /versions/{version_id}/design-link — a short-lived link to the version's design for the
+/// bundled SolidCraft web editor, whose fetch sends no credentials. Checks the caller's
+/// organization; the link expires after `design_link::TTL_SECS`.
+pub async fn create_design_link(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(version_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    owned_version_source(&state, &authed, version_id).await?;
+    let (filename, _) = design_link_file(&state, version_id).await?;
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(design_link::TTL_SECS);
+    let expires = expires_at.timestamp();
+    let signature = state.design_links.sign(version_id, &filename, expires);
+    let url = format!(
+        "/public/design/{version_id}/{}?expires={expires}&signature={signature}",
+        design_link::encode_path_segment(&filename)
+    );
+    Ok(Json(serde_json::json!({
+        "url": url,
+        "filename": filename,
+        "expires_at": expires_at,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct DesignLinkQuery {
+    pub expires: Option<String>,
+    pub signature: Option<String>,
+}
+
+/// GET /public/design/{version_id}/{filename}?expires=&signature= — unauthenticated design
+/// download for the bundled SolidCraft web editor: the app runs in a same-origin iframe and its
+/// design-link fetch sends no credentials, so the link carries an expiry and a signature from
+/// `POST /versions/{version_id}/design-link` instead of a token. With a derived .sc artifact the
+/// filename must match that artifact; otherwise it must match the version's own source file.
+pub async fn public_design_download(
+    State(state): State<AppState>,
+    Path((version_id, filename)): Path<(Uuid, String)>,
+    Query(link): Query<DesignLinkQuery>,
+) -> Result<Response, AppError> {
+    let not_found = || AppError(PdmError::NotFound("design link".into()));
+    let expires = link
+        .expires
+        .as_deref()
+        .and_then(|e| e.parse::<i64>().ok())
+        .ok_or_else(not_found)?;
+    let signature = link.signature.as_deref().ok_or_else(not_found)?;
+    match state.design_links.verify(
+        version_id,
+        &filename,
+        expires,
+        signature,
+        chrono::Utc::now().timestamp(),
+    ) {
+        Ok(()) => {}
+        Err(design_link::LinkError::Invalid) => return Err(not_found()),
+        Err(design_link::LinkError::Expired) => {
+            return Err(AppError(PdmError::Forbidden(
+                "design link has expired; open the design again".into(),
+            )));
+        }
+    }
+    let (expected, sha) = design_link_file(&state, version_id).await?;
     if filename != expected {
-        return Err(AppError(PdmError::NotFound("design link".into())));
+        return Err(not_found());
     }
     let data = state
         .store
@@ -5996,6 +6058,10 @@ pub fn api_router() -> Router<AppState> {
         .route(
             "/versions/{version_id}/solidcraft/blob",
             get(download_solidcraft_artifact),
+        )
+        .route(
+            "/versions/{version_id}/design-link",
+            post(create_design_link),
         )
         .route("/versions/{version_id}/preview", post(regenerate_preview))
         .route("/jobs/{id}", get(get_job_handler))

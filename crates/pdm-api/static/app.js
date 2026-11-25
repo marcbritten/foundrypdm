@@ -4285,8 +4285,11 @@ async function openSolidcraftWeb(itemId, versionId){
       designName = meta.filename;
     }
     if (!designName) throw new Error("This version has no file name to open");
+    // The editor's fetch sends no credentials, so it gets a short-lived signed link;
+    // Download original asks for a fresh one.
+    const designLink = async () => (await api("POST", "/versions/" + openedVersionId + "/design-link")).url;
     await PdmEditors.openSolidcraft({ version, name: designName,
-      designUrl: "/public/design/" + openedVersionId + "/" + encodeURIComponent(designName),
+      designUrl: await designLink(), designLink,
       checkin: isRole("editor") ? makeScCheckin(itemId, version, designName) : null,
       onSaved: () => { if (CUR_RELOAD) CUR_RELOAD(); },
     });

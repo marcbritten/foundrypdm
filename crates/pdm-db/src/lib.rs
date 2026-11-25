@@ -4566,6 +4566,30 @@ pub async fn put_client_settings(
     Ok(())
 }
 
+// ── Server secrets ──────────────────────────────────────────────────────
+
+/// The server-wide secret `name`: `len` random bytes, made by whichever process asks first and
+/// then kept in the database, so every API process on this database gets the same value and it
+/// survives restarts. Deleting the row makes a new one at the next start.
+pub async fn server_secret(pool: &PgPool, name: &str, len: usize) -> Result<Vec<u8>, PdmError> {
+    use rand::RngCore;
+    let mut fresh = vec![0u8; len];
+    rand::rng().fill_bytes(&mut fresh);
+    sqlx::query(
+        "INSERT INTO server_secrets (name, secret) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+    )
+    .bind(name)
+    .bind(&fresh)
+    .execute(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    sqlx::query_scalar("SELECT secret FROM server_secrets WHERE name = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .map_err(PdmError::Db)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

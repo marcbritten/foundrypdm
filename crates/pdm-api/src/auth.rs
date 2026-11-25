@@ -44,8 +44,8 @@ fn is_public(path: &str) -> bool {
         || path == "/"
         || path == "/auth/login"
         || path.starts_with("/static/")
-        // The bundled SolidCraft web editor's design-link fetch: the URL names the
-        // exact immutable version bytes, so it needs no token (see public_design_download).
+        // The bundled SolidCraft web editor's design-link fetch sends no token; the link
+        // carries an expiry and a signature instead (see public_design_download).
         || path.starts_with("/public/design/")
 }
 

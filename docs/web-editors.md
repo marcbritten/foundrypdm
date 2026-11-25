@@ -15,12 +15,19 @@ opens the selected version in the SolidCraft CAD app — the upstream web releas
 pinned into the image by the same installer (`docker/install-web-editors.sh`) and
 served at `/static/editors/solidcraft/`, so it runs on the portal’s own origin.
 
-- **Opening.** The version’s bytes come from `GET /public/design/{version}/{filename}`.
-  That route is unauthenticated on purpose: the editor’s design-link fetch sends no
-  credentials, and the URL must name the exact immutable file — the derived `.sc`
-  artifact when one exists, otherwise the version’s own source file. Convertible CAD
-  versions are restated to a native design first (editor role), reusing the
-  “Convert to SolidCraft” job.
+- **Opening.** The version’s bytes come from
+  `GET /public/design/{version}/{filename}?expires=…&signature=…`. The editor’s
+  design-link fetch sends no credentials, so that route takes no token; instead the
+  portal first asks `POST /versions/{version}/design-link` (signed in, same
+  organization), which returns the link with a 10-minute expiry and an HMAC-SHA256
+  signature over the version, file name and expiry. The file name must be the exact
+  immutable file — the derived `.sc` artifact when one exists, otherwise the version’s
+  own source file. A changed or unsigned link answers 404, an expired one 403; **Download
+  original** asks for a fresh link. The signing key is random, made on the server’s
+  first start and kept in the database (`server_secrets`, row `design_link`), so there
+  is nothing to configure; deleting that row and restarting replaces the key and ends
+  every link handed out before. Convertible CAD versions are restated to a native
+  design first (editor role), reusing the “Convert to SolidCraft” job.
 - **Saving back.** The app keeps its stored designs in the browser’s own storage,
   which the same-origin portal can read. **Save to PDM** asks the running app to
   write the open design to a throwaway file, reads the bytes back, and checks them

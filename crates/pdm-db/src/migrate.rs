@@ -28,6 +28,7 @@ const MIGRATION_0022: &str = include_str!("../migrations/0022_nest_default_unit.
 const MIGRATION_0023: &str = include_str!("../migrations/0023_nest_grain_spacing.sql");
 const MIGRATION_0024: &str = include_str!("../migrations/0024_nest_sheet_part_options.sql");
 const MIGRATION_0025: &str = include_str!("../migrations/0025_nest_sheet_defs.sql");
+const MIGRATION_0026: &str = include_str!("../migrations/0026_server_secrets.sql");
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), PdmError> {
     let mut tx = pool.begin().await.map_err(PdmError::Db)?;
@@ -78,6 +79,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), PdmError> {
         (23, MIGRATION_0023),
         (24, MIGRATION_0024),
         (25, MIGRATION_0025),
+        (26, MIGRATION_0026),
     ];
     for (version, sql) in migrations {
         if !applied.contains(version) {
