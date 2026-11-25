@@ -2035,8 +2035,10 @@ pub async fn upload_blob(
 /// GET /versions/{version_id}/blob
 pub async fn download_version_blob(
     State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
     Path(version_id): Path<Uuid>,
 ) -> Result<Response, AppError> {
+    owned_version_source(&state, &authed, version_id).await?;
     let version = pdm_db::get_version(&state.pool, version_id)
         .await?
         .ok_or_else(|| AppError(PdmError::NotFound(format!("version {version_id}"))))?;
@@ -2067,8 +2069,10 @@ pub async fn download_version_blob(
 /// stored for a version (Inventor, FreeCAD, Rhino, STEP and IGES check-ins), if any.
 pub async fn download_version_derived_step(
     State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
     Path(version_id): Path<Uuid>,
 ) -> Result<Response, AppError> {
+    owned_version_source(&state, &authed, version_id).await?;
     let derived = pdm_db::get_derived_step(&state.pool, version_id)
         .await?
         .ok_or_else(|| {
@@ -2334,8 +2338,10 @@ async fn version_thumbnail_response(
 /// GET /versions/{version_id}/thumbnail — the rendered PNG preview of a version.
 pub async fn download_version_thumbnail(
     State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
     Path(version_id): Path<Uuid>,
 ) -> Result<Response, AppError> {
+    owned_version_source(&state, &authed, version_id).await?;
     let version = pdm_db::get_version(&state.pool, version_id)
         .await?
         .ok_or_else(|| AppError(PdmError::NotFound(format!("version {version_id}"))))?;
@@ -2345,8 +2351,10 @@ pub async fn download_version_thumbnail(
 /// GET /items/{item_id}/thumbnail — the rendered PNG preview of the head version.
 pub async fn download_item_thumbnail(
     State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
     Path(item_id): Path<Uuid>,
 ) -> Result<Response, AppError> {
+    owned_item(&state, require_org(&authed), item_id).await?;
     let file = pdm_db::get_file(&state.pool, item_id)
         .await?
         .ok_or_else(|| AppError(PdmError::NotFound("file not found".into())))?;
@@ -2457,7 +2465,7 @@ pub async fn list_comments(
     Extension(authed): Extension<Authed>,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let _org = require_org(&authed);
+    owned_item(&state, require_org(&authed), item_id).await?;
     let comments = pdm_db::list_comments(&state.pool, item_id).await?;
     Ok(serde_json::json!({ "comments": comments }).into())
 }
@@ -2498,7 +2506,7 @@ pub async fn list_revisions(
     Extension(authed): Extension<Authed>,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let _org = require_org(&authed);
+    owned_item(&state, require_org(&authed), item_id).await?;
     let revisions = pdm_db::list_revisions(&state.pool, item_id).await?;
     Ok(serde_json::json!({ "revisions": revisions }).into())
 }
@@ -2511,7 +2519,7 @@ pub async fn list_item_versions(
     Extension(authed): Extension<Authed>,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let _org = require_org(&authed);
+    owned_item(&state, require_org(&authed), item_id).await?;
     let file = pdm_db::get_file(&state.pool, item_id).await?;
     let versions = match file {
         Some(f) => pdm_db::list_version_details(&state.pool, f.id).await?,
@@ -2598,7 +2606,7 @@ pub async fn get_properties(
     Extension(authed): Extension<Authed>,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let _org = require_org(&authed);
+    owned_item(&state, require_org(&authed), item_id).await?;
     let props = pdm_db::list_properties(&state.pool, item_id).await?;
     Ok(serde_json::json!({ "properties": props }).into())
 }
@@ -4721,6 +4729,19 @@ pub async fn export_flat_patterns(
                     "reason": "no flat pattern attached",
                 })),
                 Some(sha) => {
+                    // POST /sheet-metal takes the sha from the client: only this
+                    // organization's blobs.
+                    if pdm_db::get_blob_by_sha(&state.pool, org, &sha)
+                        .await?
+                        .is_none()
+                    {
+                        missing.push(serde_json::json!({
+                            "item_id": id,
+                            "part_number": e.part_number,
+                            "reason": "flat pattern blob not found in this organization",
+                        }));
+                        continue;
+                    }
                     let data = match state.store.get_by_sha(&sha).await {
                         Ok(data) => data,
                         Err(err) => {
@@ -5149,6 +5170,13 @@ async fn resolve_part_source(
         String,
         Option<Uuid>,
     ) = if let Some(v) = req.file_version_id {
+        // The version must be one of this item's (and so this organization's).
+        if pdm_db::version_source(&state.pool, org, v)
+            .await?
+            .is_none_or(|s| s.item_id != req.item_id)
+        {
+            return Err(AppError(PdmError::NotFound(format!("version {v}"))));
+        }
         let version = pdm_db::get_version(&state.pool, v)
             .await?
             .ok_or_else(|| AppError(PdmError::NotFound(format!("version {v}"))))?;
@@ -5193,10 +5221,15 @@ async fn resolve_part_source(
         let head = pdm_db::get_head_version(&state.pool, file.id)
             .await?
             .ok_or_else(|| AppError(PdmError::Validation("item has no version".into())))?;
+        // POST /sheet-metal takes this sha from the client: only this organization's blobs.
         let size = pdm_db::get_blob_by_sha(&state.pool, org, &sha)
             .await?
             .map(|b| b.size_bytes)
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                AppError(PdmError::Validation(
+                    "the flat-pattern DXF is not in this organization".into(),
+                ))
+            })?;
         (head.id, sha, size, "unknown".into(), None)
     } else if let Some(head) = head_dxf_version(&state.pool, org, req.item_id).await? {
         // The item's head version is itself a DXF flat pattern.
