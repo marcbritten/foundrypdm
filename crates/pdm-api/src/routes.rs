@@ -228,6 +228,35 @@ fn require_org(authed: &Authed) -> Uuid {
     authed.org_id
 }
 
+/// 404 unless the project is the caller's organization's and, when one is given, the folder is in
+/// that project. The foreign keys alone accept any organization's ids.
+async fn require_project_and_folder(
+    state: &AppState,
+    org: Uuid,
+    project_id: Uuid,
+    folder_id: Option<Uuid>,
+) -> Result<(), AppError> {
+    if pdm_db::get_project(&state.pool, project_id, org).await?.is_none() {
+        return Err(AppError(PdmError::NotFound(format!("project {project_id}"))));
+    }
+    if let Some(folder_id) = folder_id
+        && !pdm_db::folder_in_project(&state.pool, folder_id, org, project_id).await?
+    {
+        return Err(AppError(PdmError::NotFound(format!(
+            "folder {folder_id} in project {project_id}"
+        ))));
+    }
+    Ok(())
+}
+
+/// 404 unless the item is the caller's organization's.
+async fn require_item_in_org(state: &AppState, org: Uuid, item_id: Uuid) -> Result<(), AppError> {
+    if pdm_db::get_item(&state.pool, item_id, org).await?.is_none() {
+        return Err(AppError(PdmError::NotFound(format!("item {item_id}"))));
+    }
+    Ok(())
+}
+
 /// Auto-generate the next alpha revision label: A, B, … Z, AA, AB, …
 fn auto_revision_label(existing: usize) -> String {
     if existing < 26 {
@@ -1516,6 +1545,9 @@ pub async fn create_item(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
     let user = require_user(&authed)?.clone();
+    // Without this, a missing project id was a 500, and another organization's project id made an
+    // item in this organization pointing at it.
+    require_project_and_folder(&state, org, project_id, body.folder_id).await?;
     let classification = body.classification.unwrap_or_else(|| "BE".to_string());
 
     // Resolve the configured part-number prefix for this category. If the org
@@ -1581,6 +1613,7 @@ pub async fn create_folder(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
     let user = require_user(&authed)?.clone();
+    require_project_and_folder(&state, org, project_id, body.parent_id).await?;
     let folder =
         pdm_db::create_folder(&state.pool, org, project_id, body.parent_id, &body.name).await?;
 
@@ -1782,6 +1815,7 @@ pub async fn checkout(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
     let user = require_user(&authed)?.clone();
+    require_item_in_org(&state, org, item_id).await?;
     let workstation = body.workstation.unwrap_or_else(|| "unknown".to_string());
 
     // The file record may not exist before the first check-in.
@@ -1829,6 +1863,7 @@ pub async fn undo_checkout(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
     let user = require_user(&authed)?.clone();
+    require_item_in_org(&state, org, item_id).await?;
     pdm_db::release_lock(&state.pool, item_id, user.id).await?;
 
     pdm_db::record_audit(
@@ -1855,6 +1890,7 @@ pub async fn checkin(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
     let user = require_user(&authed)?.clone();
+    require_item_in_org(&state, org, item_id).await?;
 
     // 1. Verify lock is held by this user
     let lock = pdm_db::get_lock(&state.pool, item_id)
