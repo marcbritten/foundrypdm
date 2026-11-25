@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A 2D point in millimetres.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Point {
     pub x: f64,

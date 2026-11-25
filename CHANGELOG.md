@@ -127,12 +127,34 @@ Foundry PDM server. Dates are UTC.
    (`GET /laser-nests/{id}/sheets/{i}/dxf|preview`,
    `GET /laser-nests/{id}/package`, `POST …/{id}/cancel|rerun`). A superseded
    source CAD version flags a nest **stale** without rewriting it. The pinned
-   `sparrow` binary is bundled into the Docker images (`PDM_SPARROW_CLI`); see
-   `docs/laser-nesting.md`, `docs/sparrow-compatibility.md`, and
-   `docs/sparrow-laser-implementation-plan.md`. New schema: migrations 0021–0023
-   (`flat_pattern_artifacts`, `laser_nests`, `laser_nest_parts`,
-   `laser_nest_sheets`, `laser_nest_placements`, plus directional spacing,
-   grain, and per-line mirror/ordinal columns).
+    `sparrow` binary is bundled into the Docker images (`PDM_SPARROW_CLI`); see
+    `docs/laser-nesting.md`, `docs/sparrow-compatibility.md`, and
+    `docs/sparrow-laser-implementation-plan.md`. New schema: migrations 0021–0023
+    (`flat_pattern_artifacts`, `laser_nests`, `laser_nest_parts`,
+    `laser_nest_sheets`, `laser_nest_placements`, plus directional spacing,
+    grain, and per-line mirror/ordinal columns).
+  - **Laser-nest create panel, professional-style**: the create flow is now a
+    **Sheets | Parts** tab pair like a nesting workstation. *Sheets*: a
+    sheet list that **adds/removes sizes of differing dimensions**, each with
+    its own quantity ("as many as needed" or a fixed count) — the worker works
+    through the definitions in order and carries parts that don't fit one size
+    onto the later, larger ones; plus **units of measure** (inches/millimetres,
+    labelled on every dimensional field), grain direction, **nesting corner**
+    (the fill starts at the chosen corner), origin X/Y, sheet–sheet distance,
+    **guillotine cut**, and automatic sheet origins. *Parts*: a **searchable
+    part picker** with flat-pattern SVG thumbnails (falling back to the
+    rendered 3D thumbnail, via `GET /items/{id}/flat-pattern/preview`) and
+    checkbox multi-select + **Add selected**; each part line can be **removed
+    individually** and carries quantity, minimum/filler quantity, **step angle**
+    (90/45/30/180° rotation increments), priority, label, grain, a three-way
+    **Mirror** (Original Only / Both / Mirror Only), and use-bounding-box /
+    common-edge flags; shared part–part spacing (horizontal/vertical),
+    **add part labels** (drawn on the sheet DXF + preview), optimized pairs and
+    fill-all-sheets. Sheet/part choices pre-fill from new **org laser-nesting
+    defaults** in **Settings** ("Laser nesting defaults" — units, sheet size,
+    margin, spacing, grain, corner, guillotine, labels, part source unit;
+    `GET/PUT /settings/nest-defaults`). Migrations 0024–0025 add the
+    sheet/part option columns and `laser_nests.sheet_defs`.
 
 ### Fixed
 - SolidCraft web editor updates now work on Docker overlay filesystems and

@@ -77,6 +77,13 @@ pub enum Primitive {
     },
     /// A zero-length point (mark candidate).
     Point { layer: String, pos: Point },
+    /// A single-line text annotation (label). Not cutting geometry.
+    Text {
+        layer: String,
+        pos: Point,
+        height: f64,
+        content: String,
+    },
 }
 
 /// Convert a parsed DXF to millimetres.
@@ -160,6 +167,17 @@ fn scale_primitive(p: &Primitive, f: f64) -> Primitive {
             layer: layer.clone(),
             pos: spt(pos),
         },
+        Primitive::Text {
+            layer,
+            pos,
+            height,
+            content,
+        } => Primitive::Text {
+            layer: layer.clone(),
+            pos: spt(pos),
+            height: height * f,
+            content: content.clone(),
+        },
     }
 }
 
@@ -171,7 +189,8 @@ impl Primitive {
             | Self::Circle { layer, .. }
             | Self::Arc { layer, .. }
             | Self::Polyline { layer, .. }
-            | Self::Point { layer, .. } => layer.clone(),
+            | Self::Point { layer, .. }
+            | Self::Text { layer, .. } => layer.clone(),
         }
     }
 }
@@ -216,6 +235,7 @@ struct Raw {
     layer: String,
     block: Option<String>,
     nums: HashMap<i32, f64>,
+    strs: HashMap<i32, String>,
     // LWPOLYLINE vertices in order as (x, y, bulge); bulge is per-vertex.
     verts: Vec<(f64, f64, Option<f64>)>,
 }
@@ -226,6 +246,9 @@ impl Raw {
     }
     fn n_def(&self, c: i32, d: f64) -> f64 {
         self.n(c).unwrap_or(d)
+    }
+    fn s(&self, c: i32) -> Option<String> {
+        self.strs.get(&c).cloned()
     }
 }
 
@@ -408,6 +431,12 @@ pub fn parse(input: &str) -> Result<Dxf> {
                     }
                 }
             }
+            // Text content (group 1) — store the raw string for TEXT/MTEXT.
+            1 => {
+                if let Some(r) = raw.as_mut() {
+                    r.strs.insert(1, value.clone());
+                }
+            }
             _ => {}
         }
     }
@@ -539,9 +568,13 @@ fn expand(
             "TEXT" | "MTEXT" => {
                 let layer = ent.layer.clone();
                 if let (Some(x), Some(y)) = (ent.n(10), ent.n(20)) {
-                    out.push(Primitive::Point {
+                    let content = ent.s(1).unwrap_or_default();
+                    let height = ent.n_def(40, 1.0);
+                    out.push(Primitive::Text {
                         layer,
                         pos: Point::new(x, y),
+                        height,
+                        content,
                     });
                 }
             }
@@ -647,6 +680,7 @@ fn transform_primitive(mut prim: Primitive, f: &impl Fn(Point) -> Point) -> Prim
             }
         }
         Primitive::Point { pos, .. } => *pos = f(*pos),
+        Primitive::Text { pos, .. } => *pos = f(*pos),
     }
     prim
 }
@@ -792,6 +826,24 @@ fn write_primitive(s: &mut String, p: &Primitive) {
             s.push_str("\n20\n");
             s.push_str(&fmt_num(pos.y));
             s.push_str("\n30\n0.0\n");
+        }
+        Primitive::Text {
+            layer,
+            pos,
+            height,
+            content,
+        } => {
+            s.push_str("0\nTEXT\n8\n");
+            s.push_str(layer);
+            s.push_str("\n10\n");
+            s.push_str(&fmt_num(pos.x));
+            s.push_str("\n20\n");
+            s.push_str(&fmt_num(pos.y));
+            s.push_str("\n30\n0.0\n40\n");
+            s.push_str(&fmt_num(*height));
+            s.push_str("\n1\n");
+            s.push_str(content);
+            s.push('\n');
         }
     }
 }

@@ -47,6 +47,19 @@ pub enum GrainDir {
     Any,
 }
 
+/// The corner of the stock from which the layout fill starts. The solver packs
+/// from the lower-left; other corners are realised by a whole-layout flip,
+/// which preserves relative grain alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NestingCorner {
+    #[default]
+    LowerLeft,
+    LowerRight,
+    UpperLeft,
+    UpperRight,
+}
+
 /// Nesting configuration for a single run.
 ///
 /// The stock rectangle is `stock_width` (x) by `stock_height` (y); the PDM API
@@ -68,6 +81,15 @@ pub struct NestConfig {
     /// The sheet's grain direction (drives per-part rotation restrictions).
     #[serde(default)]
     pub sheet_grain: GrainDir,
+    /// Which corner the fill starts from (default lower-left).
+    #[serde(default)]
+    pub nesting_corner: NestingCorner,
+    /// Nesting origin offset from the stock lower-left corner (mm).
+    #[serde(default)]
+    pub origin: crate::geom::Point,
+    /// Draw part labels (P1, P2, …) on the exported DXF + preview.
+    #[serde(default)]
+    pub add_part_labels: bool,
     /// Max chord deviation (mm) when tessellating arcs for the solver outline.
     #[serde(default = "default_chord")]
     pub chord_tol: f64,
@@ -128,6 +150,9 @@ impl Default for NestConfig {
             gap_x: 5.0,
             gap_y: 5.0,
             sheet_grain: GrainDir::AlongLength,
+            nesting_corner: NestingCorner::LowerLeft,
+            origin: crate::geom::Point::new(0.0, 0.0),
+            add_part_labels: false,
             chord_tol: part::DEFAULT_CHORD_TOL,
             join_tol: part::DEFAULT_JOIN_TOL,
             time_budget_sec: default_budget(),
@@ -156,6 +181,9 @@ impl NestConfig {
             || !(self.gap_y.is_finite() && self.gap_y >= 0.0)
         {
             return Err(E("part spacing must be finite and >= 0".into()));
+        }
+        if !(self.origin.x.is_finite() && self.origin.y.is_finite()) {
+            return Err(E("nesting origin must be finite".into()));
         }
         if self.edge_margin * 2.0 + self.gap_x.max(self.gap_y) >= self.stock_height
             || self.edge_margin * 2.0 + self.gap_x.max(self.gap_y) >= self.stock_width

@@ -777,7 +777,7 @@ fn primitive_to_edges(p: &Primitive) -> (Vec<Edge>, bool) {
             }
             (edges, *closed)
         }
-        Primitive::Point { .. } => (Vec::new(), false),
+        Primitive::Point { .. } | Primitive::Text { .. } => (Vec::new(), false),
     }
 }
 

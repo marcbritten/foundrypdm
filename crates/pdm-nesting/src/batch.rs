@@ -25,7 +25,12 @@ pub enum BatchError {
     #[error("part {0} does not fit a stock sheet in any allowed orientation")]
     OversizedPart(usize),
     #[error("partial demand: {remaining} copies could not be placed within {sheets} sheets")]
-    Partial { remaining: usize, sheets: usize },
+    Partial {
+        remaining: usize,
+        sheets: usize,
+        /// Sheets placed before this size ran out of demand capacity.
+        placed: Vec<BatchSheet>,
+    },
     #[error("solver: {0}")]
     Solver(#[from] solver::SolverError),
     #[error("sheet: {0}")]
@@ -43,6 +48,14 @@ pub struct NestLine {
     pub allow_mirror: bool,
     /// This line's grain preference relative to the part's long axis.
     pub grain: GrainDir,
+    /// Rotation increment in degrees (90 => 0/90/180/270, 45 => 8, 180 => 0/180).
+    pub step_angle: f64,
+    /// Nesting priority (lower number placed first).
+    pub priority: i32,
+    /// Nest by the part's bounding box instead of its outline.
+    pub use_bounding_box: bool,
+    /// Part label (drawn when the config has labels enabled).
+    pub label: String,
 }
 
 /// A sheet of the batch: its copies, the validated layout, and the raw solution.
@@ -62,7 +75,7 @@ pub fn precheck(lines: &[NestLine], parts: &[Part], cfg: &NestConfig) -> Result<
     for line in lines {
         let p = &parts[line.part];
         let bb = p.outer.bbox;
-        let rots = grain_rotations(cfg, p, line.grain);
+        let rots = line_rotations(cfg, p, line);
         let fits = rots
             .iter()
             .any(|&r| rotation_fits(bb.width(), bb.height(), r, usable_w, usable_h));
@@ -82,42 +95,72 @@ fn rotation_fits(w: f64, h: f64, rot_deg: f64, usable_w: f64, usable_h: f64) -> 
     ew <= usable_w && eh <= usable_h
 }
 
-/// The rotations allowed for a line, derived from the sheet and part grain
-/// directions (or the explicit `cfg.allowed_rotations` when non-empty).
-///
-/// The stock *length* axis is the vertical (y) axis in PDM layouts; the part's
-/// long axis is its larger bounding-box side. Grain alignment keeps the part's
-/// long axis parallel to the sheet grain axis.
+/// The rotation base set from a step angle (degrees): `{0, step, 2·step, … <
+/// 360}`. A step of 360° (or ≤ 0) means a single orientation.
+fn step_set(step: f64) -> Vec<f64> {
+    let s = if step > 1.0 { step } else { 90.0 };
+    let mut v = Vec::new();
+    let mut i = 0.0;
+    while i < 360.0 - 1e-6 {
+        v.push(i);
+        i += s;
+    }
+    v
+}
+
+/// The rotations allowed for a line: the step-angle base set filtered by the
+/// sheet/part grain alignment (or the explicit `cfg.allowed_rotations` when
+/// non-empty). The stock *length* axis is vertical (y) in PDM layouts; the
+/// part's long axis is its larger bounding-box side; grain alignment keeps the
+/// part's relevant axis parallel to the sheet grain axis.
+pub fn line_rotations(cfg: &NestConfig, part: &Part, line: &NestLine) -> Vec<f64> {
+    if !cfg.allowed_rotations.is_empty() {
+        return cfg.allowed_rotations.clone();
+    }
+    rotate_set(cfg, part, line.grain, line.step_angle)
+}
+
+/// Legacy entry point: grain-derived rotations at a 90° step.
 pub fn grain_rotations(cfg: &NestConfig, part: &Part, grain: GrainDir) -> Vec<f64> {
     if !cfg.allowed_rotations.is_empty() {
         return cfg.allowed_rotations.clone();
     }
-    const ALL: [f64; 4] = [0.0, 90.0, 180.0, 270.0];
+    rotate_set(cfg, part, grain, 90.0)
+}
+
+fn rotate_set(cfg: &NestConfig, part: &Part, grain: GrainDir, step: f64) -> Vec<f64> {
+    let base = step_set(step);
+    if cfg.sheet_grain == GrainDir::Any || grain == GrainDir::Any {
+        return base;
+    }
     let bb = part.outer.bbox;
     let w = bb.width();
     let h = bb.height();
     if (w - h).abs() < 1e-6 {
-        return ALL.to_vec();
+        return base; // square: any orientation aligns
     }
-    let part_long_is_x = w > h;
-    match (cfg.sheet_grain, grain) {
-        (GrainDir::Any, _) | (_, GrainDir::Any) => ALL.to_vec(),
-        (sheet, part_grain) => {
-            // Does the part's long axis need to run along the sheet's length
-            // (the y axis)?
-            let want_y = matches!(
-                (sheet, part_grain),
-                (GrainDir::AlongLength, GrainDir::AlongLength)
-                    | (GrainDir::AlongWidth, GrainDir::AlongWidth)
-            );
-            let long_axis_is_x_at_zero = part_long_is_x;
-            if long_axis_is_x_at_zero == want_y {
-                vec![90.0, 270.0]
-            } else {
-                vec![0.0, 180.0]
-            }
-        }
+    let part_local_long = if w > h { 0.0 } else { 90.0 };
+    let sheet_dir = if cfg.sheet_grain == GrainDir::AlongLength {
+        90.0
+    } else {
+        0.0
+    };
+    let mut target = sheet_dir;
+    if grain == GrainDir::AlongWidth {
+        target += 90.0; // part's long axis must run across the sheet grain
     }
+    target %= 180.0;
+    let delta = ((target - part_local_long) % 180.0 + 180.0) % 180.0;
+    let filtered: Vec<f64> = base
+        .iter()
+        .filter(|th| {
+            let m = ((**th) % 180.0 + 180.0) % 180.0;
+            let diff = (m - delta).abs();
+            diff < 1e-3 || (180.0 - diff) < 1e-3
+        })
+        .copied()
+        .collect();
+    if filtered.is_empty() { base } else { filtered }
 }
 
 /// Expand demand lines into per-copy references (`part` = line index).
@@ -152,12 +195,30 @@ pub fn build_instance(
         .map(|(i, c)| {
             let line = &lines[c.part];
             let part = &parts[line.part];
+            // Collision shape: the dilated outline, or the dilated bounding box
+            // when the line requests box nesting.
+            let polygon = if line.use_bounding_box {
+                let bb = &part.outer.bbox;
+                let m = mapping.gap_x.max(mapping.gap_y) / 2.0;
+                crate::part::dilate_box(
+                    &[
+                        crate::geom::Point::new(bb.min_x, bb.min_y),
+                        crate::geom::Point::new(bb.max_x, bb.min_y),
+                        crate::geom::Point::new(bb.max_x, bb.max_y),
+                        crate::geom::Point::new(bb.min_x, bb.max_y),
+                    ],
+                    m,
+                    m,
+                )
+            } else {
+                mapping.solver_outline(part)
+            };
             SolverItem {
                 id: item_ids[i],
                 part_index: line.part,
-                polygon: mapping.solver_outline(part),
+                polygon,
                 demand: 1,
-                rotations: grain_rotations(cfg, part, line.grain),
+                rotations: line_rotations(cfg, part, line),
                 allow_reflection: line.allow_mirror,
             }
         })
@@ -190,11 +251,17 @@ pub fn run_batch<F: Fn(&SolverInstance) -> Result<SolverSolution, solver::Solver
             cfg.max_copies as usize,
         ));
     }
-    // Sort by part outline area descending, then line/copy for determinism.
+    // Sort by priority (lower first), then area descending, then line/copy for
+    // determinism.
     remaining.sort_by(|a, b| {
-        parts[lines[b.part].part]
-            .area
-            .total_cmp(&parts[lines[a.part].part].area)
+        lines[a.part]
+            .priority
+            .cmp(&lines[b.part].priority)
+            .then(
+                parts[lines[b.part].part]
+                    .area
+                    .total_cmp(&parts[lines[a.part].part].area),
+            )
             .then(a.part.cmp(&b.part))
             .then(a.copy.cmp(&b.copy))
     });
@@ -278,6 +345,7 @@ pub fn run_batch<F: Fn(&SolverInstance) -> Result<SolverSolution, solver::Solver
         Err(BatchError::Partial {
             remaining: remaining.len(),
             sheets: sheets.len(),
+            placed: sheets,
         })
     }
 }
@@ -329,6 +397,19 @@ mod tests {
     use crate::dxf::Primitive as P;
     use crate::part::assemble;
 
+    fn line(part: usize, quantity: u64) -> NestLine {
+        NestLine {
+            part,
+            quantity,
+            allow_mirror: false,
+            grain: GrainDir::Any,
+            step_angle: 90.0,
+            priority: 1,
+            use_bounding_box: false,
+            label: String::new(),
+        }
+    }
+
     fn rect_part(w: f64, h: f64) -> Part {
         let prim = P::Polyline {
             layer: "cut".into(),
@@ -351,12 +432,7 @@ mod tests {
     #[test]
     fn precheck_rejects_oversized() {
         let parts = vec![rect_part(500.0, 500.0)];
-        let lines = vec![NestLine {
-            part: 0,
-            quantity: 1,
-            allow_mirror: false,
-            grain: GrainDir::Any,
-        }];
+        let lines = vec![line(0, 1)];
         let cfg = NestConfig {
             stock_width: 200.0,
             stock_height: 200.0,
@@ -373,20 +449,7 @@ mod tests {
 
     #[test]
     fn expand_lines_counts() {
-        let lines = vec![
-            NestLine {
-                part: 0,
-                quantity: 2,
-                allow_mirror: false,
-                grain: GrainDir::Any,
-            },
-            NestLine {
-                part: 1,
-                quantity: 3,
-                allow_mirror: false,
-                grain: GrainDir::Any,
-            },
-        ];
+        let lines = vec![line(0, 2), line(1, 3)];
         let c = expand_lines(&lines);
         assert_eq!(c.len(), 5);
         assert_eq!(c[0], CopyRef { part: 0, copy: 0 });
@@ -437,5 +500,115 @@ mod tests {
             grain_rotations(&cfg3, &part, GrainDir::AlongLength),
             vec![0.0, 180.0]
         );
+    }
+
+    #[test]
+    fn partial_keeps_placed_sheets() {
+        // Two copies of a 60x40 part on a 100x100 stock: the oracle accepts a
+        // single-item sheet only, so one copy is placed and one remains.
+        let part = rect_part(60.0, 40.0);
+        let parts = vec![part];
+        let lines = vec![line(0, 2)];
+        let cfg = NestConfig {
+            stock_width: 100.0,
+            stock_height: 100.0,
+            edge_margin: 10.0,
+            gap_x: 5.0,
+            gap_y: 5.0,
+            chord_tol: 0.05,
+            join_tol: 0.01,
+            max_sheets: 1,
+            ..Default::default()
+        };
+        let mapping = sheet::StockMapping::from_config(&cfg).unwrap();
+        // The solver inlines the dilated outline (local min -m), so the nominal
+        // part starts m past the separation to clear the edge margin.
+        let m = cfg.gap_x.max(cfg.gap_y) / 2.0;
+        let pos = mapping.separation + m;
+        let oracle = |inst: &SolverInstance| {
+            if inst.items.len() == 1 {
+                Ok(solver::SolverSolution {
+                    strip_width: 70.0,
+                    placed: vec![solver::Placed {
+                        item_id: inst.items[0].id,
+                        reflected: false,
+                        rotation_deg: 0.0,
+                        translation: [pos, pos],
+                    }],
+                })
+            } else {
+                Err(solver::SolverError::Malformed("single only".into()))
+            }
+        };
+        match run_batch(&lines, &parts, &cfg, oracle) {
+            Ok(_) => panic!("expected Partial"),
+            Err(BatchError::Partial {
+                remaining,
+                sheets,
+                placed,
+            }) => {
+                assert_eq!(remaining, 1);
+                assert_eq!(sheets, 1);
+                assert_eq!(placed.len(), 1);
+                assert_eq!(placed[0].layout.placements.len(), 1);
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn line_rotations_step_angle() {
+        let part = rect_part(60.0, 40.0);
+        let cfg = NestConfig {
+            sheet_grain: GrainDir::Any,
+            allowed_rotations: vec![],
+            ..Default::default()
+        };
+        // step 90 -> 4 orientations; grain any -> all.
+        let l90 = NestLine {
+            part: 0,
+            quantity: 1,
+            allow_mirror: false,
+            grain: GrainDir::Any,
+            step_angle: 90.0,
+            priority: 1,
+            use_bounding_box: false,
+            label: String::new(),
+        };
+        assert_eq!(
+            line_rotations(&cfg, &part, &l90),
+            vec![0.0, 90.0, 180.0, 270.0]
+        );
+        // step 45 -> 8 orientations.
+        let mut l45 = l90.clone();
+        l45.step_angle = 45.0;
+        assert_eq!(line_rotations(&cfg, &part, &l45).len(), 8);
+        // step 180 -> 2 orientations.
+        let mut l180 = l90.clone();
+        l180.step_angle = 180.0;
+        assert_eq!(line_rotations(&cfg, &part, &l180), vec![0.0, 180.0]);
+    }
+
+    #[test]
+    fn line_rotations_grain_filters_step() {
+        // Part long axis = local x. Sheet grain along length (y) + part along
+        // length => long axis must be y => only 90/270 survive a 45° step set.
+        let part = rect_part(60.0, 40.0);
+        let cfg = NestConfig {
+            sheet_grain: GrainDir::AlongLength,
+            allowed_rotations: vec![],
+            ..Default::default()
+        };
+        let line = NestLine {
+            part: 0,
+            quantity: 1,
+            allow_mirror: false,
+            grain: GrainDir::AlongLength,
+            step_angle: 45.0,
+            priority: 1,
+            use_bounding_box: false,
+            label: String::new(),
+        };
+        assert_eq!(line_rotations(&cfg, &part, &line), vec![90.0, 270.0]);
     }
 }

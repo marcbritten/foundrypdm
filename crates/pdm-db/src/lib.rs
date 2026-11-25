@@ -218,6 +218,41 @@ pub async fn get_dutchman_settings(
     Ok(settings)
 }
 
+/// The org's saved laser-nest create-panel defaults, if any.
+pub async fn get_org_nest_defaults(
+    pool: &PgPool,
+    org_id: Uuid,
+) -> Result<Option<pdm_core::NestDefaults>, PdmError> {
+    let v: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT settings->'nest_defaults' FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(PdmError::Db)?
+            .flatten();
+    match v {
+        Some(v) => Ok(serde_json::from_value(v).ok()),
+        None => Ok(None),
+    }
+}
+
+/// Store the org's laser-nest defaults (replaces the whole object).
+pub async fn set_org_nest_defaults(
+    pool: &PgPool,
+    org_id: Uuid,
+    defaults: &pdm_core::NestDefaults,
+) -> Result<(), PdmError> {
+    sqlx::query(
+        "UPDATE organizations SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{nest_defaults}', to_jsonb($1::jsonb), true) WHERE id = $2",
+    )
+    .bind(serde_json::to_value(defaults).map_err(|e| PdmError::Validation(e.to_string()))?)
+    .bind(org_id)
+    .execute(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    Ok(())
+}
+
 /// The Dutchman channel of the org created first (`None` when no org has a
 /// channel set): the boot-time update loop has no org of its own, so it keeps
 /// the oldest org's choice current on this host.
@@ -3852,6 +3887,17 @@ pub struct LaserNestParams {
     pub spacing_x_mm: f64,
     pub spacing_y_mm: f64,
     pub grain_direction: String,
+    pub nesting_corner: String,
+    pub origin_x_mm: f64,
+    pub origin_y_mm: f64,
+    pub sheet_sheet_distance_mm: f64,
+    pub guillotine: bool,
+    pub add_part_labels: bool,
+    pub fill_direction: String,
+    pub auto_sheet_origins: bool,
+    pub fill_all_sheets: bool,
+    pub optimized_pairs: bool,
+    pub sheet_defs: Vec<pdm_core::SheetDef>,
     pub chord_tol_mm: f64,
     pub join_tol_mm: f64,
     pub default_part_unit: String,
@@ -3884,6 +3930,13 @@ pub struct LaserNestPartInput {
     pub allow_mirror: bool,
     pub part_grain: String,
     pub ordinal: i32,
+    pub step_angle: f64,
+    pub priority: i32,
+    pub label: String,
+    pub use_bounding_box: bool,
+    pub common_edge: bool,
+    pub min_qty: i32,
+    pub filler_qty: i32,
 }
 
 /// Create a nesting run: the nest row, its part snapshots, and the queued
@@ -3906,10 +3959,14 @@ pub async fn create_laser_nest_run(
               org_id, project_id, name, machine_id, material, thickness_mm,
               stock_width_mm, stock_height_mm, edge_margin_mm, part_gap_mm,
               spacing_x_mm, spacing_y_mm, grain_direction,
+              nesting_corner, origin_x_mm, origin_y_mm, sheet_sheet_distance_mm,
+              guillotine, add_part_labels, fill_direction, auto_sheet_origins,
+              fill_all_sheets, optimized_pairs, sheet_defs,
               chord_tol_mm, join_tol_mm, default_part_unit, allowed_rotations,
               time_budget_sec, attempt_limit_sec, max_sheets, seed,
               solver_version, engine_build, created_by, parent_nest_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+                   $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
            RETURNING *"#,
     )
     .bind(org_id)
@@ -3925,6 +3982,17 @@ pub async fn create_laser_nest_run(
     .bind(params.spacing_x_mm)
     .bind(params.spacing_y_mm)
     .bind(&params.grain_direction)
+    .bind(&params.nesting_corner)
+    .bind(params.origin_x_mm)
+    .bind(params.origin_y_mm)
+    .bind(params.sheet_sheet_distance_mm)
+    .bind(params.guillotine)
+    .bind(params.add_part_labels)
+    .bind(&params.fill_direction)
+    .bind(params.auto_sheet_origins)
+    .bind(params.fill_all_sheets)
+    .bind(params.optimized_pairs)
+    .bind(serde_json::json!(params.sheet_defs))
     .bind(params.chord_tol_mm)
     .bind(params.join_tol_mm)
     .bind(&params.default_part_unit)
@@ -3946,8 +4014,10 @@ pub async fn create_laser_nest_run(
             r#"INSERT INTO laser_nest_parts (
                  nest_id, org_id, item_id, file_version_id, artifact_id,
                  dxf_sha, dxf_size, part_number, revision_label, quantity,
-                 layer_cut, layers_mark, unit, mirror, allow_mirror, part_grain, ordinal)
-              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)"#,
+                 layer_cut, layers_mark, unit, mirror, allow_mirror, part_grain, ordinal,
+                 step_angle, priority, label, use_bounding_box, common_edge, min_qty, filler_qty)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+                      $18,$19,$20,$21,$22,$23,$24)"#,
         )
         .bind(nest.id)
         .bind(org_id)
@@ -3966,6 +4036,13 @@ pub async fn create_laser_nest_run(
         .bind(p.allow_mirror)
         .bind(&p.part_grain)
         .bind(p.ordinal)
+        .bind(p.step_angle)
+        .bind(p.priority)
+        .bind(&p.label)
+        .bind(p.use_bounding_box)
+        .bind(p.common_edge)
+        .bind(p.min_qty)
+        .bind(p.filler_qty)
         .execute(&mut *tx)
         .await
         .map_err(PdmError::Db)?;

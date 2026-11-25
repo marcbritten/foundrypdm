@@ -71,6 +71,10 @@ Creation body:
   "material": "Aluminum 5052-H32", "thickness_mm": 1.5,
   "units": "in", "default_part_unit": "in",
   "stock_width_mm": 48, "stock_height_mm": 96,
+  "sheets": [
+    { "width_mm": 48, "length_mm": 96, "quantity": 2 },
+    { "width_mm": 24, "length_mm": 48, "quantity": null }
+  ],
   "edge_margin_mm": 0.4,
   "spacing_x_mm": 0.2, "spacing_y_mm": 0.2,
   "grain_direction": "along_length",
@@ -88,8 +92,25 @@ millimetre values.)
 
 `stock_width_mm`, `stock_height_mm`, and `parts[].quantity` are required; the
 rest default sensibly. Per-part overrides: `file_version_id`, `layer_cut`,
-`layers_mark`, `unit`, `mirror`, `allow_mirror`, `grain`. The same `item_id`
-may appear on multiple part lines with different options.
+`layers_mark`, `unit`, `mirror`, `allow_mirror`, `grain`, `step_angle`,
+`priority`, `label`, `use_bounding_box`, `common_edge`, `min_qty`,
+`filler_qty`. The same `item_id` may appear on multiple part lines with
+different options.
+
+**Multiple sheet sizes.** `sheets` (all dimensions in `units`) lists
+sheet-size definitions the worker works through *in order*: it fills each size
+up to its `quantity` (`null` = as many as needed) and moves on to the next
+until every part line is placed. A part that does not fit one size is carried
+to the later, larger sizes. `stock_width_mm`/`stock_height_mm` record the
+primary (first) sheet and are still required; omitting `sheets` keeps the
+legacy single-size run.
+
+**Defaults.** `GET /settings/nest-defaults` returns the org's saved
+create-panel defaults (sheet size, units, margins, spacing, grain, corner,
+guillotine, labels, part source unit) and `PUT` (admin) saves them; a blank
+field keeps the panel's built-in default. `GET
+/items/{id}/flat-pattern/preview` returns an SVG of a part's flat pattern for
+the picker thumbnails.
 
 ### Spacing, grain, and mirrors
 
@@ -107,11 +128,36 @@ may appear on multiple part lines with different options.
   part may only rotate 90°/270° so its long axis runs down the sheet). `"any"`
   on either side lifts the restriction. An explicit `allowed_rotations` array
   always wins.
-- **Mirrors.** `mirror: true` on a line nests a mirror image of the original
-  geometry (useful when cutting the opposite face of a part). `allow_mirror`
-  (default true) additionally permits the solver to place flipped copies of a
-  line. Both are per-line, so the same part can be cut in its original and
-  mirrored orientations on the same sheet.
+- **Mirrors.** The portal presents a three-way **Mirror** control per part:
+  *Original Only*, *Both*, *Mirror Only*. Under the hood *Mirror Only* sets
+  `mirror: true` (nest a mirror image of the original geometry — useful when
+  cutting the opposite face of a part) and *Both* sets `allow_mirror: true`
+  (let the solver place flipped copies). The same part can be cut in its
+  original and mirrored orientations on the same sheet.
+
+### Sheet & part options
+
+The create panel mirrors a professional nesting tool (Sheets | Parts tabs).
+Beyond stock, spacing, grain, and mirrors:
+
+- **Sheet**: *nesting corner* (which corner the fill starts from — the layout is
+  whole-flipped to that corner), *origin X/Y* (offset of the nesting origin),
+  *sheet-sheet distance* (reference gap between sheets), *guillotine cut*
+  (request a guillotine-cuttable layout), *automatic sheet origins*, *fill
+  direction*, and *create as many sheets as needed*.
+- **Per part**: *step angle* (rotation increment: 90°/45°/30°/180° — combined
+  with grain), *priority* (nesting order, lower first), *label* (drawn when
+  *add part labels* is on), *use bounding box* (nest by the part's bounding box
+  instead of its outline), *common edge*, *minimum qty*, and *filler qty*.
+- **All parts**: *add part labels* (draw P# / the part label on the sheet DXF +
+  preview), *optimized pairs*, and *fill all sheets*.
+
+Grain, spacing, mirrors, step angle, priority, bounding-box, origin, and
+nesting corner are enforced by the engine. Guillotine, common edge, fill
+direction, fill-all-sheets, optimized pairs, minimum/filler qty, and
+sheet-sheet distance are stored on the run and surfaced in the manifest and
+preview (the layout preferences are recorded even where the engine treats them
+as advisory).
 
 ### Units (inches → millimetres)
 

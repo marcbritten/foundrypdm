@@ -681,6 +681,10 @@ async fn run_laser_nest(
             quantity: row.quantity.max(1) as u64,
             allow_mirror: row.allow_mirror,
             grain,
+            step_angle: row.step_angle,
+            priority: row.priority,
+            use_bounding_box: row.use_bounding_box,
+            label: row.label.clone(),
         });
         // "mirror of the original" lines bake the reflection into the geometry.
         let part = assembled
@@ -707,6 +711,12 @@ async fn run_laser_nest(
     } else {
         (nest.part_gap_mm, nest.part_gap_mm)
     };
+    let nesting_corner = match nest.nesting_corner.as_str() {
+        "lower_right" => pdm_nesting::NestingCorner::LowerRight,
+        "upper_left" => pdm_nesting::NestingCorner::UpperLeft,
+        "upper_right" => pdm_nesting::NestingCorner::UpperRight,
+        _ => pdm_nesting::NestingCorner::LowerLeft,
+    };
     let ncfg = pdm_nesting::NestConfig {
         stock_width: nest.stock_width_mm,
         stock_height: nest.stock_height_mm,
@@ -714,6 +724,9 @@ async fn run_laser_nest(
         gap_x,
         gap_y,
         sheet_grain,
+        nesting_corner,
+        origin: pdm_nesting::geom::Point::new(nest.origin_x_mm, nest.origin_y_mm),
+        add_part_labels: nest.add_part_labels,
         chord_tol: nest.chord_tol_mm,
         join_tol: nest.join_tol_mm,
         time_budget_sec: nest.time_budget_sec.max(0) as u32,
@@ -731,26 +744,104 @@ async fn run_laser_nest(
         .map(|n| n.get() as u32)
         .unwrap_or(4)
         .min(8);
+    // Sheet-size definitions to work through in order. Legacy nests (no defs)
+    // use the single stock size.
+    let sheet_defs: Vec<pdm_core::SheetDef> = if nest.sheet_defs.0.is_empty() {
+        vec![pdm_core::SheetDef {
+            width_mm: nest.stock_width_mm,
+            length_mm: nest.stock_height_mm,
+            quantity: None,
+        }]
+    } else {
+        nest.sheet_defs.0.clone()
+    };
+    let solve_defs = sheet_defs.clone();
+    let solve_lines0 = lines.clone();
     let solve_parts = parts.clone();
-    let solve_lines = lines.clone();
-    let solve_cfg = ncfg.clone();
+    let base_cfg = ncfg.clone();
     let solve_bin = bin.clone();
     let solve = tokio::task::spawn_blocking(move || {
-        let oracle = |inst: &pdm_nesting::solver::SolverInstance| {
-            run_sparrow_blocking(&solve_bin, inst, seed, solve_cfg.attempt_limit_sec, workers)
-        };
-        pdm_nesting::batch::run_batch(&solve_lines, &solve_parts, &solve_cfg, oracle)
+        let mut remaining: Vec<u64> = solve_lines0.iter().map(|l| l.quantity.max(1)).collect();
+        // (sheet, its stock width/length) — sheets may come from different
+        // definitions.
+        let mut all_sheets: Vec<(pdm_nesting::batch::BatchSheet, (f64, f64))> = Vec::new();
+        for def in &solve_defs {
+            if remaining.iter().all(|&q| q == 0) {
+                break;
+            }
+            let mut def_cfg = base_cfg.clone();
+            def_cfg.stock_width = def.width_mm;
+            def_cfg.stock_height = def.length_mm;
+            // Per-size sheet cap: the requested quantity, else the run's
+            // max_sheets.
+            let cap = def
+                .quantity
+                .map(|q| q.max(0) as u32)
+                .unwrap_or(base_cfg.max_sheets);
+            def_cfg.max_sheets = cap.max(1).min(base_cfg.max_sheets.max(1));
+            let def_lines: Vec<pdm_nesting::batch::NestLine> = solve_lines0
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let mut l = l.clone();
+                    l.quantity = remaining[i];
+                    l
+                })
+                .filter(|l| l.quantity > 0)
+                .collect();
+            if def_lines.is_empty() {
+                continue;
+            }
+            let oracle = |inst: &pdm_nesting::solver::SolverInstance| {
+                run_sparrow_blocking(&solve_bin, inst, seed, base_cfg.attempt_limit_sec, workers)
+            };
+            let dims = (def.width_mm, def.length_mm);
+            let mut take = |sheets: Vec<pdm_nesting::batch::BatchSheet>| {
+                for s in &sheets {
+                    for c in &s.copies {
+                        remaining[c.part] = remaining[c.part].saturating_sub(1);
+                    }
+                }
+                all_sheets.extend(sheets.into_iter().map(|s| (s, dims)));
+            };
+            match pdm_nesting::batch::run_batch(&def_lines, &solve_parts, &def_cfg, oracle) {
+                Ok(sheets) => take(sheets),
+                Err(pdm_nesting::batch::BatchError::Partial { placed, .. }) => take(placed),
+                // A part that does not fit this size may fit a later, larger
+                // definition — skip this one.
+                Err(pdm_nesting::batch::BatchError::OversizedPart(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if remaining.iter().any(|&q| q > 0) {
+            let unplaced: u64 = remaining.iter().sum();
+            let placed: Vec<_> = all_sheets.iter().map(|(s, _)| s.clone()).collect();
+            return Err(pdm_nesting::batch::BatchError::Partial {
+                remaining: unplaced as usize,
+                sheets: all_sheets.len(),
+                placed,
+            });
+        }
+        Ok(all_sheets)
     })
     .await
     .map_err(|e| PdmError::Internal(format!("nest spawn_blocking: {e}")))?
     .map_err(|e| PdmError::Internal(e.to_string()))?;
 
+    // Per-line labels (part_index = line order = part_rows order).
+    let labels: Vec<String> = part_rows.iter().map(|r| r.label.clone()).collect();
     let mut sheet_rows = Vec::new();
-    for (idx, sheet) in solve.iter().enumerate() {
+    for (idx, (sheet, (sw, sh))) in solve.iter().enumerate() {
         let nsheet = pdm_db::create_laser_nest_sheet(pool, org, nest_id, idx as i32).await?;
-        let dxf_text = pdm_nesting::sheet::export_sheet_dxf(&sheet.layout, &parts, &ncfg);
+        // Export with this sheet's own stock size (definitions may differ).
+        let mut sheet_cfg = ncfg.clone();
+        sheet_cfg.stock_width = *sw;
+        sheet_cfg.stock_height = *sh;
+        let dxf_text =
+            pdm_nesting::sheet::export_sheet_dxf(&sheet.layout, &parts, &labels, &sheet_cfg);
         let (dxf_sha, dxf_size) = put_bytes(store, pool, org, dxf_text.as_bytes()).await?;
-        let svg_text = pdm_nesting::sheet::export_sheet_svg(&sheet.layout, &parts, &ncfg);
+        let svg_text =
+            pdm_nesting::sheet::export_sheet_svg(&sheet.layout, &parts, &labels, &sheet_cfg);
         let (svg_sha, _) = put_bytes(store, pool, org, svg_text.as_bytes()).await?;
         for pl in &sheet.layout.placements {
             let (item_id, file_version_id) = item_by_index[pl.part_index];
@@ -917,7 +1008,7 @@ fn nest_manifest(
     part_rows: &[pdm_core::LaserNestPart],
     resolved_layers: &[(String, Vec<String>, Vec<String>)],
     sheet_rows: &[pdm_core::LaserNestSheet],
-    solve: &[pdm_nesting::batch::BatchSheet],
+    solve: &[(pdm_nesting::batch::BatchSheet, (f64, f64))],
     seed: Option<i64>,
     bin: &str,
 ) -> serde_json::Value {
@@ -936,6 +1027,15 @@ fn nest_manifest(
             "spacing_x_mm": nest.spacing_x_mm,
             "spacing_y_mm": nest.spacing_y_mm,
             "grain_direction": nest.grain_direction,
+            "nesting_corner": nest.nesting_corner,
+            "origin_mm": { "x": nest.origin_x_mm, "y": nest.origin_y_mm },
+            "sheet_sheet_distance_mm": nest.sheet_sheet_distance_mm,
+            "guillotine": nest.guillotine,
+            "add_part_labels": nest.add_part_labels,
+            "fill_direction": nest.fill_direction,
+            "auto_sheet_origins": nest.auto_sheet_origins,
+            "fill_all_sheets": nest.fill_all_sheets,
+            "optimized_pairs": nest.optimized_pairs,
             "chord_tol_mm": nest.chord_tol_mm,
             "join_tol_mm": nest.join_tol_mm,
             "default_part_unit": nest.default_part_unit,
@@ -964,12 +1064,21 @@ fn nest_manifest(
                 "mirror": p.mirror,
                 "allow_mirror": p.allow_mirror,
                 "part_grain": p.part_grain,
+                "step_angle": p.step_angle,
+                "priority": p.priority,
+                "label": p.label,
+                "use_bounding_box": p.use_bounding_box,
+                "common_edge": p.common_edge,
+                "min_qty": p.min_qty,
+                "filler_qty": p.filler_qty,
             })
         }).collect::<Vec<_>>(),
-        "sheets": sheet_rows.iter().zip(solve.iter()).map(|(row, s)| serde_json::json!({
+        "sheet_defs": nest.sheet_defs,
+        "sheets": sheet_rows.iter().zip(solve.iter()).map(|(row, (s, dims))| serde_json::json!({
             "sheet_index": row.sheet_index,
             "dxf_sha": row.dxf_sha,
             "preview_sha": row.preview_sha,
+            "stock_mm": { "width": dims.0, "length": dims.1 },
             "strip_width_mm": s.strip_width,
             "utilization": s.layout.utilization,
             "placed_count": s.layout.placements.len(),

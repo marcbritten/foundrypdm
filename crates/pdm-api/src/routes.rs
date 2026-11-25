@@ -1086,6 +1086,29 @@ pub async fn save_dutchman(
     Ok(serde_json::json!({ "settings": settings }).into())
 }
 
+/// GET /settings/nest-defaults — the org's saved laser-nest create-panel
+/// defaults (null when unset).
+pub async fn get_nest_defaults(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let org = require_org(&authed);
+    let defaults = pdm_db::get_org_nest_defaults(&state.pool, org).await?;
+    Ok(serde_json::json!({ "defaults": defaults }).into())
+}
+
+/// PUT /settings/nest-defaults — save the org's laser-nest defaults (admin).
+pub async fn save_nest_defaults(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Json(body): Json<pdm_core::NestDefaults>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_admin(&authed)?;
+    let org = require_org(&authed);
+    pdm_db::set_org_nest_defaults(&state.pool, org, &body).await?;
+    Ok(serde_json::json!({ "defaults": body }).into())
+}
+
 /// POST /settings/dutchman/update — pull the release the org's channel
 /// references onto this host now (admin).
 pub async fn update_dutchman(
@@ -4581,6 +4604,73 @@ pub async fn download_item_flat_pattern(
         .map_err(|e| AppError(PdmError::Internal(format!("response build: {e}"))))
 }
 
+/// Resolve the item's nestable flat-pattern DXF text (latest revision-bound
+/// artifact → spec pointer → head DXF version).
+async fn flat_pattern_text(state: &AppState, org: Uuid, item_id: Uuid) -> Result<String, AppError> {
+    let req = NestPartReq {
+        item_id,
+        file_version_id: None,
+        layer_cut: None,
+        layers_mark: None,
+        unit: None,
+        quantity: 1,
+        mirror: false,
+        allow_mirror: true,
+        grain: None,
+        step_angle: 90.0,
+        priority: 1,
+        label: None,
+        use_bounding_box: false,
+        common_edge: false,
+        min_qty: 0,
+        filler_qty: 0,
+    };
+    let src = resolve_part_source(state, org, &req).await?;
+    let blob = pdm_db::get_blob_by_sha(&state.pool, org, &src.dxf_sha)
+        .await?
+        .ok_or_else(|| AppError(PdmError::NotFound("flat pattern blob".into())))?;
+    let data = state
+        .store
+        .get_by_sha(&blob.sha256)
+        .await
+        .map_err(|e| AppError(PdmError::Storage(e.to_string())))?;
+    String::from_utf8(data).map_err(|e| {
+        AppError(PdmError::Validation(format!(
+            "flat pattern is not UTF-8: {e}"
+        )))
+    })
+}
+
+/// GET /items/{item_id}/flat-pattern/preview — an SVG preview of the item's
+/// flat pattern for the nest part picker (profile / holes / marks).
+pub async fn flat_pattern_preview(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(item_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    let org = require_org(&authed);
+    owned_item(&state, org, item_id).await?;
+    let text = flat_pattern_text(&state, org, item_id).await?;
+    let dxf = pdm_nesting::dxf::parse(&text)
+        .map_err(|e| AppError(PdmError::Validation(e.to_string())))?;
+    let (cuts, marks) = pdm_nesting::part::auto_layers(&dxf, &[]);
+    let prims = pdm_nesting::dxf::to_mm(&dxf, "unknown", "unknown");
+    let assembled = pdm_nesting::part::assemble(
+        &prims,
+        &cuts,
+        &marks,
+        pdm_nesting::part::DEFAULT_CHORD_TOL,
+        pdm_nesting::part::DEFAULT_JOIN_TOL,
+    )
+    .map_err(|e| AppError(PdmError::Validation(format!("{e:?}"))))?;
+    let svg = pdm_nesting::sheet::render_parts_preview(&assembled.parts, 320.0, 200.0);
+    axum::http::Response::builder()
+        .status(200)
+        .header("content-type", "image/svg+xml")
+        .body(axum::body::Body::from(svg))
+        .map_err(|e| AppError(PdmError::Internal(format!("response build: {e}"))))
+}
+
 /// GET /sheet-metal/flat-patterns?items=id1,id2,… — export the flat patterns
 /// of several items as a single ZIP (one DXF per part plus a manifest
 /// listing what was included and what was missing).
@@ -4852,6 +4942,35 @@ pub struct NestPartReq {
     /// (default "any"). Drives rotation restriction with the sheet grain.
     #[serde(default)]
     pub grain: Option<String>,
+    /// Rotation increment in degrees (90 default => 0/90/180/270; 45 => 8;
+    /// 180 => 0/180).
+    #[serde(default = "default_step_angle")]
+    pub step_angle: f64,
+    /// Nesting priority (lower number placed first). Default 1.
+    #[serde(default = "default_priority")]
+    pub priority: i32,
+    /// Part label drawn when the nest has "add part labels" on.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Nest by the part's bounding box instead of its outline.
+    #[serde(default)]
+    pub use_bounding_box: bool,
+    /// Request common-edge alignment (preference).
+    #[serde(default)]
+    pub common_edge: bool,
+    /// Minimum placed quantity (preference; quantity is the primary demand).
+    #[serde(default)]
+    pub min_qty: i32,
+    /// Extra filler copies beyond quantity (preference).
+    #[serde(default)]
+    pub filler_qty: i32,
+}
+
+fn default_step_angle() -> f64 {
+    90.0
+}
+fn default_priority() -> i32 {
+    1
 }
 
 fn default_qty() -> i32 {
@@ -4860,6 +4979,16 @@ fn default_qty() -> i32 {
 
 fn default_true() -> bool {
     true
+}
+
+/// One sheet-size definition for a multi-size nest (dimensions in `units`).
+#[derive(Deserialize)]
+pub struct SheetDefReq {
+    pub width_mm: f64,
+    pub length_mm: f64,
+    /// Number of physical sheets of this size; `None` = as many as needed.
+    #[serde(default)]
+    pub quantity: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -4877,6 +5006,11 @@ pub struct CreateLaserNestReq {
     pub units: Option<String>,
     pub stock_width_mm: f64,
     pub stock_height_mm: f64,
+    /// Sheet-size definitions to work through in order. When present and
+    /// non-empty, these (converted to mm) replace the single stock size;
+    /// `stock_width_mm`/`stock_height_mm` then record the primary sheet.
+    #[serde(default)]
+    pub sheets: Vec<SheetDefReq>,
     pub edge_margin_mm: Option<f64>,
     /// Uniform part spacing (legacy): used for both axes when the separate
     /// `spacing_*_mm` values are absent.
@@ -4889,6 +5023,36 @@ pub struct CreateLaserNestReq {
     /// (default "along_length"). Drives per-part rotation restriction.
     #[serde(default)]
     pub grain_direction: Option<String>,
+    /// Which corner the fill starts from (default "lower_left").
+    #[serde(default)]
+    pub nesting_corner: Option<String>,
+    /// Nesting origin offset from the stock lower-left corner, in `units`
+    /// (default 0).
+    #[serde(default)]
+    pub origin_x_mm: Option<f64>,
+    #[serde(default)]
+    pub origin_y_mm: Option<f64>,
+    /// Reference gap between sheets, in `units` (for the manifest/package).
+    #[serde(default)]
+    pub sheet_sheet_distance_mm: Option<f64>,
+    /// Request a guillotine-cuttable layout (preference).
+    #[serde(default)]
+    pub guillotine: bool,
+    /// Draw part labels on the sheet DXF + preview.
+    #[serde(default)]
+    pub add_part_labels: bool,
+    /// Fill direction preference ("auto" default).
+    #[serde(default)]
+    pub fill_direction: Option<String>,
+    /// Use automatic sheet origins (default true).
+    #[serde(default = "default_true")]
+    pub auto_sheet_origins: bool,
+    /// Fill all requested sheets even if not needed (preference).
+    #[serde(default)]
+    pub fill_all_sheets: bool,
+    /// Optimize part pairs (preference).
+    #[serde(default)]
+    pub optimized_pairs: bool,
     /// Source unit for part DXFs that declare no `$INSUNITS` and have no
     /// per-part override: "mm", "in", or "auto" (default — honour the file's
     /// `$INSUNITS`, falling back to mm when the file is unitless).
@@ -4921,6 +5085,13 @@ struct PartSource {
     mirror: bool,
     allow_mirror: bool,
     part_grain: String,
+    step_angle: f64,
+    priority: i32,
+    label: String,
+    use_bounding_box: bool,
+    common_edge: bool,
+    min_qty: i32,
+    filler_qty: i32,
     material: Option<String>,
     thickness_mm: Option<f64>,
 }
@@ -5068,6 +5239,13 @@ async fn resolve_part_source(
         mirror: req.mirror,
         allow_mirror: req.allow_mirror,
         part_grain: grain_value(req.grain.as_deref()),
+        step_angle: req.step_angle,
+        priority: req.priority,
+        label: req.label.clone().unwrap_or_default(),
+        use_bounding_box: req.use_bounding_box,
+        common_edge: req.common_edge,
+        min_qty: req.min_qty,
+        filler_qty: req.filler_qty,
         material: spec.as_ref().and_then(|s| s.material.clone()),
         thickness_mm: spec.as_ref().and_then(|s| s.thickness_mm),
     })
@@ -5093,6 +5271,20 @@ fn sheet_grain_value(v: &Option<String>) -> String {
         Some("along_width") | Some("across") | Some("width") => "along_width".into(),
         Some("any") => "any".into(),
         _ => "along_length".into(),
+    }
+}
+
+/// Normalise the nesting corner (default "lower_left").
+fn corner_value(v: &Option<String>) -> String {
+    match v
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("lower_right") | Some("bottom_right") => "lower_right".into(),
+        Some("upper_left") | Some("top_left") => "upper_left".into(),
+        Some("upper_right") | Some("top_right") => "upper_right".into(),
+        _ => "lower_left".into(),
     }
 }
 
@@ -5203,6 +5395,38 @@ pub async fn create_laser_nest(
         .unwrap_or(5.0);
     let default_part_unit = default_part_unit_of(&body.default_part_unit);
     let grain_direction = sheet_grain_value(&body.grain_direction);
+    let nesting_corner = corner_value(&body.nesting_corner);
+    let origin_x = body.origin_x_mm.map(|v| v * um).unwrap_or(0.0);
+    let origin_y = body.origin_y_mm.map(|v| v * um).unwrap_or(0.0);
+    let sheet_sheet_distance = body.sheet_sheet_distance_mm.map(|v| v * um).unwrap_or(0.0);
+    let fill_direction = body.fill_direction.clone().unwrap_or_else(|| "auto".into());
+    // Sheet-size definitions (mm). Empty = the legacy single stock size.
+    let sheet_defs: Vec<pdm_core::SheetDef> = if body.sheets.is_empty() {
+        vec![]
+    } else {
+        for s in &body.sheets {
+            if s.width_mm <= 0.0 || s.length_mm <= 0.0 {
+                return Err(AppError(PdmError::BadRequest(
+                    "each sheet definition needs positive width and length".into(),
+                )));
+            }
+            if let Some(q) = s.quantity
+                && q < 1
+            {
+                return Err(AppError(PdmError::BadRequest(
+                    "sheet quantity must be at least 1 (or omitted for 'as many as needed')".into(),
+                )));
+            }
+        }
+        body.sheets
+            .iter()
+            .map(|s| pdm_core::SheetDef {
+                width_mm: s.width_mm * um,
+                length_mm: s.length_mm * um,
+                quantity: s.quantity,
+            })
+            .collect()
+    };
     let mut resolved: Vec<PartSource> = Vec::new();
     for p in &body.parts {
         resolved.push(resolve_part_source(&state, org, p).await?);
@@ -5241,6 +5465,17 @@ pub async fn create_laser_nest(
         spacing_x_mm: gap_x,
         spacing_y_mm: gap_y,
         grain_direction,
+        nesting_corner,
+        origin_x_mm: origin_x,
+        origin_y_mm: origin_y,
+        sheet_sheet_distance_mm: sheet_sheet_distance,
+        guillotine: body.guillotine,
+        add_part_labels: body.add_part_labels,
+        fill_direction,
+        auto_sheet_origins: body.auto_sheet_origins,
+        fill_all_sheets: body.fill_all_sheets,
+        optimized_pairs: body.optimized_pairs,
+        sheet_defs,
         chord_tol_mm: pdm_nesting::part::DEFAULT_CHORD_TOL,
         join_tol_mm: pdm_nesting::part::DEFAULT_JOIN_TOL,
         default_part_unit,
@@ -5274,6 +5509,13 @@ pub async fn create_laser_nest(
             mirror: src.mirror,
             allow_mirror: src.allow_mirror,
             part_grain: src.part_grain.clone(),
+            step_angle: src.step_angle,
+            priority: src.priority,
+            label: src.label.clone(),
+            use_bounding_box: src.use_bounding_box,
+            common_edge: src.common_edge,
+            min_qty: src.min_qty,
+            filler_qty: src.filler_qty,
             ordinal: ordinal as i32,
         })
         .collect();
@@ -5380,6 +5622,17 @@ pub async fn rerun_laser_nest(
         spacing_x_mm: parent.spacing_x_mm,
         spacing_y_mm: parent.spacing_y_mm,
         grain_direction: parent.grain_direction.clone(),
+        nesting_corner: parent.nesting_corner.clone(),
+        origin_x_mm: parent.origin_x_mm,
+        origin_y_mm: parent.origin_y_mm,
+        sheet_sheet_distance_mm: parent.sheet_sheet_distance_mm,
+        guillotine: parent.guillotine,
+        add_part_labels: parent.add_part_labels,
+        fill_direction: parent.fill_direction.clone(),
+        auto_sheet_origins: parent.auto_sheet_origins,
+        fill_all_sheets: parent.fill_all_sheets,
+        optimized_pairs: parent.optimized_pairs,
+        sheet_defs: parent.sheet_defs.0.clone(),
         chord_tol_mm: parent.chord_tol_mm,
         join_tol_mm: parent.join_tol_mm,
         default_part_unit: parent.default_part_unit.clone(),
@@ -5410,6 +5663,13 @@ pub async fn rerun_laser_nest(
             mirror: p.mirror,
             allow_mirror: p.allow_mirror,
             part_grain: p.part_grain.clone(),
+            step_angle: p.step_angle,
+            priority: p.priority,
+            label: p.label.clone(),
+            use_bounding_box: p.use_bounding_box,
+            common_edge: p.common_edge,
+            min_qty: p.min_qty,
+            filler_qty: p.filler_qty,
             ordinal: p.ordinal,
         })
         .collect();
@@ -5631,6 +5891,10 @@ pub fn api_router() -> Router<AppState> {
         .route("/settings/cad-cli/update", post(update_cad_cli))
         .route("/settings/dutchman", get(get_dutchman).put(save_dutchman))
         .route("/settings/dutchman/update", post(update_dutchman))
+        .route(
+            "/settings/nest-defaults",
+            get(get_nest_defaults).put(save_nest_defaults),
+        )
         .route("/settings/solidcraft-web", get(get_solidcraft_web))
         .route(
             "/settings/solidcraft-web/update",
@@ -5824,6 +6088,10 @@ pub fn api_router() -> Router<AppState> {
         .route(
             "/items/{item_id}/flat-pattern/generate",
             post(generate_item_flat_pattern),
+        )
+        .route(
+            "/items/{item_id}/flat-pattern/preview",
+            get(flat_pattern_preview),
         )
         .route(
             "/sheet-materials",

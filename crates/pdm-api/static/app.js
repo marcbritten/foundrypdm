@@ -984,12 +984,50 @@ async function exportFlatPatterns(ids){
 
 // ── Laser nesting (Sparrow) ─────────────────────────────────────────────
 // ── Laser nest create panel ─────────────────────────────────────────────
-// The create flow is a full panel inside the Laser Nests view (not a modal),
-// because it has a sheet-information block plus an arbitrary number of part
-// lines, each with quantity / mirror / grain options. `NC.active` (module
-// state, not a route flag) survives timer-driven re-renders so the panel is
-// not clobbered by auto-refresh.
-let NC = { cands: [], lines: [], active: false };
+// A full panel inside the Laser Nests view (not a modal), laid out like a
+// professional nesting tool: a "Sheets | Parts" tab pair. The Sheets tab holds
+// the stock size / grain / corner / spacing / origin; the Parts tab is a
+// master-detail part list (each part has quantity, mirror mode, grain, step
+// angle, priority, label, bounding-box / common-edge flags) plus the common
+// part parameters. `NC.active` (module state, not a route flag) survives
+// timer-driven re-renders so the panel is not clobbered by auto-refresh.
+function ncDefaultState(){
+  return {
+    cands: [], lines: [], active: false, tab: "sheets", selPart: 0, selSheet: 0,
+    units: "in",
+    // Sheet-size definitions, in the current unit; the worker works through
+    // them in order. quantity null = as many as needed.
+    sheets: [ { width: 48, length: 96, asNeeded: true, quantity: 1 } ],
+    margin: 0.39, grain: "along_length", corner: "lower_left", fill: "auto",
+    guillotine: false, autoOrigins: true, ssd: 0, originX: 0, originY: 0,
+    spacingX: 0.2, spacingY: 0.2, addLabels: false, optPairs: false, fillAll: false,
+    partUnit: "auto",
+  };
+}
+let NC = ncDefaultState();
+
+// Apply the org's saved nest defaults (Settings → Laser nesting) to a fresh
+// panel state; leaves anything the defaults don't set untouched.
+function ncApplyDefaults(d){
+  if (!d) return;
+  if (d.units === "in" || d.units === "mm") NC.units = d.units;
+  if (d.length != null) NC.sheets[0].length = d.length;
+  if (d.width != null) NC.sheets[0].width = d.width;
+  if (d.margin != null) NC.margin = d.margin;
+  if (d.spacingX != null) NC.spacingX = d.spacingX;
+  if (d.spacingY != null) NC.spacingY = d.spacingY;
+  if (d.grainDirection) NC.grain = d.grainDirection;
+  if (d.nestingCorner) NC.corner = d.nestingCorner;
+  if (d.guillotine != null) NC.guillotine = d.guillotine;
+  if (d.addPartLabels != null) NC.addLabels = d.addPartLabels;
+  if (d.partUnit) NC.partUnit = d.partUnit;
+}
+
+function ncDefaultLine(){
+  return { item_id: NC.cands[0] ? NC.cands[0].id : "", quantity:1, mirror_mode:"both",
+    grain:"any", step_angle:90, priority:1, label:"", use_bounding_box:false,
+    common_edge:false, min_qty:0, filler_qty:0 };
+}
 
 // Candidate sheet-metal parts, with flat-pattern availability + material.
 async function loadNestableParts(){
@@ -1010,129 +1048,421 @@ async function loadNestableParts(){
   return cands;
 }
 
-function ncOptions(sel){
-  return NC.cands.map(c =>
-    "<option value='" + c.id + "'" + (c.id === sel ? " selected" : "") + ">" +
-    esc(c.name) + (c.hasFlat ? "" : " · needs flat pattern") + "</option>").join("");
+// ── option builders ──────────────────────────────────────────────────────
+function ncOpt(pairs, sel){
+  return pairs.map(([v,l]) =>
+    "<option value='" + v + "'" + (v===sel?" selected":"") + ">" + l + "</option>").join("");
 }
-function ncGrainOptions(sel){
-  return [
-    ["any","No preference"],["along_length","Along part length"],["along_width","Across part length"]
-  ].map(([v,l]) => "<option value='" + v + "'" + (v===sel?" selected":"") + ">" + l + "</option>").join("");
+const NC_SHEET_GRAIN = [["along_length","Vertical"],["along_width","Horizontal"],["any","Ignore"]];
+const NC_CORNER = [["lower_left","Lower Left"],["lower_right","Lower Right"],
+  ["upper_left","Upper Left"],["upper_right","Upper Right"]];
+const NC_FILL = [["auto","Calculate"],["lr","Left → Right"],["rl","Right → Left"],
+  ["tb","Top → Bottom"],["bt","Bottom → Top"]];
+const NC_PART_GRAIN = [["any","Ignore"],["along_length","Along length"],["along_width","Across"]];
+const NC_MIRROR = [["both","Both"],["original","Original Only (do not mirror)"],["mirror","Mirror Only"]];
+const NC_STEP = [[90,"90°"],[45,"45°"],[30,"30°"],[180,"180°"]];
+
+// ── previews ─────────────────────────────────────────────────────────────
+function ncSheetPreview(i){
+  const sh = NC.sheets[i] || NC.sheets[0];
+  const L = +sh.length || 1, W = +sh.width || 1;
+  const boxW = 320, boxH = 200, pad = 14;
+  const s = Math.min((boxW-2*pad)/W, (boxH-2*pad)/L);
+  const w = W*s, h = L*s;
+  const x = (boxW-w)/2, y = (boxH-h)/2;
+  let arrow = "";
+  if (NC.grain === "along_length"){
+    const cx = x + 10, cy = y + h/2, a = 18;
+    arrow = "<line x1='"+cx+"' y1='"+(cy-a)+"' x2='"+cx+"' y2='"+(cy+a)+"' stroke='#3a3' stroke-width='1.5'/>" +
+      "<polygon points='"+cx+","+(cy+a+4)+" "+(cx-3)+","+(cy+a)+" "+(cx+3)+","+(cy+a)+"' fill='#3a3'/>" +
+      "<polygon points='"+cx+","+(cy-a-4)+" "+(cx-3)+","+(cy-a)+" "+(cx+3)+","+(cy-a)+"' fill='#3a3'/>" +
+      "<text x='"+(cx+6)+"' y='"+(cy+3)+"' font-size='9' fill='#8a8'>GRAIN</text>";
+  } else if (NC.grain === "along_width"){
+    const cy = y + 10, cx = x + w/2, a = 18;
+    arrow = "<line x1='"+(cx-a)+"' y1='"+cy+"' x2='"+(cx+a)+"' y2='"+cy+"' stroke='#3a3' stroke-width='1.5'/>" +
+      "<polygon points='"+(cx+a+4)+","+cy+" "+(cx+a)+","+(cy-3)+" "+(cx+a)+","+(cy+3)+"' fill='#3a3'/>" +
+      "<polygon points='"+(cx-a-4)+","+cy+" "+(cx-a)+","+(cy-3)+" "+(cx-a)+","+(cy+3)+"' fill='#3a3'/>" +
+      "<text x='"+(cx+6)+"' y='"+(cy-6)+"' font-size='9' fill='#8a8'>GRAIN</text>";
+  }
+  return "<svg class='nc-preview nc-sheetpreview' viewBox='0 0 "+boxW+" "+boxH+"'>" +
+    "<rect x='0' y='0' width='"+boxW+"' height='"+boxH+"' fill='#111'/>" +
+    "<rect x='"+x+"' y='"+y+"' width='"+w+"' height='"+h+"' fill='none' stroke='#3c3' stroke-width='1.5'/>" +
+    "<text x='"+(x+w/2)+"' y='"+(y+h-6)+"' font-size='10' fill='#6c6' text-anchor='middle'>"+
+    Math.round(W) + " × " + Math.round(L) + " " + NC.units + "</text>" + arrow + "</svg>";
 }
-function ncLineHtml(i){
-  const l = NC.lines[i];
-  return "<div class='nc-line' data-i='" + i + "'>" +
-    "<select data-f='item'>" + ncOptions(l.item_id) + "</select>" +
-    "<input data-f='qty' type='number' min='1' value='" + l.quantity + "' style='width:64px'>" +
-    "<label class='nc-check'><input data-f='mirror' type='checkbox'" + (l.mirror?" checked":"") + "> Mirror original</label>" +
-    "<label class='nc-check'><input data-f='allow' type='checkbox'" + (l.allow_mirror?" checked":"") + "> Flipping allowed</label>" +
-    "<select data-f='grain'>" + ncGrainOptions(l.grain) + "</select>" +
-    "<button class='nc-rm' title='Remove this line'>×</button>" +
-    "</div>";
+function ncPartPreview(){
+  const boxW = 320, boxH = 200;
+  const i = NC.selPart, l = NC.lines[i];
+  const cand = l && NC.cands.find(c => c.id === l.item_id);
+  const img = (cand && cand.hasFlat)
+    ? "<span data-thumb='/items/" + cand.id + "/flat-pattern/preview' class='nc-partimg'></span>"
+    : "<div class='nc-preview nc-partimg' style='display:flex;align-items:center;justify-content:center;color:#666;font-size:11px'>" +
+      (cand ? "No flat pattern yet" : "Select a part") + "</div>";
+  return "<div class='nc-previewwrap'>" + img +
+    "<div class='nc-legend'>" +
+    "<span><i style='background:#3c3'></i>Profile</span>" +
+    "<span><i style='background:#c33'></i>Hole</span>" +
+    "<span><i style='background:#888'></i>Ignore</span></div></div>";
 }
-function ncLinesHtml(){
-  return "<div class='nc-head nc-line'>" +
-      "<span>Part</span><span style='width:64px'>Qty</span>" +
-      "<span>Mirror original</span><span>Flipping allowed</span><span>Grain</span><span></span></div>" +
-    "<div id='ncLines'>" + NC.lines.map(ncLineHtml).join("") + "</div>";
+
+// ── Sheets tab ───────────────────────────────────────────────────────────
+function ncSheetsHtml(){
+  const u = NC.units;
+  const list = NC.sheets.map((sh, i) =>
+    "<div class='nc-sheetrow" + (i===NC.selSheet?" sel":"") + "' data-i='"+i+"'>" +
+    "Sheet #"+(i+1)+" — " + sh.width + " × " + sh.length + " " + u +
+    (sh.asNeeded ? " · as needed" : " · ×" + sh.quantity) +
+    "</div>").join("");
+  const sh = NC.sheets[NC.selSheet] || NC.sheets[0];
+  return "<div class='nc-cols'>" +
+    "<div class='nc-col'>" +
+      "<div class='nc-boxhead'>Sheet List <span class='dim'>" + NC.sheets.length + " of " + NC.sheets.length + "</span></div>" +
+      "<div class='nc-sheetlist' id='ncSheetList'>" + list + "</div>" +
+      "<div class='nc-partlistbtns'><button class='small' id='ncAddSheet'>+ Add sheet size</button>" +
+      "<button class='small' id='ncRmSheet'>Remove</button></div>" +
+      ncSheetPreview(NC.selSheet) +
+      "<div class='nc-group'>" +
+        "<div class='nc-grouptitle' id='ncSheetTitle'>Sheet #" + (NC.selSheet+1) + " — " + u + "</div>" +
+        "<div class='nc-row2'>" +
+          "<label>Width <span class='dim'>(" + u + ")</span><input id='nc_wid' value='" + sh.width + "'></label>" +
+          "<label>Length <span class='dim'>(" + u + ")</span><input id='nc_len' value='" + sh.length + "'></label>" +
+        "</div>" +
+        "<div class='nc-row2'>" +
+          "<label class='nc-check'><input id='nc_asneeded' type='checkbox'" + (sh.asNeeded?" checked":"") + "> As many as needed</label>" +
+          "<label>Quantity<input id='nc_sqty' type='number' min='1' value='" + sh.quantity + "'" + (sh.asNeeded?" disabled":"") + "></label>" +
+        "</div>" +
+      "</div>" +
+    "</div>" +
+    "<div class='nc-col'>" +
+      "<div class='nc-group'>" +
+        "<div class='nc-grouptitle'>Common parameters (all sheets)</div>" +
+        "<div class='nc-row'><label>Units of measure<select id='nc_units'>" + ncOpt([["in","Inches"],["mm","Millimetres"]], u) + "</select></label></div>" +
+        "<div class='nc-row'><label>Grain direction<select id='nc_grain'>" + ncOpt(NC_SHEET_GRAIN, NC.grain) + "</select></label></div>" +
+        "<div class='nc-row'><label>Nesting corner<select id='nc_corner'>" + ncOpt(NC_CORNER, NC.corner) + "</select></label></div>" +
+        "<div class='nc-row'><label>Fill direction<select id='nc_fill'>" + ncOpt(NC_FILL, NC.fill) + "</select></label></div>" +
+        "<div class='nc-row'><label class='nc-check'><input id='nc_gull' type='checkbox'" + (NC.guillotine?" checked":"") + "> Guillotine cut</label></div>" +
+        "<div class='nc-row'><label class='nc-check'><input id='nc_autoorig' type='checkbox'" + (NC.autoOrigins?" checked":"") + "> Automatic sheet origins</label></div>" +
+        "<div class='nc-row2'>" +
+          "<label>Sheet–sheet distance <span class='dim'>(" + u + ")</span><input id='nc_ssd' value='" + NC.ssd + "'></label>" +
+          "<label>Sheet margin <span class='dim'>(" + u + ")</span><input id='nc_margin' value='" + NC.margin + "'></label>" +
+        "</div>" +
+        "<div class='nc-row2'>" +
+          "<label>Origin X <span class='dim'>(" + u + ")</span><input id='nc_ox' value='" + NC.originX + "'></label>" +
+          "<label>Origin Y <span class='dim'>(" + u + ")</span><input id='nc_oy' value='" + NC.originY + "'></label>" +
+        "</div>" +
+      "</div>" +
+    "</div>" +
+  "</div>";
 }
-function ncRebind(){
-  const box = $("ncLines");
-  box.querySelectorAll(".nc-line").forEach(row => {
-    const i = +row.dataset.i;
-    row.querySelector("[data-f=item]").onchange = e => { NC.lines[i].item_id = e.target.value; };
-    row.querySelector("[data-f=qty]").oninput = e => { NC.lines[i].quantity = Math.max(1, parseInt(e.target.value,10)||1); };
-    row.querySelector("[data-f=mirror]").onchange = e => { NC.lines[i].mirror = e.target.checked; };
-    row.querySelector("[data-f=allow]").onchange = e => { NC.lines[i].allow_mirror = e.target.checked; };
-    row.querySelector("[data-f=grain]").onchange = e => { NC.lines[i].grain = e.target.value; };
-    row.querySelector(".nc-rm").onclick = () => {
-      NC.lines.splice(i,1);
-      if (!NC.lines.length) NC.lines.push(ncDefaultLine());
-      document.querySelector(".nc-parts").innerHTML = ncLinesHtml(); ncRebind();
-    };
-  });
-  const add = $("ncAdd");
+function ncRerenderSheets(){
+  const box = $("ncSheetTab");
+  if (box){ box.innerHTML = ncSheetsHtml(); ncBindSheets(); }
+}
+// Typing updates only the chrome (list rows, preview, title) so the input
+// keeps focus; structural changes (select/add/remove a sheet) re-render all.
+function ncSheetChrome(){
+  const sl = $("ncSheetList");
+  if (sl){
+    sl.innerHTML = NC.sheets.map((s2, i) =>
+      "<div class='nc-sheetrow" + (i===NC.selSheet?" sel":"") + "' data-i='"+i+"'>" +
+      "Sheet #"+(i+1)+" — " + s2.width + " × " + s2.length + " " + NC.units +
+      (s2.asNeeded ? " · as needed" : " · ×" + s2.quantity) + "</div>").join("");
+    sl.querySelectorAll(".nc-sheetrow").forEach(row => {
+      row.onclick = () => { NC.selSheet = +row.dataset.i; ncRerenderSheets(); };
+    });
+  }
+  const pv = document.querySelector(".nc-sheetpreview");
+  if (pv) pv.outerHTML = ncSheetPreview(NC.selSheet);
+  const g = $("ncSheetTitle");
+  if (g) g.textContent = "Sheet #" + (NC.selSheet+1) + " — " + NC.units;
+}
+function ncBindSheets(){
+  const set = (id, fn) => { const el = $(id); if (el){ el.onchange = e => fn(e.target); el.oninput = e => fn(e.target); } };
+  const sheet = NC.sheets[NC.selSheet];
+  set("nc_wid", t => { sheet.width = t.value; ncSheetChrome(); });
+  set("nc_len", t => { sheet.length = t.value; ncSheetChrome(); });
+  set("nc_asneeded", t => { sheet.asNeeded = t.checked;
+    const q = $("nc_sqty"); if (q) q.disabled = t.checked; ncSheetChrome(); });
+  set("nc_sqty", t => { sheet.quantity = Math.max(1, parseInt(t.value,10)||1); ncSheetChrome(); });
+  set("nc_units", t => { NC.units = t.value; ncSheetChrome(); });
+  set("nc_ox", t => NC.originX = t.value);
+  set("nc_oy", t => NC.originY = t.value);
+  set("nc_grain", t => { NC.grain = t.value; ncSheetChrome(); });
+  set("nc_corner", t => NC.corner = t.value);
+  set("nc_fill", t => NC.fill = t.value);
+  set("nc_gull", t => NC.guillotine = t.checked);
+  set("nc_autoorig", t => NC.autoOrigins = t.checked);
+  set("nc_ssd", t => NC.ssd = t.value);
+  set("nc_margin", t => NC.margin = t.value);
+  const add = $("ncAddSheet");
   if (add) add.onclick = () => {
-    NC.lines.push(ncDefaultLine());
-    document.querySelector(".nc-parts").innerHTML = ncLinesHtml(); ncRebind();
-    const last = document.querySelector(".nc-lines .nc-line:last-child select");
-    if (last) last.focus();
+    const last = NC.sheets[NC.sheets.length-1];
+    NC.sheets.push({ width: last.width, length: last.length, asNeeded: false, quantity: 1 });
+    NC.selSheet = NC.sheets.length - 1;
+    ncRerenderSheets();
+  };
+  const rm = $("ncRmSheet");
+  if (rm) rm.onclick = () => {
+    if (NC.sheets.length <= 1) return;
+    NC.sheets.splice(NC.selSheet, 1);
+    NC.selSheet = Math.max(0, NC.selSheet - 1);
+    ncRerenderSheets();
   };
 }
-function ncDefaultLine(){
-  return { item_id: NC.cands[0] ? NC.cands[0].id : "", quantity: 1,
-    mirror: false, allow_mirror: true, grain: "any" };
+
+// ── Parts tab: searchable picker + master–detail lines ───────────────────
+function ncPartName(id){
+  const c = NC.cands.find(x => x.id === id);
+  return c ? c.name : (id ? id.slice(0,8) : "—");
+}
+// The picker: search box + checkable rows with flat-pattern thumbnails.
+function ncPickerHtml(){
+  const rows = NC.cands.map(c =>
+    "<label class='nc-pickrow'>" +
+    "<input type='checkbox' class='nc-pick' value='" + c.id + "' data-has='" + (c.hasFlat?"1":"0") + "'>" +
+    "<span class='nc-pickthumb' data-id='" + c.id + "' data-thumb='/items/" + c.id + "/flat-pattern/preview'></span>" +
+    "<span class='nc-pickname'>" + esc(c.name) +
+    (c.hasFlat ? "" : " <span class='badge'>needs flat pattern</span>") +
+    "</span></label>").join("");
+  return "<div class='nc-group'>" +
+    "<div class='nc-grouptitle'>Add parts</div>" +
+    "<input id='ncSearch' class='nc-search' placeholder='Search parts…' autocomplete='off'>" +
+    "<div class='nc-picklist' id='ncPickList'>" + (rows || "<div class='dim'>No sheet-metal parts found.</div>") + "</div>" +
+    "<div class='row' style='margin-top:8px'><button class='small' id='ncAddSelected'>Add selected</button></div>" +
+    "</div>";
+}
+function ncPartListHtml(){
+  return NC.lines.map((l, i) =>
+    "<div class='nc-partrow" + (i===NC.selPart?" sel":"") + "' data-i='"+i+"'>" +
+    "<b>" + esc(ncPartName(l.item_id)) + "</b> ×" + l.quantity +
+    (l.mirror_mode!=="both" ? " · " + ({original:"no-mirror",mirror:"mirror-only"}[l.mirror_mode]) : "") +
+    " <span class='nc-rmline' data-i='"+i+"' title='Remove this line'>×</span>" +
+    "</div>").join("");
+}
+function ncPartParamsHtml(){
+  const i = NC.selPart; const l = NC.lines[i];
+  if (!l) return "<div class='dim'>No part selected.</div>";
+  return "<div class='nc-group'>" +
+    "<div class='nc-grouptitle'>Parameters — " + esc(ncPartName(l.item_id)) + "</div>" +
+    "<div class='nc-row2'>" +
+      "<label>Quantity<input id='nc_qty' type='number' min='1' value='"+l.quantity+"'></label>" +
+      "<label>Minimum qty<input id='nc_minqty' type='number' min='0' value='"+l.min_qty+"'></label>" +
+    "</div>" +
+    "<div class='nc-row2'>" +
+      "<label>Filler qty<input id='nc_fillqty' type='number' min='0' value='"+l.filler_qty+"'></label>" +
+      "<label>Step angle<select id='nc_step'>" + ncOpt(NC_STEP, l.step_angle) + "</select></label>" +
+    "</div>" +
+    "<div class='nc-row2'>" +
+      "<label>Priority<input id='nc_prio' type='number' min='1' value='"+l.priority+"'></label>" +
+      "<label>Label<input id='nc_label' value='"+esc(l.label)+"' placeholder='P"+(i+1)+"'></label>" +
+    "</div>" +
+    "<div class='nc-row'><label>Grain direction<select id='nc_pgrain'>" + ncOpt(NC_PART_GRAIN, l.grain) + "</select></label></div>" +
+    "<div class='nc-row'><label>Mirror<select id='nc_mirror'>" + ncOpt(NC_MIRROR, l.mirror_mode) + "</select></label></div>" +
+    "<div class='nc-row2'>" +
+      "<label class='nc-check'><input id='nc_usebb' type='checkbox'" + (l.use_bounding_box?" checked":"") + "> Use bounding box</label>" +
+      "<label class='nc-check'><input id='nc_commedge' type='checkbox'" + (l.common_edge?" checked":"") + "> Common edge</label>" +
+    "</div>" +
+  "</div>" +
+  "<div class='nc-group'>" +
+    "<div class='nc-grouptitle'>Common parameters (all parts)</div>" +
+    "<div class='nc-row2'>" +
+      "<label>Part–part · horizontal <span class='dim'>(" + NC.units + ")</span><input id='nc_spx' value='"+NC.spacingX+"'></label>" +
+      "<label>Part–part · vertical <span class='dim'>(" + NC.units + ")</span><input id='nc_spy' value='"+NC.spacingY+"'></label>" +
+    "</div>" +
+    "<div class='nc-row'><label class='nc-check'><input id='nc_addlabels' type='checkbox'" + (NC.addLabels?" checked":"") + "> Add part labels</label></div>" +
+    "<div class='nc-row2'>" +
+      "<label class='nc-check'><input id='nc_optpairs' type='checkbox'" + (NC.optPairs?" checked":"") + "> Optimized pairs</label>" +
+      "<label class='nc-check'><input id='nc_fillall' type='checkbox'" + (NC.fillAll?" checked":"") + "> Fill all sheets</label>" +
+    "</div>" +
+    "<div class='nc-row'><label>Part source unit<select id='nc_punit'>" + ncOpt([["auto","Auto (file units)"],["in","Inches"],["mm","Millimetres"]], NC.partUnit) + "</select></label>" +
+  "</div>";
+}
+function ncPartsHtml(){
+  return "<div class='nc-cols'>" +
+    "<div class='nc-col'>" +
+      ncPickerHtml() +
+      "<div class='nc-boxhead'>Part List <span class='dim'>" + NC.lines.length + " line(s)</span></div>" +
+      "<div class='nc-partlist' id='ncPartList'>" + (NC.lines.length ? ncPartListHtml() : "<div class='dim'>No parts added.</div>") + "</div>" +
+      ncPartPreview() +
+    "</div>" +
+    "<div class='nc-col' id='ncPartParams'>" + ncPartParamsHtml() + "</div>" +
+  "</div>";
+}
+function ncRebindParts(){
+  // Picker: live search filter + add-selected (independent lines may repeat a part).
+  const search = $("ncSearch");
+  if (search) search.oninput = () => {
+    const q = search.value.trim().toLowerCase();
+    document.querySelectorAll("#ncPickList .nc-pickrow").forEach(row => {
+      const name = (row.querySelector(".nc-pickname").textContent || "").toLowerCase();
+      row.style.display = (!q || name.includes(q)) ? "" : "none";
+    });
+  };
+  const addSel = $("ncAddSelected");
+  if (addSel) addSel.onclick = () => {
+    const picked = [...document.querySelectorAll(".nc-pick:checked")].map(c => c.value);
+    if (!picked.length) return toast("Tick one or more parts first", "err");
+    picked.forEach(id => {
+      NC.lines.push({ item_id: id, quantity: 1, mirror_mode: "both", grain: "any",
+        step_angle: 90, priority: 1, label: "", use_bounding_box: false,
+        common_edge: false, min_qty: 0, filler_qty: 0 });
+    });
+    NC.selPart = NC.lines.length - 1;
+    ncRerenderParts();
+  };
+  const list = $("ncPartList");
+  if (list){
+    list.querySelectorAll(".nc-partrow").forEach(row => {
+      row.onclick = e => {
+        if (e.target.classList.contains("nc-rmline")) return;
+        NC.selPart = +row.dataset.i;
+        ncRerenderParts();
+      };
+    });
+    // Per-line remove.
+    list.querySelectorAll(".nc-rmline").forEach(btn => {
+      btn.onclick = e => {
+        e.stopPropagation();
+        const i = +btn.dataset.i;
+        NC.lines.splice(i, 1);
+        if (!NC.lines.length) NC.lines.push(ncDefaultLine());
+        NC.selPart = Math.min(NC.selPart, NC.lines.length - 1);
+        ncRerenderParts();
+      };
+    });
+  }
+  // Flat-pattern thumbnails for the picker + preview; fall back to the
+  // rendered 3D thumbnail when a part has no flat pattern yet.
+  const tab = document.getElementById("ncPartsTab");
+  if (tab) attachThumbs(tab).then(() => {
+    tab.querySelectorAll(".nc-pickthumb").forEach(el => {
+      if (el.querySelector("img") || !el.dataset.id) return;
+      thumbUrl("/items/" + el.dataset.id + "/thumbnail").then(u => {
+        if (u && !el.querySelector("img"))
+          el.innerHTML = "<img src='" + u + "' alt='' loading='lazy'>";
+      });
+    });
+  });
+  // Selected-part field bindings.
+  const l = NC.lines[NC.selPart];
+  if (!l) return;
+  const set = (id, fn) => { const el = $(id); if (el){ el.onchange = e => fn(e.target); el.oninput = e => fn(e.target); } };
+  set("nc_qty", t => l.quantity = Math.max(1, parseInt(t.value,10)||1));
+  set("nc_minqty", t => l.min_qty = parseInt(t.value,10)||0);
+  set("nc_fillqty", t => l.filler_qty = parseInt(t.value,10)||0);
+  set("nc_step", t => l.step_angle = parseFloat(t.value)||90);
+  set("nc_prio", t => l.priority = parseInt(t.value,10)||1);
+  set("nc_label", t => l.label = t.value);
+  set("nc_pgrain", t => l.grain = t.value);
+  set("nc_mirror", t => l.mirror_mode = t.value);
+  set("nc_usebb", t => l.use_bounding_box = t.checked);
+  set("nc_commedge", t => l.common_edge = t.checked);
+  set("nc_spx", t => NC.spacingX = t.value);
+  set("nc_spy", t => NC.spacingY = t.value);
+  set("nc_addlabels", t => NC.addLabels = t.checked);
+  set("nc_optpairs", t => NC.optPairs = t.checked);
+  set("nc_fillall", t => NC.fillAll = t.checked);
+  set("nc_punit", t => NC.partUnit = t.value);
+}
+function ncRerenderParts(){
+  const box = $("ncPartsTab");
+  if (box){ box.innerHTML = ncPartsHtml(); ncRebindParts(); }
 }
 
 async function renderNestCreate(v){
   NC.cands = await loadNestableParts();
+  // Pre-fill the sheet/part defaults from the org's saved settings. This only
+  // runs when the panel is opened fresh (timer re-renders keep the live DOM).
+  try { const d = await api("GET", "/settings/nest-defaults"); ncApplyDefaults(d.defaults); }
+  catch(e){}
   // Drop any preselection carried on the route (consumed into NC.lines by the
   // entry points) and seed a default line when none were added.
   delete ROUTE._parts;
   if (!NC.lines.length && NC.cands.length) NC.lines.push(ncDefaultLine());
+  NC.selPart = 0;
   v.innerHTML =
     "<div class='head'><h2>New laser nest</h2>" +
-    "<button class='small' id='ncBack'>← Back to history</button></div>" +
-    "<div class='card nc' style='max-width:980px'>" +
-    "<h3 class='nc-sec'>Sheet information</h3>" +
-    "<div class='nc-grid'>" +
-      "<label>Units<input id='ncUnits' type='text' hidden value='in'>" +
-        "<select id='nc_units'>" +
-        "<option value='in' selected>Inches</option><option value='mm'>Millimetres</option></select></label>" +
-      "<label>Length<input id='nc_len' value='96' required></label>" +
-      "<label>Width<input id='nc_wid' value='48' required></label>" +
-      "<label>Grain direction<select id='nc_grain'>" +
-        "<option value='along_length' selected>Along length</option>" +
-        "<option value='along_width'>Along width</option>" +
-        "<option value='any'>Any</option></select></label>" +
-      "<label>Edge margin<input id='nc_margin' value='0.39'></label>" +
-      "<label>Spacing · horizontal<input id='nc_spx' value='0.2'></label>" +
-      "<label>Spacing · vertical<input id='nc_spy' value='0.2'></label>" +
-      "<label>Part source unit<select id='nc_punit'>" +
-        "<option value='auto' selected>Auto (file's declared units)</option>" +
-        "<option value='in'>Inches</option><option value='mm'>Millimetres</option></select></label>" +
-      "<label>Nest name<input id='nc_name' value='Laser nest " + new Date().toISOString().slice(0,10) + "'></label>" +
+    "<div class='nc-tabs'>" +
+    "<button class='nc-tab" + (NC.tab==="sheets"?" on":"") + "' id='ncTabSheetsBtn'>Sheets</button>" +
+    "<button class='nc-tab" + (NC.tab==="parts"?" on":"") + "' id='ncTabPartsBtn'>Parts</button>" +
     "</div>" +
-    "<h3 class='nc-sec nc-parts-title'>Parts</h3>" +
-    "<div class='nc-parts'>" + (NC.cands.length ? ncLinesHtml() :
-        "<div class='dim'>No sheet-metal parts found.</div>") + "</div>" +
-    (NC.cands.length ? "<button class='small' id='ncAdd'>+ Add part</button>" : "") +
+    "<div class='grow'></div>" +
+    "<label class='dim nc-namewrap'>Nest name <input id='nc_name' style='width:200px' value='Laser nest " + new Date().toISOString().slice(0,10) + "'></label>" +
+    "<button class='small' id='ncBack'>← Back</button></div>" +
+    "<div class='card nc'>" +
+    "<div id='ncSheetTab' style='" + (NC.tab==="sheets"?"":"display:none") + "'>" + ncSheetsHtml() + "</div>" +
+    "<div id='ncPartsTab' style='" + (NC.tab==="parts"?"":"display:none") + "'>" + ncPartsHtml() + "</div>" +
     "<div class='nc-foot'>" +
-      "<span class='dim'>Parts nest on the selected sheet; the laser receives millimetres.</span>" +
+      "<span class='dim'>Parts nest on the selected sheets; the laser receives millimetres.</span>" +
       "<div class='grow'></div>" +
       "<button class='primary' id='ncQueue'>Queue nest</button>" +
     "</div>" +
     "</div>";
+  $("ncTabSheetsBtn").onclick = () => ncSwitchTab("sheets");
+  $("ncTabPartsBtn").onclick = () => ncSwitchTab("parts");
   $("ncBack").onclick = () => { NC.active = false; go("laser-nests"); };
-  if (NC.cands.length) ncRebind();
   $("ncQueue").onclick = () => queueLaserNest();
+  ncBindSheets();
+  ncRebindParts();
+}
+function ncSwitchTab(tab){
+  NC.tab = tab;
+  $("ncSheetTab").style.display = tab === "sheets" ? "" : "none";
+  $("ncPartsTab").style.display = tab === "parts" ? "" : "none";
+  $("ncTabSheetsBtn").className = "nc-tab" + (tab === "sheets" ? " on" : "");
+  $("ncTabPartsBtn").className = "nc-tab" + (tab === "parts" ? " on" : "");
+  if (tab === "parts") attachThumbs($("ncPartsTab"));
 }
 
 async function queueLaserNest(){
   if (!NC.lines.length) return toast("Add at least one part", "err");
-  const lines = NC.lines.map(l => ({
-    item_id: l.item_id,
-    quantity: Math.max(1, l.quantity|0),
-    mirror: !!l.mirror,
-    allow_mirror: l.allow_mirror !== false,
-    grain: l.grain || "any",
-  }));
-  const pu = $("nc_punit").value;
+  if (NC.sheets.some(sh => !isFinite(num(sh.width)) || num(sh.width) <= 0 ||
+      !isFinite(num(sh.length)) || num(sh.length) <= 0))
+    return toast("Sheet width and length must be positive numbers", "err");
+  const mirrorMap = { original: [false, false], both: [false, true], mirror: [true, false] };
+  const lines = NC.lines.map(l => {
+    const mm = mirrorMap[l.mirror_mode] || [false, true];
+    return {
+      item_id: l.item_id,
+      quantity: Math.max(1, l.quantity | 0),
+      mirror: mm[0], allow_mirror: mm[1],
+      grain: l.grain || "any",
+      step_angle: l.step_angle || 90,
+      priority: l.priority || 1,
+      label: l.label || "",
+      use_bounding_box: !!l.use_bounding_box,
+      common_edge: !!l.common_edge,
+      min_qty: l.min_qty | 0,
+      filler_qty: l.filler_qty | 0,
+    };
+  });
   const body = {
     name: $("nc_name").value.trim() || "Laser nest",
-    units: $("nc_units").value,
-    stock_width_mm: num($("nc_wid").value),
-    stock_height_mm: num($("nc_len").value),
-    edge_margin_mm: num($("nc_margin").value),
-    spacing_x_mm: num($("nc_spx").value),
-    spacing_y_mm: num($("nc_spy").value),
-    grain_direction: $("nc_grain").value,
-    default_part_unit: pu !== "auto" ? pu : undefined,
+    units: NC.units,
+    stock_width_mm: num(NC.sheets[0].width),
+    stock_height_mm: num(NC.sheets[0].length),
+    sheets: NC.sheets.map(sh => ({
+      width_mm: num(sh.width),
+      length_mm: num(sh.length),
+      quantity: sh.asNeeded ? null : Math.max(1, sh.quantity | 0),
+    })),
+    edge_margin_mm: num(NC.margin),
+    spacing_x_mm: num(NC.spacingX),
+    spacing_y_mm: num(NC.spacingY),
+    grain_direction: NC.grain,
+    nesting_corner: NC.corner,
+    origin_x_mm: num(NC.originX),
+    origin_y_mm: num(NC.originY),
+    sheet_sheet_distance_mm: num(NC.ssd),
+    guillotine: NC.guillotine,
+    add_part_labels: NC.addLabels,
+    fill_direction: NC.fill,
+    auto_sheet_origins: NC.autoOrigins,
+    fill_all_sheets: NC.fillAll,
+    optimized_pairs: NC.optPairs,
+    default_part_unit: NC.partUnit !== "auto" ? NC.partUnit : undefined,
     parts: lines,
   };
-  if ([body.stock_width_mm, body.stock_height_mm].some(x => !isFinite(x) || x <= 0))
-    return toast("Length and width must be positive numbers", "err");
   try {
     const q = $("ncQueue"); q.disabled = true; q.textContent = "Queueing…";
     const pre = await api("POST", "/laser-nests/validate", body);
@@ -1145,7 +1475,7 @@ async function queueLaserNest(){
       return;
     }
     const r = await api("POST", "/laser-nests", body);
-    NC = { cands: [], lines: [], active: false };
+    NC = ncDefaultState();
     toast("Laser nest queued (" + r.nest.status + ")", "ok");
     go("laser-nests");
   } catch(e){ toast("Create failed: " + e.message, "err");
@@ -1153,11 +1483,14 @@ async function queueLaserNest(){
 }
 
 // Thin wrapper so the Items bulk action still works: it jumps to the Laser
-// Nests view and opens the create panel with those parts pre-added.
+// Nests view and opens the create panel (Parts tab) with those parts pre-added.
 function openLaserNestDialog(itemIds){
   if (!itemIds.length) return toast("Select one or more items first", "err");
-  NC = { cands: [], lines: itemIds.map(id => ({ item_id: id, quantity: 1,
-    mirror: false, allow_mirror: true, grain: "any" })), active: true };
+  NC = ncDefaultState();
+  NC.lines = itemIds.map(id => ({ item_id: id, quantity: 1, mirror_mode: "both",
+    grain: "any", step_angle: 90, priority: 1, label: "", use_bounding_box: false,
+    common_edge: false, min_qty: 0, filler_qty: 0 }));
+  NC.active = true; NC.tab = "parts"; NC.selPart = 0;
   go("laser-nests");
 }
 function num(s, d){ const n = parseFloat(s); return isFinite(n) ? n : (d === undefined ? NaN : d); }
@@ -1224,18 +1557,26 @@ async function toggleNestDetail(row){
       ? " · spacing " + Math.round(n.spacing_x_mm) + "×" + Math.round(n.spacing_y_mm) + " mm" : "";
     const grain = (n.grain_direction && n.grain_direction !== "any")
       ? " · grain " + n.grain_direction.replace("along_","") : "";
+    const corner = (n.nesting_corner && n.nesting_corner !== "lower_left")
+      ? " · " + n.nesting_corner.replace(/_/g," ") : "";
+    const defs = (n.sheet_defs && n.sheet_defs.length > 1)
+      ? " · sizes: " + n.sheet_defs.map(d2 => Math.round(d2.widthMm) + "×" + Math.round(d2.lengthMm) + "mm" +
+          (d2.quantity == null ? " (as needed)" : " ×" + d2.quantity)).join(", ") : "";
     const partLines = (det.parts||[]).map(p => {
       const tags = [];
       if (p.mirror) tags.push("mirrored");
       if (!p.allow_mirror) tags.push("no-flip");
       if (p.part_grain && p.part_grain !== "any") tags.push(p.part_grain.replace("along_","") + " grain");
+      if (p.step_angle && p.step_angle !== 90) tags.push(p.step_angle + "° steps");
+      if (p.use_bounding_box) tags.push("bbox");
+      if (p.label) tags.push("“" + p.label + "”");
       return "<div class='ln-partline'><b>" + esc(p.part_number) + "</b> ×" + p.quantity +
         (tags.length ? " <span class='dim'>(" + tags.join(", ") + ")</span>" : "") + "</div>";
     }).join("");
     box.innerHTML =
       "<div class='ln-meta dim'>" + (det.parts||[]).reduce((a,p)=>a+p.quantity,0) +
       " part(s) across " + det.parts.length + " line item(s) · " + sheets.length + " sheet(s)" +
-      spacing + grain + "</div>" +
+      spacing + grain + corner + defs + "</div>" +
       (partLines ? "<div class='ln-partlines dim'>" + partLines + "</div>" : "") +
       (sheets.length ? "<div class='ln-sheets'>" + sheets.map(s => sheetCard(n.id, s)).join("") + "</div>" :
         "<div class='dim'>No sheets yet " + (n.status === "completed" ? "(failed run)" : "(still " + n.status + ")") + ".</div>") +
@@ -3109,14 +3450,16 @@ function viewSystem(v){
 // ── settings (org part-number prefixes) ─────────────────────────────────
 async function viewSettings(v){
   const canEdit = isRole("admin");
-  const [d, gp, mail, osh, proj, preview] = await Promise.all([
+  const [d, gp, mail, osh, proj, preview, nestDef] = await Promise.all([
     api("GET", "/settings/part-number-prefixes").catch(() => ({ prefixes: [] })),
     api("GET", "/settings/gpu-policy").catch(() => ({ gpu_policy: "auto" })),
     api("GET", "/settings/mail").catch(() => ({})),
     api("GET", "/settings/onshape").catch(() => ({})),
     api("GET", "/projects").catch(() => ({ projects: [] })),
-    api("GET", "/settings/preview-style").catch(() => ({preview_style:"transparent"}))
+    api("GET", "/settings/preview-style").catch(() => ({preview_style:"transparent"})),
+    api("GET", "/settings/nest-defaults").catch(() => ({ defaults: null }))
   ]);
+  const nd = nestDef.defaults || {};
   const prefixes = d.prefixes || [];
   const gpuPolicy = gp.gpu_policy || "auto";
   v.innerHTML =
@@ -3167,6 +3510,30 @@ async function viewSettings(v){
     "</div>" +
     (canEdit ? "<div class='row' style='margin-top:10px'><button id='os-save' class='primary'>Save Onshape</button>" +
       "<span class='dim'>" + (osh.configured ? "configured" : "not configured") + "</span></div>" : "") +
+    "</div>" +
+    "<h2 class='sec'>Laser nesting defaults</h2>" +
+    "<div class='card'><p class='dim'>Pre-fills the New laser nest panel. Blank fields keep the panel's built-in default. " +
+    "Units of measure applies to the sheet/part dimensional fields.</p>" +
+    "<div class='grid2'>" +
+      "<div class='modal-field'><label>Units of measure</label><select id='nd-units'" + (canEdit?"":" disabled") + ">" +
+        ["in","mm"].map(u => "<option value='"+u+"' " + (nd.units===u?"selected":"") + ">" + (u==="in"?"Inches":"Millimetres") + "</option>").join("") + "</select></div>" +
+      "<div class='modal-field'><label>Part source unit</label><select id='nd-punit'" + (canEdit?"":" disabled") + ">" +
+        ["auto","in","mm"].map(u => "<option value='"+u+"' " + (nd.partUnit===u?"selected":"") + ">" + (u==="auto"?"Auto (file units)":u==="in"?"Inches":"Millimetres") + "</option>").join("") + "</select></div>" +
+      "<div class='modal-field'><label>Sheet width</label><input id='nd-width' value='" + esc(String(nd.width ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
+      "<div class='modal-field'><label>Sheet length</label><input id='nd-length' value='" + esc(String(nd.length ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
+      "<div class='modal-field'><label>Sheet margin</label><input id='nd-margin' value='" + esc(String(nd.margin ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
+      "<div class='modal-field'><label>Part spacing (H)</label><input id='nd-spx' value='" + esc(String(nd.spacingX ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
+      "<div class='modal-field'><label>Part spacing (V)</label><input id='nd-spy' value='" + esc(String(nd.spacingY ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
+      "<div class='modal-field'><label>Grain direction</label><select id='nd-grain'" + (canEdit?"":" disabled") + ">" +
+        [["along_length","Vertical"],["along_width","Horizontal"],["any","Ignore"]].map(([u,l]) =>
+          "<option value='"+u+"' " + (nd.grainDirection===u?"selected":"") + ">" + l + "</option>").join("") + "</select></div>" +
+      "<div class='modal-field'><label>Nesting corner</label><select id='nd-corner'" + (canEdit?"":" disabled") + ">" +
+        [["lower_left","Lower Left"],["lower_right","Lower Right"],["upper_left","Upper Left"],["upper_right","Upper Right"]].map(([u,l]) =>
+          "<option value='"+u+"' " + (nd.nestingCorner===u?"selected":"") + ">" + l + "</option>").join("") + "</select></div>" +
+      "<div class='modal-field'><label><input id='nd-gull' type='checkbox'" + (nd.guillotine?" checked":"") + (canEdit?"":" disabled") + "> Guillotine cut</label></div>" +
+      "<div class='modal-field'><label><input id='nd-labels' type='checkbox'" + (nd.addPartLabels?" checked":"") + (canEdit?"":" disabled") + "> Add part labels</label></div>" +
+    "</div>" +
+    (canEdit ? "<div class='row' style='margin-top:10px'><button id='nd-save' class='primary'>Save nesting defaults</button></div>" : "") +
     "</div>" +
     "<div class='head'><h2 class='sec' style='margin:0'>Part-number prefixes</h2>" +
     "<div class='grow'></div>" +
@@ -3228,6 +3595,27 @@ async function viewSettings(v){
       toast("Onshape API saved", "ok");
       render(false);
     } catch(e){ toast("Onshape: " + e.message, "err"); }
+  };
+  const ndSave = $("nd-save");
+  if (ndSave) ndSave.onclick = async () => {
+    const numOr = id => { const n = num($(id).value); return isFinite(n) ? n : null; };
+    try {
+      await api("PUT", "/settings/nest-defaults", {
+        units: $("nd-units").value,
+        part_unit: $("nd-punit").value,
+        width: numOr("nd-width"),
+        length: numOr("nd-length"),
+        margin: numOr("nd-margin"),
+        spacingX: numOr("nd-spx"),
+        spacingY: numOr("nd-spy"),
+        grainDirection: $("nd-grain").value,
+        nestingCorner: $("nd-corner").value,
+        guillotine: $("nd-gull").checked,
+        addPartLabels: $("nd-labels").checked,
+      });
+      toast("Nesting defaults saved", "ok");
+      render(false);
+    } catch(e){ toast("Nesting defaults: " + e.message, "err"); }
   };
 }
 function prefixTable(prefixes, canEdit){

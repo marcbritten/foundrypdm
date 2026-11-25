@@ -469,6 +469,36 @@ impl Default for DutchmanSettings {
     }
 }
 
+/// The org's saved defaults for the laser-nest create panel. Every field is
+/// optional so a partial set pre-fills only what was saved.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestDefaults {
+    /// Unit of measure for the sheet/part dimensional fields ("in" | "mm").
+    #[serde(default)]
+    pub units: Option<String>,
+    #[serde(default)]
+    pub length: Option<f64>,
+    #[serde(default)]
+    pub width: Option<f64>,
+    #[serde(default)]
+    pub margin: Option<f64>,
+    #[serde(default)]
+    pub spacing_x: Option<f64>,
+    #[serde(default)]
+    pub spacing_y: Option<f64>,
+    #[serde(default)]
+    pub grain_direction: Option<String>,
+    #[serde(default)]
+    pub nesting_corner: Option<String>,
+    #[serde(default)]
+    pub guillotine: Option<bool>,
+    #[serde(default)]
+    pub add_part_labels: Option<bool>,
+    #[serde(default)]
+    pub part_unit: Option<String>,
+}
+
 impl DutchmanSettings {
     /// Reject values the CLI would refuse or the update logic cannot reason about.
     pub fn validate(&self) -> Result<(), PdmError> {
@@ -890,6 +920,17 @@ pub struct FlatPatternArtifact {
     pub created_at: DateTime<Utc>,
 }
 
+/// One sheet-size definition within a nesting run. The worker works through
+/// definitions in order, filling each up to its quantity.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetDef {
+    pub width_mm: f64,
+    pub length_mm: f64,
+    /// How many physical sheets of this size to use; `None` = as many as needed.
+    pub quantity: Option<i32>,
+}
+
 /// A laser nesting run (settings snapshot + status).
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct LaserNest {
@@ -912,6 +953,23 @@ pub struct LaserNest {
     pub spacing_y_mm: f64,
     /// Sheet grain direction: "along_length" | "along_width" | "any".
     pub grain_direction: String,
+    /// Which corner the fill starts from.
+    pub nesting_corner: String,
+    /// Nesting origin offset from the stock lower-left corner, mm.
+    pub origin_x_mm: f64,
+    pub origin_y_mm: f64,
+    /// Reference gap between sheets (mm), for the manifest/package.
+    pub sheet_sheet_distance_mm: f64,
+    /// Request a guillotine-cuttable layout.
+    pub guillotine: bool,
+    /// Draw part labels on the sheet DXF + preview.
+    pub add_part_labels: bool,
+    pub fill_direction: String,
+    pub auto_sheet_origins: bool,
+    pub fill_all_sheets: bool,
+    pub optimized_pairs: bool,
+    /// Sheet-size definitions in order; empty = single legacy stock size.
+    pub sheet_defs: sqlx::types::Json<Vec<SheetDef>>,
     pub chord_tol_mm: f64,
     pub join_tol_mm: f64,
     /// Default source unit for parts whose DXF declares no `$INSUNITS`
@@ -960,6 +1018,18 @@ pub struct LaserNestPart {
     pub part_grain: String,
     /// Stable line order (the part_index used by placements).
     pub ordinal: i32,
+    /// Rotation increment in degrees (90 => 0/90/180/270, 45 => 8, 180 => 0/180).
+    pub step_angle: f64,
+    /// Nesting priority (lower number placed first).
+    pub priority: i32,
+    /// Part label drawn when the nest has add_part_labels on.
+    pub label: String,
+    /// Nest by the part's bounding box instead of its outline.
+    pub use_bounding_box: bool,
+    /// Request common-edge alignment.
+    pub common_edge: bool,
+    pub min_qty: i32,
+    pub filler_qty: i32,
 }
 
 /// A produced sheet and its output blobs.

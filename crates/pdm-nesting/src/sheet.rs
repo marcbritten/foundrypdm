@@ -2,12 +2,11 @@
 //! the layout independently of the solver, render stock-space geometry, and
 //! export DXF.
 
-use crate::GrainDir;
-use crate::NestConfig;
 use crate::dxf;
 use crate::geom::{BBox, Point, Transform};
 use crate::part::Part;
 use crate::solver::{Placed, SolverSolution};
+use crate::{GrainDir, NestConfig, NestingCorner};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -34,7 +33,7 @@ const LAYOUT_SAFETY: f64 = 1.0;
 pub struct StockMapping {
     /// Solver `min_item_separation` (isotropic epsilon: 2·chord_tol + eps).
     pub separation: f64,
-    /// Strip<->stock translation offset.
+    /// Strip<->stock translation offset (includes the nesting origin).
     pub offset: Point,
     /// Solver `strip_height`.
     pub strip_height: f64,
@@ -42,6 +41,8 @@ pub struct StockMapping {
     pub gap_x: f64,
     /// Required vertical spacing between parts (nominal).
     pub gap_y: f64,
+    /// Which corner the fill starts from.
+    pub corner: NestingCorner,
 }
 
 impl StockMapping {
@@ -58,10 +59,11 @@ impl StockMapping {
         // outline; the true part bulges up to `chord_tol` outside the
         // tessellation; and the solver's rotated edge-inset can under-shoot by
         // up to ~LAYOUT_SAFETY. offset = M - m + c + safety puts the true
-        // boundary at >= M for all shapes and rotations.
+        // boundary at >= M for all shapes and rotations. The nesting origin
+        // shifts the whole layout.
         let m = cfg.gap_x.max(cfg.gap_y) / 2.0;
         let inset = margin - m + cfg.chord_tol + LAYOUT_SAFETY;
-        let offset = Point::new(inset, inset);
+        let offset = Point::new(inset + cfg.origin.x, inset + cfg.origin.y);
         let strip_height = cfg.stock_height - 2.0 * offset.y;
         if strip_height <= 0.0 {
             return Err(SheetError::Mapping("strip height non-positive".into()));
@@ -72,6 +74,7 @@ impl StockMapping {
             strip_height,
             gap_x: cfg.gap_x,
             gap_y: cfg.gap_y,
+            corner: cfg.nesting_corner,
         })
     }
 
@@ -80,6 +83,37 @@ impl StockMapping {
     pub fn solver_outline(&self, part: &crate::part::Part) -> Vec<Point> {
         let m = self.gap_x.max(self.gap_y) / 2.0;
         crate::part::dilate_box(&part.outer.points, m, m)
+    }
+
+    /// The whole-layout flip that moves the (lower-left fill) layout to the
+    /// requested nesting corner. The identity for the lower-left corner.
+    ///
+    /// Note: upper-right is a 180° *rotation* about the stock center
+    /// ((w−x, h−y), proper — not a reflection); the single-axis corners are
+    /// reflections.
+    pub fn corner_transform(&self, cfg: &NestConfig) -> Transform {
+        let (w, h) = (cfg.stock_width, cfg.stock_height);
+        match self.corner {
+            NestingCorner::LowerLeft => Transform::identity(),
+            NestingCorner::LowerRight => Transform {
+                reflected: true,
+                rotation_deg: 180.0,
+                tx: w,
+                ty: 0.0,
+            },
+            NestingCorner::UpperLeft => Transform {
+                reflected: true,
+                rotation_deg: 0.0,
+                tx: 0.0,
+                ty: h,
+            },
+            NestingCorner::UpperRight => Transform {
+                reflected: false,
+                rotation_deg: 180.0,
+                tx: w,
+                ty: h,
+            },
+        }
     }
 }
 
@@ -165,6 +199,13 @@ pub fn build_sheet(
             return Err(SheetError::UnknownItem(p.item_id));
         }
         let t = solver_to_stock(p, mapping.offset);
+        // Move the whole layout to the requested nesting corner (identity for
+        // lower-left; a global flip otherwise, preserving relative orientation).
+        let t = if mapping.corner == NestingCorner::LowerLeft {
+            t
+        } else {
+            t.then(mapping.corner_transform(cfg))
+        };
         placed.push((part, copy, t));
     }
     for (i, &want) in item_ids.iter().enumerate() {
@@ -235,9 +276,19 @@ pub fn build_sheet(
         }
     }
 
-    // Strip width sanity: the solver's used width plus the offset must leave the
-    // right margin.
-    if mapping.offset.x + solution.strip_width > w + eps {
+    // Strip width sanity: the used width must fit the stock on the fill side.
+    // For a horizontally-flipped corner the strip grows leftward from
+    // (w - offset.x), so it overflows when it is wider than that span.
+    let flipped_x = matches!(
+        mapping.corner,
+        NestingCorner::LowerRight | NestingCorner::UpperRight
+    );
+    let over = if flipped_x {
+        solution.strip_width - (w - mapping.offset.x)
+    } else {
+        mapping.offset.x + solution.strip_width - w
+    };
+    if over > eps {
         return Err(SheetError::StripTooWide(solution.strip_width));
     }
 
@@ -490,15 +541,45 @@ fn orient_arc(start: f64, end: f64, mid: f64) -> (f64, f64, bool) {
 }
 
 /// Render the full sheet as a DXF string (mm, $INSUNITS=4) with a stock outline.
-pub fn export_sheet_dxf(layout: &SheetLayout, parts: &[Part], cfg: &NestConfig) -> String {
-    let prims = sheet_primitives(layout, parts);
+pub fn export_sheet_dxf(
+    layout: &SheetLayout,
+    parts: &[Part],
+    labels: &[String],
+    cfg: &NestConfig,
+) -> String {
+    let mut prims = sheet_primitives(layout, parts);
+    // Optional part labels (text, not cutting geometry).
+    if cfg.add_part_labels {
+        for pl in &layout.placements {
+            let part = &parts[pl.part_index];
+            let text = labels
+                .get(pl.part_index)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| label_for(pl));
+            let c = pl
+                .transform
+                .apply(crate::geom::centroid(&part.outer.points));
+            prims.push(dxf::Primitive::Text {
+                layer: "LABELS".into(),
+                pos: c,
+                height: 3.0,
+                content: text,
+            });
+        }
+    }
     dxf::write(&prims, Some((cfg.stock_width, cfg.stock_height)), "STOCK")
 }
 
 /// Render the sheet as a preview SVG: stock outline, nominal outer contours,
 /// holes (dashed), and a per-copy label. Labels and the stock border are drawn
 /// as overlays (not cutting geometry).
-pub fn export_sheet_svg(layout: &SheetLayout, parts: &[Part], cfg: &NestConfig) -> String {
+pub fn export_sheet_svg(
+    layout: &SheetLayout,
+    parts: &[Part],
+    labels: &[String],
+    cfg: &NestConfig,
+) -> String {
     let w = cfg.stock_width;
     let h = cfg.stock_height;
     let pad = 8.0;
@@ -568,15 +649,20 @@ pub fn export_sheet_svg(layout: &SheetLayout, parts: &[Part], cfg: &NestConfig) 
                 pts
             ));
         }
-        // Label at the part centroid.
+        // Label at the part centroid (the line's label when set, else P#-C#).
         let c = pl
             .transform
             .apply(crate::geom::centroid(&part.outer.points));
+        let text = labels
+            .get(pl.part_index)
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| label_for(pl));
         s.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" fill=\"#333\" text-anchor=\"middle\">{}</text>\n",
             c.x,
             c.y,
-            label_for(pl)
+            text
         ));
     }
     s.push_str("</svg>\n");
@@ -585,6 +671,64 @@ pub fn export_sheet_svg(layout: &SheetLayout, parts: &[Part], cfg: &NestConfig) 
 
 fn label_for(pl: &SheetPlacement) -> String {
     format!("P{}-C{}", pl.part_index + 1, pl.copy_index + 1)
+}
+
+/// Render the assembled parts (untransformed, local coordinates) as a preview
+/// SVG: outer profile (green), holes (red, dashed), marks (grey). Used for the
+/// flat-pattern thumbnails in the nest part picker.
+pub fn render_parts_preview(parts: &[Part], width: f64, height: f64) -> String {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for p in parts {
+        min_x = min_x.min(p.outer.bbox.min_x);
+        min_y = min_y.min(p.outer.bbox.min_y);
+        max_x = max_x.max(p.outer.bbox.max_x);
+        max_y = max_y.max(p.outer.bbox.max_y);
+    }
+    if !min_x.is_finite() {
+        return format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width:.0} {height:.0}\"><rect width=\"{width:.0}\" height=\"{height:.0}\" fill=\"#111\"/></svg>"
+        );
+    }
+    let span_x = (max_x - min_x).max(1e-6);
+    let span_y = (max_y - min_y).max(1e-6);
+    let pad = 12.0;
+    let scale = ((width - 2.0 * pad) / span_x).min((height - 2.0 * pad) / span_y);
+    let ox = pad + (width - 2.0 * pad - span_x * scale) / 2.0 - min_x * scale;
+    let oy = pad + (height - 2.0 * pad - span_y * scale) / 2.0 + min_y * scale;
+    let tr = |p: &Point| format!("{:.2},{:.2}", p.x * scale + ox, height - (p.y * scale + oy));
+    let mut s = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width:.0} {height:.0}\">
+         <rect width=\"{width:.0}\" height=\"{height:.0}\" fill=\"#111\"/>"
+    );
+    for p in parts {
+        // Outer profile.
+        let pts: Vec<String> = p.outer.points.iter().map(&tr).collect();
+        s.push_str(&format!(
+            "<polygon points=\"{}\" fill=\"none\" stroke=\"#3c3\" stroke-width=\"1.5\"/>",
+            pts.join(" ")
+        ));
+        // Holes.
+        for h in &p.holes {
+            let hpts: Vec<String> = h.points.iter().map(&tr).collect();
+            s.push_str(&format!(
+                "<polygon points=\"{}\" fill=\"none\" stroke=\"#c33\" stroke-width=\"1\" stroke-dasharray=\"3,2\"/>",
+                hpts.join(" ")
+            ));
+        }
+        // Marks.
+        for m in &p.marks {
+            let mpts: Vec<String> = m.points.iter().map(&tr).collect();
+            s.push_str(&format!(
+                "<polyline points=\"{}\" fill=\"none\" stroke=\"#888\" stroke-width=\"1\"/>",
+                mpts.join(" ")
+            ));
+        }
+    }
+    s.push_str("</svg>");
+    s
 }
 
 /// Convenience: the part's nominal outer polygon in its local (untransformed)
@@ -734,10 +878,81 @@ mod tests {
             }],
         };
         let layout = build_sheet(&solution, &ids, &parts, &cfg, &mapping).unwrap();
-        let dxf_text = export_sheet_dxf(&layout, &parts, &cfg);
+        let dxf_text = export_sheet_dxf(&layout, &parts, &[], &cfg);
         let parsed = dxf::parse(&dxf_text).unwrap();
         assert_eq!(parsed.units, dxf::Unit::Mm);
         // stock + one part outline (4 edges) -> >= 5 primitives.
         assert!(parsed.primitives.len() >= 5);
+    }
+
+    #[test]
+    fn corner_transform_flips_to_requested_corner() {
+        let cfg = NestConfig {
+            stock_width: 100.0,
+            stock_height: 200.0,
+            ..Default::default()
+        };
+        let map = |c: crate::NestingCorner| StockMapping {
+            separation: 0.0,
+            offset: Point::new(0.0, 0.0),
+            strip_height: 100.0,
+            gap_x: 0.0,
+            gap_y: 0.0,
+            corner: c,
+        };
+        // Upper-right is a 180° rotation about the stock center: interior
+        // points must map to (100−x, 200−y), not (100−x, 200+y).
+        let ur = map(crate::NestingCorner::UpperRight);
+        let p = ur.corner_transform(&cfg).apply(Point::new(20.0, 50.0));
+        assert!((p.x - 80.0).abs() < 1e-6 && (p.y - 150.0).abs() < 1e-6);
+        // Lower-right mirrors x only; upper-left mirrors y only.
+        let lr = map(crate::NestingCorner::LowerRight)
+            .corner_transform(&cfg)
+            .apply(Point::new(20.0, 50.0));
+        assert!((lr.x - 80.0).abs() < 1e-6 && (lr.y - 50.0).abs() < 1e-6);
+        let ul = map(crate::NestingCorner::UpperLeft)
+            .corner_transform(&cfg)
+            .apply(Point::new(20.0, 50.0));
+        assert!((ul.x - 20.0).abs() < 1e-6 && (ul.y - 150.0).abs() < 1e-6);
+        // The lower-left corner stays the identity.
+        let ll = map(crate::NestingCorner::LowerLeft)
+            .corner_transform(&cfg)
+            .apply(Point::new(3.0, 4.0));
+        assert!((ll.x - 3.0).abs() < 1e-6 && (ll.y - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn add_part_labels_writes_text() {
+        let part = square_part();
+        let parts = vec![part];
+        let cfg = NestConfig {
+            stock_width: 100.0,
+            stock_height: 100.0,
+            edge_margin: 10.0,
+            gap_x: 5.0,
+            gap_y: 5.0,
+            chord_tol: 0.05,
+            add_part_labels: true,
+            ..Default::default()
+        };
+        let mapping = StockMapping::from_config(&cfg).unwrap();
+        let ids = assign_item_ids(&[CopyRef { part: 0, copy: 0 }]);
+        let solution = SolverSolution {
+            strip_width: 30.0,
+            placed: vec![Placed {
+                item_id: ids[0],
+                reflected: false,
+                rotation_deg: 0.0,
+                translation: [10.0, 10.0],
+            }],
+        };
+        let layout = build_sheet(&solution, &ids, &parts, &cfg, &mapping).unwrap();
+        let dxf_text = export_sheet_dxf(&layout, &parts, &["BRK".to_string()], &cfg);
+        let parsed = dxf::parse(&dxf_text).unwrap();
+        let has_label = parsed
+            .primitives
+            .iter()
+            .any(|p| matches!(p, dxf::Primitive::Text { layer, content, .. } if layer == "LABELS" && content == "BRK"));
+        assert!(has_label, "expected a LABELS text primitive");
     }
 }

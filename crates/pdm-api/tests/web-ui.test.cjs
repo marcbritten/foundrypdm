@@ -412,41 +412,54 @@ test("new part in SolidCraft web creates nothing when the modal is cancelled", a
 test("items bulk action opens the nest create panel with the parts preselected", async () => {
   const context = loadFunctions(["openLaserNestDialog"], {
     NC: { cands: [], lines: [], active: false },
-    go(name, extra){ context.__route = { name, extra }; },
+    ncDefaultState: () => ({ cands: [], lines: [], active: false, tab: "sheets", selPart: 0,
+      sheet: {}, parts: {}, partUnit: "auto" }),
+    go(name){ context.__route = { name }; },
     toast(){},
   });
   context.openLaserNestDialog(["a", "b"]);
   assert.equal(context.__route.name, "laser-nests");
   assert.equal(context.NC.active, true, "panel marked active");
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(context.NC.lines)),
-    [
-      { item_id: "a", quantity: 1, mirror: false, allow_mirror: true, grain: "any" },
-      { item_id: "b", quantity: 1, mirror: false, allow_mirror: true, grain: "any" },
-    ],
-    "each selected item becomes a part line"
-  );
+  assert.equal(context.NC.tab, "parts", "jumps to the Parts tab");
+  const lines = JSON.parse(JSON.stringify(context.NC.lines));
+  assert.equal(lines.length, 2, "each selected item becomes a part line");
+  assert.equal(lines[0].item_id, "a");
+  assert.equal(lines[1].item_id, "b");
+  assert.equal(lines[0].mirror_mode, "both", "default mirror mode is 'both'");
 });
 
-test("nest create panel carries per-line qty/mirror/grain + sheet info into the body", async () => {
+test("nest create panel carries per-line + sheet options into the body", async () => {
   const calls = [];
   const input = v => ({ value: v, trim(){ return this.value; }, checked: false });
   const doc = {
     getElementById(id){
-      return ({
-        nc_name: input("Nest X"), nc_units: input("in"), nc_wid: input("48"),
-        nc_len: input("96"), nc_margin: input("0.39"), nc_spx: input("0.2"),
-        nc_spy: input("0.15"), nc_grain: input("along_length"), nc_punit: input("auto"),
-        ncQueue: { disabled: false, textContent: "" },
-      })[id] || input("");
+      return ({ nc_name: input("Nest X"), ncQueue: { disabled: false, textContent: "" } })[id]
+        || input("");
     },
   };
   const context = loadFunctions(["queueLaserNest", "num"], {
-    // Panel state: two lines (same item twice is allowed) with the options set.
-    NC: { cands: [], lines: [
-      { item_id: "a", quantity: 7, mirror: true,  allow_mirror: true,  grain: "along_width"  },
-      { item_id: "a", quantity: 3, mirror: false, allow_mirror: false, grain: "any"          },
-    ] },
+    // Panel state: two lines (same item twice is allowed) + multi-sheet defs
+    // + sheet/part options in the flat NC shape.
+    NC: {
+      cands: [],
+      lines: [
+        { item_id: "a", quantity: 7, mirror_mode: "mirror", grain: "along_width",
+          step_angle: 45, priority: 2, label: "P1", use_bounding_box: true,
+          common_edge: false, min_qty: 1, filler_qty: 0 },
+        { item_id: "a", quantity: 3, mirror_mode: "original", grain: "any",
+          step_angle: 90, priority: 1, label: "", use_bounding_box: false,
+          common_edge: true, min_qty: 0, filler_qty: 2 },
+      ],
+      units: "in",
+      sheets: [
+        { width: 48, length: 96, asNeeded: false, quantity: 2 },
+        { width: 24, length: 48, asNeeded: true, quantity: 1 },
+      ],
+      margin: 0.39, grain: "along_length", corner: "upper_left", fill: "lr",
+      guillotine: true, autoOrigins: true, ssd: 1, originX: 0, originY: 0,
+      spacingX: 0.2, spacingY: 0.15, addLabels: true, optPairs: false, fillAll: false,
+      partUnit: "in",
+    },
     document: doc,
     $: id => doc.getElementById(id),
     api: async (method, url, body) => {
@@ -455,27 +468,46 @@ test("nest create panel carries per-line qty/mirror/grain + sheet info into the 
       if (url === "/laser-nests") return { nest: { status: "queued" } };
       return {};
     },
-    toast(){}, go(){},
+    toast(){}, go(){}, ncDefaultState(){ return context.NC; },
   });
   await context.queueLaserNest();
   const create = calls.find(c => c[0] === "POST" && c[1] === "/laser-nests");
   assert.ok(create, "create was called");
   const b = create[2];
-  // Both lines preserved, including the duplicate item, with their options.
+  // Mirror modes map to mirror/allow_mirror.
   assert.equal(
     JSON.stringify(b.parts),
     JSON.stringify([
-      { item_id: "a", quantity: 7, mirror: true,  allow_mirror: true,  grain: "along_width" },
-      { item_id: "a", quantity: 3, mirror: false, allow_mirror: false, grain: "any" },
+      { item_id: "a", quantity: 7, mirror: true,  allow_mirror: false, grain: "along_width",
+        step_angle: 45, priority: 2, label: "P1", use_bounding_box: true,
+        common_edge: false, min_qty: 1, filler_qty: 0 },
+      { item_id: "a", quantity: 3, mirror: false, allow_mirror: false, grain: "any",
+        step_angle: 90, priority: 1, label: "", use_bounding_box: false,
+        common_edge: true, min_qty: 0, filler_qty: 2 },
     ])
   );
-  // Sheet info: directional spacing + grain + inches. Dimensions are sent in
-  // the chosen unit (the server converts to mm).
+  // Sheet options: directional spacing, grain, corner, origin, guillotine, labels.
   assert.equal(b.units, "in");
   assert.equal(b.stock_width_mm, 48, "width sent in the chosen unit");
   assert.equal(b.stock_height_mm, 96, "length sent in the chosen unit");
   assert.equal(b.grain_direction, "along_length");
   assert.equal(b.spacing_x_mm, 0.2, "horizontal spacing");
   assert.equal(b.spacing_y_mm, 0.15, "vertical spacing");
-  assert.equal(b.default_part_unit, undefined, "auto part unit is omitted");
+  assert.equal(b.nesting_corner, "upper_left");
+  assert.equal(b.origin_x_mm, 0);
+  assert.equal(b.sheet_sheet_distance_mm, 1);
+  assert.equal(b.guillotine, true);
+  assert.equal(b.add_part_labels, true);
+  assert.equal(b.fill_direction, "lr");
+  assert.equal(b.default_part_unit, "in", "non-auto part unit sent");
+  // Multiple sheet-size definitions, in the chosen unit, with quantities.
+  assert.equal(
+    JSON.stringify(b.sheets),
+    JSON.stringify([
+      { width_mm: 48, length_mm: 96, quantity: 2 },
+      { width_mm: 24, length_mm: 48, quantity: null },
+    ])
+  );
+  assert.equal(b.stock_width_mm, 48, "primary sheet = first definition");
+  assert.equal(b.stock_height_mm, 96);
 });

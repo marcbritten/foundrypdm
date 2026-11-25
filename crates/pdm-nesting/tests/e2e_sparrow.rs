@@ -86,12 +86,20 @@ fn e2e_sparrow_nests_and_exports() {
             quantity: 2,
             allow_mirror: false,
             grain: pdm_nesting::GrainDir::Any,
+            step_angle: 90.0,
+            priority: 1,
+            use_bounding_box: false,
+            label: String::new(),
         },
         batch::NestLine {
             part: 1,
             quantity: 3,
             allow_mirror: false,
             grain: pdm_nesting::GrainDir::Any,
+            step_angle: 90.0,
+            priority: 1,
+            use_bounding_box: false,
+            label: String::new(),
         },
     ];
 
@@ -164,7 +172,7 @@ fn e2e_sparrow_nests_and_exports() {
     assert_eq!(layout.placements.len(), 5);
 
     // Export + re-parse: verify a known dimension survives (part A width = 60).
-    let dxf_text = sheet::export_sheet_dxf(&layout, &parts, &cfg);
+    let dxf_text = sheet::export_sheet_dxf(&layout, &parts, &[], &cfg);
     let parsed = dxf::parse(&dxf_text).expect("exported dxf parses");
     assert_eq!(parsed.units, dxf::Unit::Mm);
     // The stock outline is a 300x200 polyline.
