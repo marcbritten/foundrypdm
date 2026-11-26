@@ -4935,8 +4935,10 @@ pub struct NestPartReq {
     /// Use a mirror of the original geometry for this line (default false).
     #[serde(default)]
     pub mirror: bool,
-    /// Allow the solver to flip copies of this line (default true).
-    #[serde(default = "default_true")]
+    /// Allow the solver to flip copies of this line (default false). A flipped copy is cut with
+    /// the sheet's bottom face up, which is wrong for sheet with one good face, so flipping is
+    /// something a line asks for.
+    #[serde(default)]
     pub allow_mirror: bool,
     /// This part's grain preference: "along_length" | "along_width" | "any"
     /// (default "any"). Drives rotation restriction with the sheet grain.

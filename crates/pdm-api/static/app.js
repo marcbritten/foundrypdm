@@ -1024,7 +1024,7 @@ function ncApplyDefaults(d){
 }
 
 function ncDefaultLine(){
-  return { item_id: NC.cands[0] ? NC.cands[0].id : "", quantity:1, mirror_mode:"both",
+  return { item_id: NC.cands[0] ? NC.cands[0].id : "", quantity:1, mirror_mode:"original",
     grain:"any", step_angle:90, priority:1, label:"", use_bounding_box:false,
     common_edge:false, min_qty:0, filler_qty:0 };
 }
@@ -1059,7 +1059,9 @@ const NC_CORNER = [["lower_left","Lower Left"],["lower_right","Lower Right"],
 const NC_FILL = [["auto","Calculate"],["lr","Left → Right"],["rl","Right → Left"],
   ["tb","Top → Bottom"],["bt","Bottom → Top"]];
 const NC_PART_GRAIN = [["any","Ignore"],["along_length","Along length"],["along_width","Across"]];
-const NC_MIRROR = [["both","Both"],["original","Original Only (do not mirror)"],["mirror","Mirror Only"]];
+// "Original Only" is the default: a flipped copy is cut with the sheet's bottom face up, which
+// is wrong for sheet with one good face (brushed, coated, film-protected, laminated, veneered).
+const NC_MIRROR = [["original","Original Only (do not mirror)"],["both","Both"],["mirror","Mirror Only"]];
 const NC_STEP = [[90,"90°"],[45,"45°"],[30,"30°"],[180,"180°"]];
 
 // ── previews ─────────────────────────────────────────────────────────────
@@ -1235,7 +1237,7 @@ function ncPartListHtml(){
   return NC.lines.map((l, i) =>
     "<div class='nc-partrow" + (i===NC.selPart?" sel":"") + "' data-i='"+i+"'>" +
     "<b>" + esc(ncPartName(l.item_id)) + "</b> ×" + l.quantity +
-    (l.mirror_mode!=="both" ? " · " + ({original:"no-mirror",mirror:"mirror-only"}[l.mirror_mode]) : "") +
+    (l.mirror_mode && l.mirror_mode!=="original" ? " · " + ({both:"flips allowed",mirror:"mirror-only"}[l.mirror_mode]) : "") +
     " <span class='nc-rmline' data-i='"+i+"' title='Remove this line'>×</span>" +
     "</div>").join("");
 }
@@ -1303,7 +1305,7 @@ function ncRebindParts(){
     const picked = [...document.querySelectorAll(".nc-pick:checked")].map(c => c.value);
     if (!picked.length) return toast("Tick one or more parts first", "err");
     picked.forEach(id => {
-      NC.lines.push({ item_id: id, quantity: 1, mirror_mode: "both", grain: "any",
+      NC.lines.push({ item_id: id, quantity: 1, mirror_mode: "original", grain: "any",
         step_angle: 90, priority: 1, label: "", use_bounding_box: false,
         common_edge: false, min_qty: 0, filler_qty: 0 });
     });
@@ -1421,7 +1423,7 @@ async function queueLaserNest(){
     return toast("Sheet width and length must be positive numbers", "err");
   const mirrorMap = { original: [false, false], both: [false, true], mirror: [true, false] };
   const lines = NC.lines.map(l => {
-    const mm = mirrorMap[l.mirror_mode] || [false, true];
+    const mm = mirrorMap[l.mirror_mode] || [false, false];
     return {
       item_id: l.item_id,
       quantity: Math.max(1, l.quantity | 0),
@@ -1487,7 +1489,7 @@ async function queueLaserNest(){
 function openLaserNestDialog(itemIds){
   if (!itemIds.length) return toast("Select one or more items first", "err");
   NC = ncDefaultState();
-  NC.lines = itemIds.map(id => ({ item_id: id, quantity: 1, mirror_mode: "both",
+  NC.lines = itemIds.map(id => ({ item_id: id, quantity: 1, mirror_mode: "original",
     grain: "any", step_angle: 90, priority: 1, label: "", use_bounding_box: false,
     common_edge: false, min_qty: 0, filler_qty: 0 }));
   NC.active = true; NC.tab = "parts"; NC.selPart = 0;
@@ -1565,7 +1567,7 @@ async function toggleNestDetail(row){
     const partLines = (det.parts||[]).map(p => {
       const tags = [];
       if (p.mirror) tags.push("mirrored");
-      if (!p.allow_mirror) tags.push("no-flip");
+      if (p.allow_mirror) tags.push("flips allowed");
       if (p.part_grain && p.part_grain !== "any") tags.push(p.part_grain.replace("along_","") + " grain");
       if (p.step_angle && p.step_angle !== 90) tags.push(p.step_angle + "° steps");
       if (p.use_bounding_box) tags.push("bbox");
