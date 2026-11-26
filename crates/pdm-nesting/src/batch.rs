@@ -189,12 +189,18 @@ pub fn build_instance(
     name: &str,
 ) -> SolverInstance {
     let item_ids = sheet::assign_item_ids(copies);
+    // What the solver nests for each line: the part, or its mirror image when the nesting
+    // corner is a reflection, so that the corner turns it back (`StockMapping::corner_reflects`).
+    let shapes: Vec<std::borrow::Cow<'_, Part>> = lines
+        .iter()
+        .map(|l| mapping.solver_part(&parts[l.part]))
+        .collect();
     let items: Vec<SolverItem> = copies
         .iter()
         .enumerate()
         .map(|(i, c)| {
             let line = &lines[c.part];
-            let part = &parts[line.part];
+            let part = shapes[c.part].as_ref();
             // Collision shape: the dilated outline, or the dilated bounding box
             // when the line requests box nesting.
             let polygon = if line.use_bounding_box {
@@ -218,7 +224,8 @@ pub fn build_instance(
                 part_index: line.part,
                 polygon,
                 demand: 1,
-                rotations: line_rotations(cfg, part, line),
+                // The rotations allowed on the sheet, as the solver must turn this shape.
+                rotations: mapping.solver_rotations(line_rotations(cfg, &parts[line.part], line)),
                 allow_reflection: line.allow_mirror,
             }
         })
@@ -610,5 +617,153 @@ mod tests {
             label: String::new(),
         };
         assert_eq!(line_rotations(&cfg, &part, &line), vec![90.0, 270.0]);
+    }
+
+    /// An L: no mirror symmetry, so a mirrored copy shows in its outline's orientation.
+    fn l_part() -> Part {
+        let prim = P::Polyline {
+            layer: "cut".into(),
+            points: vec![
+                Point::new(0.0, 0.0),
+                Point::new(60.0, 0.0),
+                Point::new(60.0, 15.0),
+                Point::new(15.0, 15.0),
+                Point::new(15.0, 40.0),
+                Point::new(0.0, 40.0),
+            ],
+            bulges: vec![None; 6],
+            closed: true,
+        };
+        assemble(&[prim], &["cut".to_string()], &[], 0.05, 0.01)
+            .unwrap()
+            .parts
+            .pop()
+            .unwrap()
+    }
+
+    /// Signed area (shoelace): its sign is the outline's orientation.
+    fn signed_area(pts: &[Point]) -> f64 {
+        let n = pts.len();
+        (0..n)
+            .map(|i| {
+                let (a, b) = (pts[i], pts[(i + 1) % n]);
+                a.x * b.y - b.x * a.y
+            })
+            .sum::<f64>()
+            / 2.0
+    }
+
+    /// A test oracle: turns every item by its first allowed rotation, flips the ones that allow it
+    /// when `flip`, and lines the items up along the strip `sep` apart.
+    fn row_oracle(
+        sep: f64,
+        flip: bool,
+    ) -> impl Fn(&SolverInstance) -> Result<SolverSolution, solver::SolverError> {
+        move |inst: &SolverInstance| {
+            let mut x = sep;
+            let mut placed = Vec::new();
+            for it in &inst.items {
+                let reflected = flip && it.allow_reflection;
+                let rot = it.rotations.first().copied().unwrap_or(0.0);
+                let (s, c) = rot.to_radians().sin_cos();
+                // The solver's order: reflect across x, then rotate, then translate.
+                let turned: Vec<Point> = it
+                    .polygon
+                    .iter()
+                    .map(|p| if reflected { Point::new(p.x, -p.y) } else { *p })
+                    .map(|p| Point::new(c * p.x - s * p.y, s * p.x + c * p.y))
+                    .collect();
+                let min_x = turned.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+                let max_x = turned.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
+                let min_y = turned.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+                placed.push(solver::Placed {
+                    item_id: it.id,
+                    reflected,
+                    rotation_deg: rot,
+                    translation: [x - min_x, sep - min_y],
+                });
+                x += max_x - min_x + sep;
+            }
+            Ok(SolverSolution {
+                strip_width: x,
+                placed,
+            })
+        }
+    }
+
+    #[test]
+    fn no_nesting_corner_mirrors_a_part() {
+        // Lower-right and upper-left are reached by reflecting the finished layout. That alone
+        // would mirror every part whatever its line allows. At every corner the copies must come
+        // out unmirrored, turned by the allowed rotation (30° here, which the corner would
+        // otherwise turn into 150°, 330° or 210°), and inside the stock.
+        use crate::NestingCorner::{LowerLeft, LowerRight, UpperLeft, UpperRight};
+        let parts = vec![l_part()];
+        let want = signed_area(&parts[0].outer.points);
+        let lines = vec![line(0, 3)];
+        for corner in [LowerLeft, LowerRight, UpperLeft, UpperRight] {
+            let cfg = NestConfig {
+                stock_width: 400.0,
+                stock_height: 300.0,
+                edge_margin: 10.0,
+                gap_x: 5.0,
+                gap_y: 5.0,
+                chord_tol: 0.05,
+                join_tol: 0.01,
+                max_sheets: 1,
+                allowed_rotations: vec![30.0],
+                nesting_corner: corner,
+                ..Default::default()
+            };
+            let mapping = sheet::StockMapping::from_config(&cfg).unwrap();
+            let oracle = row_oracle(mapping.separation, false);
+            let sheets =
+                run_batch(&lines, &parts, &cfg, oracle).unwrap_or_else(|e| panic!("{corner:?}: {e}"));
+            let placements = &sheets[0].layout.placements;
+            assert_eq!(placements.len(), 3, "{corner:?}");
+            for pl in placements {
+                assert!(!pl.transform.reflected, "{corner:?}: a copy came out mirrored");
+                let placed: Vec<Point> = parts[0]
+                    .outer
+                    .points
+                    .iter()
+                    .map(|p| pl.transform.apply(*p))
+                    .collect();
+                let got = signed_area(&placed);
+                assert!(
+                    (got - want).abs() < 1e-6 * want.abs(),
+                    "{corner:?}: outline orientation {got} vs {want}"
+                );
+                let rot = pl.transform.rotation_deg.rem_euclid(360.0);
+                assert!(
+                    (rot - 30.0).abs() < 1e-6,
+                    "{corner:?}: turned {rot}°, not 30°"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reflecting_corner_still_lets_a_line_flip() {
+        // A copy the solver flips (its line allows mirroring) stays flipped at a reflecting corner.
+        let parts = vec![l_part()];
+        let mut l = line(0, 1);
+        l.allow_mirror = true;
+        let cfg = NestConfig {
+            stock_width: 400.0,
+            stock_height: 300.0,
+            edge_margin: 10.0,
+            gap_x: 5.0,
+            gap_y: 5.0,
+            chord_tol: 0.05,
+            join_tol: 0.01,
+            max_sheets: 1,
+            nesting_corner: crate::NestingCorner::LowerRight,
+            ..Default::default()
+        };
+        let mapping = sheet::StockMapping::from_config(&cfg).unwrap();
+        let oracle = row_oracle(mapping.separation, true);
+        let sheets = run_batch(&[l], &parts, &cfg, oracle).unwrap();
+        assert!(sheets[0].layout.placements[0].transform.reflected);
     }
 }

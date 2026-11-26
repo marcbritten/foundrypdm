@@ -24,6 +24,118 @@ fn sparrow_bin() -> Option<std::path::PathBuf> {
     default.is_file().then_some(default)
 }
 
+/// One Sparrow run of an instance (the pinned binary at `bin`), as the worker runs it.
+fn run_sparrow(
+    bin: &std::path::Path,
+    inst: &solver::SolverInstance,
+) -> Result<solver::SolverSolution, solver::SolverError> {
+    let bad = |e: String| solver::SolverError::Malformed(e);
+    let work = tempfile::tempdir().map_err(|e| bad(e.to_string()))?;
+    std::fs::create_dir_all(work.path().join("output")).map_err(|e| bad(e.to_string()))?;
+    let input = work.path().join("inst.json");
+    std::fs::write(&input, inst.to_json()).map_err(|e| bad(e.to_string()))?;
+    let out = std::process::Command::new(bin)
+        .arg("-i")
+        .arg(&input)
+        .args(["-t", "20", "-s", "1", "--workers", "2"])
+        .current_dir(work.path())
+        .output()
+        .map_err(|e| bad(e.to_string()))?;
+    if !out.status.success() {
+        return Err(bad(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+    }
+    let text = std::fs::read_to_string(
+        work.path()
+            .join("output")
+            .join(format!("final_{}.json", inst.name)),
+    )
+    .map_err(|e| bad(format!("no output: {e}")))?;
+    solver::parse_solution(&text)
+}
+
+#[test]
+fn e2e_sparrow_no_nesting_corner_mirrors_a_part() {
+    // An L (no mirror symmetry) on a line that may not be mirrored, nested from the two corners
+    // the layout is reflected to reach. Every copy must come out as drawn: unreflected, with its
+    // outline's orientation (signed area) unchanged. Test values.
+    let Some(bin) = sparrow_bin() else {
+        eprintln!("SPARROW_BIN not found; skipping e2e sparrow test");
+        return;
+    };
+    let outer = Primitive::Polyline {
+        layer: "cut".into(),
+        points: vec![
+            Point::new(0.0, 0.0),
+            Point::new(50.0, 0.0),
+            Point::new(50.0, 12.0),
+            Point::new(12.0, 12.0),
+            Point::new(12.0, 44.0),
+            Point::new(0.0, 44.0),
+        ],
+        bulges: vec![None; 6],
+        closed: true,
+    };
+    let ell = part::assemble(&[outer], &["cut".to_string()], &[], 0.05, 0.01)
+        .unwrap()
+        .parts
+        .pop()
+        .unwrap();
+    let signed_area = |pts: &[Point]| -> f64 {
+        let n = pts.len();
+        (0..n)
+            .map(|i| pts[i].x * pts[(i + 1) % n].y - pts[(i + 1) % n].x * pts[i].y)
+            .sum::<f64>()
+            / 2.0
+    };
+    let drawn = signed_area(&ell.outer.points);
+    let parts = vec![ell];
+    let lines = vec![batch::NestLine {
+        part: 0,
+        quantity: 4,
+        allow_mirror: false,
+        grain: pdm_nesting::GrainDir::Any,
+        step_angle: 90.0,
+        priority: 1,
+        use_bounding_box: false,
+        label: String::new(),
+    }];
+    for corner in [
+        pdm_nesting::NestingCorner::LowerRight,
+        pdm_nesting::NestingCorner::UpperLeft,
+    ] {
+        let cfg = NestConfig {
+            stock_width: 300.0,
+            stock_height: 200.0,
+            edge_margin: 10.0,
+            gap_x: 5.0,
+            gap_y: 5.0,
+            nesting_corner: corner,
+            time_budget_sec: 60,
+            attempt_limit_sec: 30,
+            max_sheets: 1,
+            ..Default::default()
+        };
+        let sheets = batch::run_batch(&lines, &parts, &cfg, |inst| run_sparrow(&bin, inst))
+            .unwrap_or_else(|e| panic!("{corner:?}: {e}"));
+        let placements = &sheets[0].layout.placements;
+        assert_eq!(placements.len(), 4, "{corner:?}: all copies placed");
+        let mirrored = placements
+            .iter()
+            .filter(|pl| {
+                let placed: Vec<Point> = parts[0]
+                    .outer
+                    .points
+                    .iter()
+                    .map(|q| pl.transform.apply(*q))
+                    .collect();
+                pl.transform.reflected || signed_area(&placed) * drawn < 0.0
+            })
+            .count();
+        eprintln!("{corner:?}: {} copies, {mirrored} mirrored", placements.len());
+        assert_eq!(mirrored, 0, "{corner:?}: a copy of a no-mirror line came out mirrored");
+    }
+}
+
 #[test]
 fn e2e_sparrow_nests_and_exports() {
     let bin = match sparrow_bin() {

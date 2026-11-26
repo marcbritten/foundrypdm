@@ -49,7 +49,9 @@ pub enum GrainDir {
 
 /// The corner of the stock from which the layout fill starts. The solver packs
 /// from the lower-left; other corners are realised by a whole-layout flip,
-/// which preserves relative grain alignment.
+/// which preserves relative grain alignment. No part is mirrored by the corner:
+/// for the two reflecting corners the solver nests mirror images, which the flip
+/// turns back (`sheet::StockMapping::corner_reflects`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NestingCorner {
