@@ -42,7 +42,9 @@ the *original nominal curves* (not the solver's collision polygons).
    preview + a manifest.
 4. **Review & export.** Open **Laser Nests** to see runs, previews, and sheet
    counts. Download a single sheet DXF, a sheet preview, or the whole package
-   (ZIP of every sheet DXF + preview + a `MANIFEST.txt`).
+   (ZIP of every sheet DXF + preview + a `MANIFEST.txt`, and the run's
+   `manifest.json`: settings, parts with their item and version, and every
+   placement).
 
 Mixed materials or thicknesses within one run are rejected; group them into
 separate runs. A source CAD version being superseded flags the nest **stale**
@@ -60,7 +62,7 @@ without changing its stored outputs.
 | `POST /laser-nests/{id}/rerun` | New linked run from the same source parts |
 | `GET /laser-nests/{id}/sheets/{i}/dxf` | Download one sheet's DXF |
 | `GET /laser-nests/{id}/sheets/{i}/preview` | One sheet's SVG preview |
-| `GET /laser-nests/{id}/package` | ZIP of all sheets (DXF + preview) + `MANIFEST.txt` |
+| `GET /laser-nests/{id}/package` | ZIP of all sheets (DXF + preview) + `MANIFEST.txt` + `manifest.json` (runs that recorded one) |
 
 Creation body:
 

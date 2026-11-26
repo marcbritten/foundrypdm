@@ -5839,6 +5839,23 @@ pub async fn download_laser_nest_package(
                 .map_err(|e| AppError(PdmError::Internal(e.to_string())))?;
         }
     }
+    // The run's full manifest (settings, parts with their item and version, every placement),
+    // when the run recorded one; nests from before it was kept have none.
+    if let Some(sha) = &nest.manifest_sha {
+        let blob = pdm_db::get_blob_by_sha(&state.pool, org, sha)
+            .await?
+            .ok_or_else(|| AppError(PdmError::NotFound("nest manifest blob".into())))?;
+        let data = state
+            .store
+            .get_by_sha(&blob.sha256)
+            .await
+            .map_err(|e| AppError(PdmError::Storage(e.to_string())))?;
+        zip.start_file("manifest.json", zip::write::FileOptions::<()>::default())
+            .map_err(|e| AppError(PdmError::Internal(e.to_string())))?;
+        std::io::Write::write_all(&mut zip, &data)
+            .map_err(|e| AppError(PdmError::Internal(e.to_string())))?;
+        manifest_lines.push("manifest.json — settings, parts and placements".to_string());
+    }
     let manifest = manifest_lines.join("\n");
     zip.start_file("MANIFEST.txt", zip::write::FileOptions::<()>::default())
         .map_err(|e| AppError(PdmError::Internal(e.to_string())))?;

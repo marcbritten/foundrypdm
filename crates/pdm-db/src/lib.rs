@@ -4112,6 +4112,23 @@ pub async fn list_laser_nests(
 
 /// Transition a nest's status. `completed` sets completed_at. Idempotent-safe:
 /// a terminal nest (completed/cancelled) is not overwritten by running/queued.
+/// Record the hash of a finished run's manifest blob (`pdm.laserNestManifest`).
+pub async fn set_laser_nest_manifest(
+    pool: &PgPool,
+    org_id: Uuid,
+    id: Uuid,
+    manifest_sha: &str,
+) -> Result<(), PdmError> {
+    sqlx::query("UPDATE laser_nests SET manifest_sha = $3 WHERE org_id = $1 AND id = $2")
+        .bind(org_id)
+        .bind(id)
+        .bind(manifest_sha)
+        .execute(pool)
+        .await
+        .map_err(PdmError::Db)?;
+    Ok(())
+}
+
 pub async fn set_laser_nest_status(
     pool: &PgPool,
     org_id: Uuid,
