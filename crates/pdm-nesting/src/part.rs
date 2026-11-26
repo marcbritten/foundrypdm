@@ -459,27 +459,43 @@ impl BBox {
     }
 }
 
-/// Inflate a polygon outline radially outward from its centroid by `by` mm.
-/// Conservative fallback used only when [`dilate_box`] cannot produce a valid
-/// outline; the exported geometry always uses the nominal curves.
-fn inflate_outline(points: &[Point], by: f64) -> Vec<Point> {
-    if by <= 0.0 || points.len() < 3 {
-        return points.to_vec();
+/// The convex hull of a point set (Andrew's monotone chain), counter-clockwise, without
+/// collinear points.
+fn convex_hull(points: &[Point]) -> Vec<Point> {
+    let mut pts: Vec<Point> = points.iter().copied().filter(|p| p.is_finite()).collect();
+    pts.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    pts.dedup_by(|a, b| (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9);
+    if pts.len() < 3 {
+        return pts;
     }
-    let c = geom::centroid(points);
-    points
-        .iter()
-        .map(|p| {
-            let dx = p.x - c.x;
-            let dy = p.y - c.y;
-            let l = dx.hypot(dy);
-            if l < 1e-9 {
-                *p
-            } else {
-                Point::new(p.x + dx / l * by, p.y + dy / l * by)
+    let cross = |o: Point, a: Point, b: Point| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    let chain = |pts: &mut dyn Iterator<Item = Point>| {
+        let mut c: Vec<Point> = Vec::new();
+        for p in pts {
+            while c.len() >= 2 && cross(c[c.len() - 2], c[c.len() - 1], p) <= 0.0 {
+                c.pop();
             }
-        })
-        .collect()
+            c.push(p);
+        }
+        // The last point of each chain starts the other one.
+        c.pop();
+        c
+    };
+    let mut hull = chain(&mut pts.iter().copied());
+    hull.extend(chain(&mut pts.iter().rev().copied()));
+    hull
+}
+
+/// The axis-aligned bounding box of `points`, grown by `(hx, hy)`, counter-clockwise. The last
+/// resort of [`dilate_box`]: always simple and always at least the requested spacing away.
+fn bbox_grown(points: &[Point], hx: f64, hy: f64) -> Vec<Point> {
+    let bb = BBox::from_points(points.iter().copied()).unwrap_or_default();
+    vec![
+        Point::new(bb.min_x - hx, bb.min_y - hy),
+        Point::new(bb.max_x + hx, bb.min_y - hy),
+        Point::new(bb.max_x + hx, bb.max_y + hy),
+        Point::new(bb.min_x - hx, bb.max_y + hy),
+    ]
 }
 
 /// Minkowski dilation of a polygon by the axis box with HALF extents
@@ -492,12 +508,27 @@ fn inflate_outline(points: &[Point], by: f64) -> Vec<Point> {
 /// direction; the dilated vertex at corner i is the intersection of the two
 /// adjacent offset lines. That is exact for convex corners and produces the
 /// correct notch corner at right-angle reflex corners (the usual sheet-metal
-/// case). Winding is handled; consecutive duplicates are removed; when the
-/// construction is not sane (sharp spikes), a uniform radial inflate is used
-/// instead.
+/// case). Winding is handled; consecutive duplicates are removed.
+///
+/// When the construction is not sane (sharp spikes, a notch narrower than the spacing), the
+/// same construction is run on the outline's convex hull, where it is exact: nothing nests into
+/// that part's notches, but the spacing still holds. The grown bounding box is the last resort.
+/// Every result contains the true dilation, so the spacing is never less than asked for.
 pub fn dilate_box(points: &[Point], hx: f64, hy: f64) -> Vec<Point> {
     if (hx <= 0.0 && hy <= 0.0) || points.len() < 3 {
         return points.to_vec();
+    }
+    offset_by_box(points, points, hx, hy)
+        .or_else(|| offset_by_box(&convex_hull(points), points, hx, hy))
+        .unwrap_or_else(|| bbox_grown(points, hx, hy))
+}
+
+/// The edge-offset construction of [`dilate_box`] on `ring`, or `None` when the result is not
+/// sane: not finite, not simple, implausibly small, or not containing every point of `outline`.
+fn offset_by_box(ring: &[Point], outline: &[Point], hx: f64, hy: f64) -> Option<Vec<Point>> {
+    let points = ring;
+    if points.len() < 3 {
+        return None;
     }
     let n = points.len();
     let ccw = geom::signed_area(points) >= 0.0;
@@ -549,17 +580,13 @@ pub fn dilate_box(points: &[Point], hx: f64, hy: f64) -> Vec<Point> {
             dedup.pop();
         }
     }
-    // Sanity: finite, simple, sane area, and every original vertex lies inside.
-    if dedup.len() >= 3
+    // Sanity: finite, simple, sane area, and every vertex of the outline lies inside.
+    (dedup.len() >= 3
         && dedup.iter().all(|p| p.is_finite())
         && geom::is_simple_ring(&dedup)
         && geom::signed_area(&dedup).abs() > geom::signed_area(points).abs() * 0.5
-        && points.iter().all(|p| geom::point_in_ring(*p, &dedup))
-    {
-        return dedup;
-    }
-    // Fallback: uniform radial inflate by the larger half-extent (diagonal).
-    inflate_outline(points, hx.max(hy) * std::f64::consts::SQRT_2)
+        && outline.iter().all(|p| geom::point_in_ring(*p, &dedup)))
+    .then_some(dedup)
 }
 
 /// Intersection of the infinite lines p0 + t·d0 and p1 + s·d1.
@@ -1041,6 +1068,52 @@ mod tests {
         assert!((bb.max_y - 12.0).abs() < 0.05, "max_y {}", bb.max_y);
         // Area = 12 * 14 = 168.
         assert!((crate::geom::signed_area(&d) - 168.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn dilate_box_keeps_the_spacing_when_a_notch_is_narrower_than_it() {
+        // 40 x 20 with a 1 mm slot 10 deep from the top. Grown by 2 mm the slot walls cross, so
+        // the edge-offset construction is not sane and the convex hull is grown instead.
+        let slotted = vec![
+            Point::new(0.0, 0.0),
+            Point::new(40.0, 0.0),
+            Point::new(40.0, 20.0),
+            Point::new(20.5, 20.0),
+            Point::new(20.5, 10.0),
+            Point::new(19.5, 10.0),
+            Point::new(19.5, 20.0),
+            Point::new(0.0, 20.0),
+        ];
+        let (hx, hy) = (2.0, 2.0);
+        let d = dilate_box(&slotted, hx, hy);
+        assert!(crate::geom::is_simple_ring(&d), "{d:?}");
+        assert!(
+            (crate::geom::signed_area(&d).abs() - 44.0 * 24.0).abs() < 1e-6,
+            "the hull (the 40 x 20 rectangle) grown by 2 mm: {d:?}"
+        );
+        // Every point of the outline, moved anywhere within the box, is still inside.
+        for p in &slotted {
+            for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                let q = Point::new(p.x + sx * hx * 0.999, p.y + sy * hy * 0.999);
+                assert!(crate::geom::point_in_ring(q, &d), "{q:?} is outside {d:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn convex_hull_drops_notches_and_collinear_points() {
+        let pts = vec![
+            Point::new(0.0, 0.0),
+            Point::new(5.0, 0.0),
+            Point::new(10.0, 0.0),
+            Point::new(10.0, 10.0),
+            Point::new(5.0, 3.0),
+            Point::new(0.0, 10.0),
+        ];
+        let h = convex_hull(&pts);
+        assert_eq!(h.len(), 4, "{h:?}");
+        assert!(crate::geom::signed_area(&h) > 0.0, "counter-clockwise");
+        assert!((crate::geom::signed_area(&h) - 100.0).abs() < 1e-9);
     }
 
     #[test]

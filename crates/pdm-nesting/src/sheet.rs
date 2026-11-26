@@ -21,6 +21,10 @@ const SEPARATION_EPS: f64 = 0.05;
 /// the requested stock margin.
 const LAYOUT_SAFETY: f64 = 1.0;
 
+/// How far (mm) two placed parts may fall short of the requested spacing before a layout is
+/// refused: rounding only (the solver works in f32).
+const SPACING_TOL: f64 = 1e-3;
+
 /// The stock<->strip mapping derived from the config.
 ///
 /// Part spacing is enforced directionally: the solver outline is the nominal
@@ -52,8 +56,8 @@ impl StockMapping {
         // The collision box is symmetric (the larger half-extent on both axes)
         // so it is invariant to the part's rotation: a 90°-turned part would
         // otherwise swap its x/y clearance. This guarantees at least
-        // max(gap_x, gap_y) of separation between parts in both stock axes;
-        // the directional validation below then re-checks the per-axis values.
+        // max(gap_x, gap_y) of separation between parts in every direction;
+        // `build_sheet` re-checks that distance on the nominal outlines.
         //
         // Margin: the nominal tessellation sits `m` inside the dilated
         // outline; the true part bulges up to `chord_tol` outside the
@@ -127,8 +131,13 @@ pub enum SheetError {
     UnknownItem(u64),
     #[error("part {part} (copy {copy}) exceeds the stock margins in stock space")]
     OutOfBounds { part: usize, copy: usize },
-    #[error("parts {a} and {b} are closer than the required gap")]
-    TooClose { a: usize, b: usize },
+    #[error("parts {a} and {b} are {distance:.3} mm apart, closer than the {required:.3} mm spacing")]
+    TooClose {
+        a: usize,
+        b: usize,
+        distance: f64,
+        required: f64,
+    },
     #[error("solver strip width {0} leaves a part past the right margin")]
     StripTooWide(f64),
 }
@@ -248,13 +257,18 @@ pub fn build_sheet(
         let _ = i;
     }
 
-    // Minimum separation. The solver keeps the dilated outlines (nominal
-    // tessellation ⊕ symmetric box) >= `separation` apart, which implies the
-    // nominal tessellations are >= `separation` apart in Euclidean distance and
-    // >= max(gap_x,gap_y) + separation apart along any axis whose ranges
-    // overlap. Re-check the Euclidean floor directly — it is shape-independent,
-    // whereas a bounding-box check is too strict for concave parts that nest
-    // into each other's notches (small bbox gap, large real gap).
+    // Minimum spacing. The solver keeps the dilated outlines (nominal
+    // tessellation ⊕ symmetric box of half-extent max(gap_x, gap_y)/2) apart,
+    // and every dilation contains the true box dilation (`part::dilate_box`),
+    // so the nominal tessellations of a correct layout are at least
+    // max(gap_x, gap_y) apart in every direction (and at least `separation`
+    // when no spacing is asked for). Re-check that distance here, independently
+    // of the solver: the spacing is usually the cutting process's own minimum
+    // (kerf, bridge width, cutter), so a closer pair is a bad sheet, not a tight
+    // one. The Euclidean distance is shape-independent, whereas a
+    // bounding-box check is too strict for concave parts that nest into each
+    // other's notches (small bbox gap, large real gap).
+    let required = mapping.gap_x.max(mapping.gap_y).max(mapping.separation);
     let boxes: Vec<BBox> = outlines
         .iter()
         .map(|o| BBox::from_points(o.iter().copied()).unwrap_or_default())
@@ -262,16 +276,21 @@ pub fn build_sheet(
     for i in 0..outlines.len() {
         for j in (i + 1)..outlines.len() {
             let (bi, bj) = (&boxes[i], &boxes[j]);
-            // If separated by more than `separation` in either axis, the rings
-            // are too far apart to violate the floor — skip the O(n^2) check.
+            // If separated by more than the spacing in either axis, the rings
+            // are too far apart to violate it — skip the O(n^2) check.
             let x_gap = bi.min_x.max(bj.min_x) - bi.max_x.min(bj.max_x);
             let y_gap = bi.min_y.max(bj.min_y) - bi.max_y.min(bj.max_y);
-            if x_gap > mapping.separation || y_gap > mapping.separation {
+            if x_gap > required || y_gap > required {
                 continue;
             }
             let d = min_ring_distance(&outlines[i], &outlines[j]);
-            if d < mapping.separation - 1e-3 {
-                return Err(SheetError::TooClose { a: i, b: j });
+            if d < required - SPACING_TOL {
+                return Err(SheetError::TooClose {
+                    a: i,
+                    b: j,
+                    distance: d,
+                    required,
+                });
             }
         }
     }
@@ -851,6 +870,62 @@ mod tests {
             build_sheet(&solution, &ids, &parts, &cfg, &mapping),
             Err(SheetError::OutOfBounds { .. })
         ));
+    }
+
+    /// Two 10 x 10 squares side by side, `gap` mm apart in stock space, on the 100 x 100 stock
+    /// with 5 mm spacing; the second one flipped when `flip_second`.
+    fn squares(gap: f64, flip_second: bool) -> Result<SheetLayout, SheetError> {
+        let parts = vec![square_part()];
+        let (cfg, mapping) = bounds_cfg();
+        let copies = [CopyRef { part: 0, copy: 0 }, CopyRef { part: 0, copy: 1 }];
+        let ids = assign_item_ids(&copies);
+        // A flip mirrors across the local x axis (y -> -y), so a flipped square sits 10 mm
+        // lower for the same translation: lift it back level with the first.
+        let at = |id: u64, x: f64, reflected: bool| Placed {
+            item_id: id,
+            reflected,
+            rotation_deg: 0.0,
+            translation: [x, if reflected { 15.1 } else { 5.1 }],
+        };
+        let solution = SolverSolution {
+            strip_width: 40.0,
+            placed: vec![
+                at(ids[0], 5.1, false),
+                at(ids[1], 5.1 + 10.0 + gap, flip_second),
+            ],
+        };
+        build_sheet(&solution, &ids, &parts, &cfg, &mapping)
+    }
+
+    fn two_squares(gap: f64) -> Result<SheetLayout, SheetError> {
+        squares(gap, false)
+    }
+
+    #[test]
+    fn build_sheet_checks_the_spacing_of_flipped_parts() {
+        assert!(matches!(
+            squares(3.0, true),
+            Err(SheetError::TooClose { .. })
+        ));
+        let layout = squares(5.0, true).unwrap();
+        assert!(layout.placements[1].transform.reflected);
+    }
+
+    #[test]
+    fn build_sheet_rejects_parts_closer_than_the_spacing() {
+        // 3 mm apart: well over the solver's 0.15 mm separation, but under the 5 mm spacing.
+        match two_squares(3.0) {
+            Err(SheetError::TooClose { distance, required, .. }) => {
+                assert!((distance - 3.0).abs() < 1e-9, "{distance}");
+                assert!((required - 5.0).abs() < 1e-9, "{required}");
+            }
+            other => panic!("expected TooClose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_sheet_accepts_parts_at_the_spacing() {
+        assert_eq!(two_squares(5.0).unwrap().placements.len(), 2);
     }
 
     #[test]
