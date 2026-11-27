@@ -1687,6 +1687,111 @@ pub async fn create_version(
     .map_err(PdmError::Db)
 }
 
+/// What [`checkin_version`] made: the file record, the head before it, and the new version.
+pub struct CheckedIn {
+    pub file: FileRecord,
+    pub previous_head: Option<FileVersion>,
+    pub version: FileVersion,
+}
+
+/// A check-in as one transaction. The item's lease row is locked first, so check-ins of one item
+/// run one at a time. Inside it the lease must be live and the caller's, the base must be the head,
+/// and the version is written and the lease released together. Parallel check-ins now give one new
+/// version and "no active checkout" for the rest; before, they all passed the lease check and then
+/// clashed on the version number (a 500).
+#[allow(clippy::too_many_arguments)]
+pub async fn checkin_version(
+    pool: &PgPool,
+    item_id: Uuid,
+    user_id: Uuid,
+    filename: &str,
+    mime: &str,
+    base_version: Option<i32>,
+    blob_id: Uuid,
+    commit_message: &str,
+    native_format: &str,
+    new_version: bool,
+) -> Result<CheckedIn, PdmError> {
+    let mut tx = pool.begin().await.map_err(PdmError::Db)?;
+    let holder: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM file_locks WHERE item_id = $1 AND lease_expires_at > now() FOR UPDATE",
+    )
+    .bind(item_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?;
+    match holder {
+        None => return Err(PdmError::Conflict("no active checkout".into())),
+        Some(h) if h != user_id => {
+            return Err(PdmError::Conflict("lock held by another user".into()));
+        }
+        Some(_) => {}
+    }
+    // The file record is made on the first check-in.
+    sqlx::query(
+        "INSERT INTO files (item_id, filename, mime_type) VALUES ($1, $2, $3)
+         ON CONFLICT (item_id) DO NOTHING",
+    )
+    .bind(item_id)
+    .bind(filename)
+    .bind(mime)
+    .execute(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?;
+    let file = sqlx::query_as::<_, FileRecord>(
+        "SELECT id, item_id, filename, mime_type, created_at FROM files WHERE item_id = $1",
+    )
+    .bind(item_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?;
+    let previous_head = sqlx::query_as::<_, FileVersion>(
+        "SELECT id, file_id, seq, version, revision, blob_id, author_id, committed_at, commit_message,
+                    base_version_id, native_format, measurements,
+                    thumbnail_sha256, thumbnail_size_bytes,
+                    thumbnail_error
+             FROM file_versions WHERE file_id = $1 ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(file.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?;
+    pdm_core::validate_checkin(base_version, previous_head.as_ref().map(|v| v.seq))?;
+    let (next_seq, version_no, revision) = match &previous_head {
+        None => (1, 1, 1),
+        Some(h) if new_version => (h.seq + 1, h.version + 1, 1),
+        Some(h) => (h.seq + 1, h.version, h.revision + 1),
+    };
+    let version = sqlx::query_as::<_, FileVersion>(
+        "INSERT INTO file_versions (file_id, seq, version, revision, blob_id, author_id, commit_message, base_version_id, native_format)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id, file_id, seq, version, revision, blob_id, author_id, committed_at, commit_message,
+                    base_version_id, native_format, measurements,
+                    thumbnail_sha256, thumbnail_size_bytes,
+                    thumbnail_error",
+    )
+    .bind(file.id)
+    .bind(next_seq)
+    .bind(version_no)
+    .bind(revision)
+    .bind(blob_id)
+    .bind(user_id)
+    .bind(commit_message)
+    .bind(previous_head.as_ref().map(|v| v.id))
+    .bind(native_format)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?;
+    sqlx::query("DELETE FROM file_locks WHERE item_id = $1 AND user_id = $2")
+        .bind(item_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(PdmError::Db)?;
+    tx.commit().await.map_err(PdmError::Db)?;
+    Ok(CheckedIn { file, previous_head, version })
+}
+
 pub async fn get_head_version(
     pool: &PgPool,
     file_id: Uuid,
