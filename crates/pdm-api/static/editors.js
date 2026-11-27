@@ -187,7 +187,7 @@
       await new Promise(r => setTimeout(r, 400));
     }
   }
-  async function openSolidcraft({ version, name, designUrl, checkin, createNew, onSaved }){
+  async function openSolidcraft({ version, name, designUrl, designLink, checkin, createNew, onSaved }){
     if (active) return;
     active = true;
     const isNew = !version; // blank session: Save to PDM creates the item (createNew)
@@ -222,7 +222,8 @@
     find("[data-close]").onclick = close;
     dialog.addEventListener("cancel", e => { e.preventDefault(); close(); });
     find("[data-original]").onclick = async () => {
-      try { download(original || await fetch(designUrl).then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.arrayBuffer(); }), name); }
+      // Design links expire, so ask for a fresh one when the host can make it.
+      try { download(original || await fetch(designLink ? await designLink() : designUrl).then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.arrayBuffer(); }), name); }
       catch(e){ status.textContent = "Download failed: " + e.message; }
     };
     const grab = async () => {

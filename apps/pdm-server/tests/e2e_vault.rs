@@ -971,37 +971,52 @@ async fn e2e_native_conversion_and_transparent_preview() {
         .await
         .unwrap();
     assert_eq!(source.as_ref(), PIN_STEP.as_bytes(), "source is immutable");
-    // The bundled SolidCraft web editor opens versions through the unauthenticated
-    // public design link, named exactly after the version's SolidCraft file.
-    let public = client
-        .get(format!("{}/public/design/{version_id}/pin-v1.sc", base()))
+    // The bundled SolidCraft web editor opens versions through a short-lived signed design
+    // link, named exactly after the version's SolidCraft file; fetching it needs no token.
+    let link: serde_json::Value = client
+        .post(format!("{}/versions/{version_id}/design-link", base()))
+        .bearer_auth(&editor)
         .send()
         .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    assert_eq!(public.status(), 200, "public design link needs no token");
+    assert_eq!(link["filename"], "pin-v1.sc");
+    let url = link["url"].as_str().unwrap();
+    let (path, query) = url.split_once('?').unwrap();
+    assert_eq!(path, format!("/public/design/{version_id}/pin-v1.sc"));
+    let public = client.get(format!("{}{url}", base())).send().await.unwrap();
+    assert_eq!(public.status(), 200, "a signed design link needs no token");
     let public = public.bytes().await.unwrap();
     assert_eq!(
         sha256_hex(&public),
         artifact["artifact"]["sha256"].as_str().unwrap()
     );
+    let status = |url: String| {
+        let client = client.clone();
+        async move { client.get(url).send().await.unwrap().status() }
+    };
     assert_eq!(
-        client
-            .get(format!("{}/public/design/{version_id}/pin.step", base()))
-            .send()
-            .await
-            .unwrap()
-            .status(),
+        status(format!("{}{path}", base())).await,
         404,
-        "with an artifact, the source name must not match"
+        "an unsigned link is refused"
     );
     assert_eq!(
-        client
-            .get(format!("{}/public/design/{version_id}/wrong.sc", base()))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        404
+        status(format!(
+            "{}/public/design/{version_id}/pin.step?{query}",
+            base()
+        ))
+        .await,
+        404,
+        "the signature covers the file name"
+    );
+    assert_eq!(
+        status(format!("{}{url}0", base())).await,
+        404,
+        "a changed signature is refused"
     );
     let detail: serde_json::Value = client
         .get(format!("{}/items/{item_id}", base()))

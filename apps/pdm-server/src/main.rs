@@ -78,6 +78,11 @@ async fn main() -> Result<(), MainError> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(24);
 
+    // The key that signs the SolidCraft web editor's short-lived design links: random, made
+    // once and kept in the database (shared by every API process on it), so nothing to set.
+    let design_link_key = pdm_db::server_secret(&pool, "design_link", 32).await?;
+    let design_links = pdm_api::DesignLinks::new(&design_link_key)?;
+
     let state = pdm_api::AppState {
         pool: pool.clone(),
         store: store.clone(),
@@ -85,6 +90,7 @@ async fn main() -> Result<(), MainError> {
         lease_hours,
         started_at: std::time::Instant::now(),
         update: std::sync::Arc::new(tokio::sync::RwLock::new(pdm_update::UpdateState::default())),
+        design_links,
     };
     let app = pdm_api::build_router(state.clone());
 

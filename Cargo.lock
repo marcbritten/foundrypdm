@@ -1668,6 +1668,7 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
+ "hmac",
  "lettre",
  "pdm-core",
  "pdm-db",

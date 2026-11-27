@@ -19,6 +19,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 mod auth;
+mod design_link;
 mod error;
 mod mail;
 mod onshape;
@@ -27,6 +28,7 @@ mod routes;
 mod state;
 
 pub use auth::{Authed, auth_middleware};
+pub use design_link::DesignLinks;
 pub use error::AppError;
 pub use routes::version_info;
 pub use state::AppState;
