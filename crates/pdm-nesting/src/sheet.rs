@@ -231,6 +231,11 @@ pub struct SheetLayout {
     pub strip_width: f64,
     /// Nominal material utilization: sum(part areas) / stock area.
     pub utilization: f64,
+    /// The least distance between any two parts' real outlines the layout check proved, mm (on a
+    /// router, a cut-out bit wider than this cuts into the next part). Set by [`build_sheet`];
+    /// `None` on a layout that didn't come from it, whose DXF then says nothing about the gap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_gap_mm: Option<f64>,
 }
 
 /// A reference to one demanded copy.
@@ -393,7 +398,28 @@ pub fn build_sheet(
             .collect(),
         strip_width: solution.strip_width,
         utilization,
+        checked_gap_mm: Some(checked_gap(required, cfg.chord_tol)),
     })
+}
+
+/// The least distance between two parts' real outlines that the spacing check above proves, mm.
+/// The check measures the straight-segment forms (within [`SPACING_TOL`]), and a curve bulges up
+/// to `chord_tol` past its form, on each of the two parts. Rounded down to 0.001 mm.
+fn checked_gap(required: f64, chord_tol: f64) -> f64 {
+    let gap = required - SPACING_TOL - 2.0 * chord_tol.max(0.0);
+    // The 1e-9 keeps float noise (4.8989999…) from rounding a whole thousandth down.
+    (gap.max(0.0) * 1000.0 + 1e-9).floor() / 1000.0
+}
+
+/// The first line of a sheet DXF the nest checked: a DXF comment (group 999, which readers skip)
+/// giving the least gap between parts, so CAM downstream can check a tool against it (on a router,
+/// a cut-out bit wider than the gap cuts into the next part). Readers look for `part_gap_mm=`.
+pub const NEST_RECORD_PREFIX: &str = "FoundryPDM nest:";
+
+fn nest_record(gap_mm: f64) -> String {
+    format!(
+        "999\n{NEST_RECORD_PREFIX} part_gap_mm={gap_mm:.3} (the least distance between parts the nest checked, curves included)\n"
+    )
 }
 
 /// Map a solver placement into a stock-space transform.
@@ -650,7 +676,12 @@ pub fn export_sheet_dxf(
             });
         }
     }
-    dxf::write(&prims, Some((cfg.stock_width, cfg.stock_height)), "STOCK")
+    let body = dxf::write(&prims, Some((cfg.stock_width, cfg.stock_height)), "STOCK");
+    // Only a layout the spacing check passed says what gap it keeps.
+    match layout.checked_gap_mm {
+        Some(gap) => nest_record(gap) + &body,
+        None => body,
+    }
 }
 
 /// Render the sheet as a preview SVG: stock outline, nominal outer contours,
@@ -1021,6 +1052,36 @@ mod tests {
         assert_eq!(parsed.units, dxf::Unit::Mm);
         // stock + one part outline (4 edges) -> >= 5 primitives.
         assert!(parsed.primitives.len() >= 5);
+        // The gap the check proved leads the file, as a DXF comment: 5 mm checked, less
+        // 0.001 mm for rounding and 0.05 mm of curve on each of two parts.
+        assert_eq!(layout.checked_gap_mm, Some(4.899));
+        assert!(
+            dxf_text.starts_with("999\nFoundryPDM nest: part_gap_mm=4.899 (the least distance between parts the nest checked, curves included)\n0\nSECTION\n"),
+            "{}",
+            &dxf_text[..dxf_text.len().min(160)]
+        );
+    }
+
+    #[test]
+    fn a_layout_the_check_didnt_make_says_nothing_of_its_gap() {
+        // An older stored layout has no gap, so its DXF carries no record.
+        let old = r#"{"placements":[],"stripWidth":0.0,"utilization":0.0}"#;
+        let layout: SheetLayout = serde_json::from_str(old).unwrap();
+        assert_eq!(layout.checked_gap_mm, None);
+        let cfg = NestConfig { stock_width: 100.0, stock_height: 100.0, ..Default::default() };
+        let dxf_text = export_sheet_dxf(&layout, &[], &[], &cfg);
+        assert!(dxf_text.starts_with("0\nSECTION\n"), "{}", &dxf_text[..40]);
+        assert!(!dxf_text.contains(NEST_RECORD_PREFIX));
+        // The record is left out of the JSON when there is none, and kept when there is one.
+        assert!(!serde_json::to_string(&layout).unwrap().contains("checkedGapMm"));
+    }
+
+    #[test]
+    fn the_checked_gap_allows_for_curves_and_rounding() {
+        assert_eq!(checked_gap(9.525, 0.05), 9.424);
+        assert_eq!(checked_gap(6.35, 0.05), 6.249);
+        assert_eq!(checked_gap(0.0, 0.05), 0.0);
+        assert_eq!(checked_gap(10.0, 0.0), 9.999);
     }
 
     #[test]

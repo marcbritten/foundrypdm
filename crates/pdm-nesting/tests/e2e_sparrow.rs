@@ -515,6 +515,18 @@ fn e2e_sparrow_keeps_the_spacing_with_turning_and_flipping_allowed() {
         layout.placements.iter().filter(|p| p.transform.reflected).count()
     );
     assert!(d >= 6.35 - 1e-3, "parts {d} mm apart");
+    // The sheet DXF leads with the gap the check proved: never more than the parts' real
+    // distance, and short of the spacing only by the check's allowances.
+    let gap = layout.checked_gap_mm.expect("a checked layout records its gap");
+    let dxf_text = sheet::export_sheet_dxf(&layout, &parts, &[], &cfg);
+    eprintln!("recorded gap: {gap:.3} mm; {}", dxf_text.lines().nth(1).unwrap_or(""));
+    assert!(
+        dxf_text.starts_with(&format!("999
+{} part_gap_mm={gap:.3} ", sheet::NEST_RECORD_PREFIX)),
+        "{}",
+        &dxf_text[..dxf_text.len().min(160)]
+    );
+    assert!(gap <= d + 1e-9 && gap >= 6.35 - 0.2, "recorded {gap} mm, parts {d} mm apart");
 }
 
 fn pointset_bbox(pts: &[Point]) -> (f64, f64) {

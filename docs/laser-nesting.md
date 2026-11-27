@@ -218,7 +218,14 @@ for x/y spacing). The solver (a strip-packing engine) is constrained to a
 fixed-height strip and minimizes its width; the PDM independently validates that
 the solved width and every nominal part lie within `[M, W-M] × [M, H-M]` and
 that directional spacing is respected (with a hard ring-distance check for parts
-nested inside each other's concavities). Multiple identical sheets are produced
+nested inside each other's concavities). The least distance that check proves
+between any two parts leads each sheet DXF as a comment (group 999, which DXF
+readers skip): `999` / `FoundryPDM nest: part_gap_mm=6.249 (...)`. It is the
+spacing less 0.001 mm and twice the curve tolerance (a curve may bulge up to
+`chord_tol` past the straight segments the check measures), rounded down to
+0.001 mm, so CAM downstream can check a tool against it: on a router, a
+cut-out bit wider than the gap cuts into the next part. A layout stored before
+this change writes no record. Multiple identical sheets are produced
 by splitting demand into per-sheet batches under one wall-clock budget; a run
 that cannot place all demand reports the unplaced copies rather than silently
 dropping them.
