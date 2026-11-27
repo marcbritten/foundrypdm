@@ -2,22 +2,7 @@
 
 Foundry PDM server. Dates are UTC.
 
-## V.01-39 — edit in SolidCraft web
-
-- The Preview tab’s **✎ Edit in SolidCraft web** button (under the 3D model) opens
-  the selected version in the SolidCraft CAD app: the upstream web release is
-  pinned into the image (same installer as the other web editors) and runs in a
-  same-origin iframe. Convertible CAD versions are restated to a native `.sc`
-  design first, on demand.
-- New unauthenticated `GET /public/design/{version}/{filename}`: the URL names the
-  exact immutable file (the derived `.sc` artifact when one exists, otherwise the
-  version’s source file), so the editor’s design-link fetch needs no token.
-- **Save to PDM** in the editor collects the edited design from the app’s browser
-  storage and checks it in as a new immutable version (editor role; same base-version
-  and lock rules as the other web editors). **Download original / Download edited
-  file** are offered alongside.
-
-## Unreleased
+## V.01-77 — sheet metal, laser nesting and tool library
 
 ### Added
 - **Tool library editor** (sidebar › **Tool library**): tools are now full
@@ -153,8 +138,33 @@ Foundry PDM server. Dates are UTC.
     fill-all-sheets. Sheet/part choices pre-fill from new **org laser-nesting
     defaults** in **Settings** ("Laser nesting defaults" — units, sheet size,
     margin, spacing, grain, corner, guillotine, labels, part source unit;
-    `GET/PUT /settings/nest-defaults`). Migrations 0024–0025 add the
-    sheet/part option columns and `laser_nests.sheet_defs`.
+     `GET/PUT /settings/nest-defaults`). Migrations 0024–0025 add the
+     sheet/part option columns and `laser_nests.sheet_defs`.
+  - **The sheet DXF records the checked part gap**: each sheet DXF leads with a
+    DXF comment (group 999, which readers skip) — `FoundryPDM nest:
+    part_gap_mm=…` — the least distance between parts the nest's spacing check
+    proved (the requested spacing less rounding and twice the curve allowance,
+    rounded down to 0.001 mm), so CAM downstream can check a tool against it:
+    on a router, a cut-out bit wider than the gap cuts into the next part. A
+    layout stored before this change carries no record.
+  - **Nest layouts sit in the chosen corner on both axes**: Sparrow shortens
+    the strip lengthwise only, so a layout could start at the chosen corner's
+    side but float between the sheet's top and bottom edges (leaving the
+    off-cut in two pieces). After each solve the whole layout is pressed down
+    the strip until its lowest part has the solver's own edge clearance, so the
+    parts sit in the corner on both axes; the move is uniform, so part spacing
+    is unchanged, and if the moved layout failed validation the solver's own is
+    kept.
+  - **Optional router layers** (`PDM_ROUTER_LAYERS=1`, off by default): a
+    generated flat pattern is put on router layers with every depth taken from
+    the SolidCraft model — `OUTLINE`, `THROUGH` (cut-outs) and `DEPTH_<mm>`
+    (pockets open on the top face) — and the nest keeps each contour's layer
+    through to the sheet DXF, so CAM can tell a pocket from a hole and won't
+    cut the pocket through. A blind feature leaves material under it, so it
+    doesn't come off the part's area; a part with pockets is never nested
+    mirrored (a *Mirror Only* line for it is refused), and a pocket that opens
+    on the bottom face or inside the material is refused by name. Uploaded flat
+    patterns are not renamed.
 
 ### Fixed
 - SolidCraft web editor updates now work on Docker overlay filesystems and
@@ -207,6 +217,23 @@ Foundry PDM server. Dates are UTC.
   revisions within a version stay compatible with the same manufacturing
   chain. `ItemSummary` gains `head_version` / `head_revision`.
 - Bundled CAD CLI tracks GitHub latest (0.29.0 as of this entry) instead of a frozen image-only 0.27.1.
+
+## Unreleased
+
+## V.01-39 — edit in SolidCraft web
+
+- The Preview tab’s **✎ Edit in SolidCraft web** button (under the 3D model) opens
+  the selected version in the SolidCraft CAD app: the upstream web release is
+  pinned into the image (same installer as the other web editors) and runs in a
+  same-origin iframe. Convertible CAD versions are restated to a native `.sc`
+  design first, on demand.
+- New unauthenticated `GET /public/design/{version}/{filename}`: the URL names the
+  exact immutable file (the derived `.sc` artifact when one exists, otherwise the
+  version’s source file), so the editor’s design-link fetch needs no token.
+- **Save to PDM** in the editor collects the edited design from the app's browser
+  storage and checks it in as a new immutable version (editor role; same base-version
+  and lock rules as the other web editors). **Download original / Download edited
+  file** are offered alongside.
 
 ## V.01-38 — native conversions and transparent previews
 
