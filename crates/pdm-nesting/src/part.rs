@@ -246,6 +246,16 @@ pub struct Part {
 }
 
 impl Part {
+    /// Whether any inner contour is a blind feature (`DEPTH_<mm>`, machined from the top face):
+    /// such a part must not be nested mirrored, or its pockets would be cut into the wrong face.
+    /// Only [`assemble_keeping_layers`] keeps the layers this reads.
+    pub fn has_blind_features(&self) -> bool {
+        self.holes
+            .iter()
+            .chain(&self.marks)
+            .any(|c| crate::cnc_layers::is_blind_layer(&c.layer))
+    }
+
     pub fn bbox(&self) -> &BBox {
         &self.outer.bbox
     }
@@ -314,6 +324,8 @@ pub fn auto_layers(d: &crate::dxf::Dxf, user_marks: &[String]) -> (Vec<String>, 
 /// geometry (layer names are case-insensitive); `mark_layers` are layers
 /// treated as marking (bend/etch lines). Layers in neither are ignored. Units
 /// are assumed to already be in mm (callers convert via `dxf::to_mm` first).
+/// Every cut contour is named after the first cut layer and every mark after
+/// the first mark layer; [`assemble_keeping_layers`] keeps each one's own.
 pub fn assemble(
     prims: &[Primitive],
     cut_layers: &[String],
@@ -321,14 +333,44 @@ pub fn assemble(
     chord_tol: f64,
     join_tol: f64,
 ) -> Result<Assembled, NestingError> {
+    assemble_layers(prims, cut_layers, mark_layers, chord_tol, join_tol, false)
+}
+
+/// As [`assemble`], but every contour keeps the layer it was drawn on, and loose
+/// edges are chained layer by layer, so two layers' edges are never joined. A
+/// sheet's DXF then says which contour is the outline, which goes through and
+/// how deep a blind one goes (router layers, see [`crate::cnc_layers`]). A blind
+/// feature (`DEPTH_<mm>`) leaves material under it, so it doesn't come off the
+/// part's area.
+pub fn assemble_keeping_layers(
+    prims: &[Primitive],
+    cut_layers: &[String],
+    mark_layers: &[String],
+    chord_tol: f64,
+    join_tol: f64,
+) -> Result<Assembled, NestingError> {
+    assemble_layers(prims, cut_layers, mark_layers, chord_tol, join_tol, true)
+}
+
+fn assemble_layers(
+    prims: &[Primitive],
+    cut_layers: &[String],
+    mark_layers: &[String],
+    chord_tol: f64,
+    join_tol: f64,
+    keep_layers: bool,
+) -> Result<Assembled, NestingError> {
     let cut_set: Vec<String> = cut_layers.iter().map(|s| s.to_ascii_lowercase()).collect();
     let mark_set: Vec<String> = mark_layers.iter().map(|s| s.to_ascii_lowercase()).collect();
     let cut_attr = cut_layers.first().cloned().unwrap_or_default();
 
-    // 1. Build closed contours from closed primitives on the cut layers.
-    let mut closed: Vec<Vec<Edge>> = Vec::new();
-    let mut open_edges: Vec<Edge> = Vec::new();
-    let mut mark_chains: Vec<Vec<Edge>> = Vec::new();
+    // 1. Build closed contours from closed primitives on the cut layers; loose
+    //    edges are collected per layer name. Without `keep_layers` every cut
+    //    contour takes the first cut layer's name (so all loose edges chain
+    //    together) and every mark the first mark layer's.
+    let mut closed: Vec<(Vec<Edge>, String)> = Vec::new();
+    let mut open_by_layer: Vec<(String, Vec<Edge>)> = Vec::new();
+    let mut mark_chains: Vec<(Vec<Edge>, String)> = Vec::new();
     let mut mark_attr = String::new();
 
     for p in prims {
@@ -337,39 +379,48 @@ pub fn assemble(
         let is_mark = mark_set.contains(&layer.to_ascii_lowercase());
         let (edges, is_closed) = primitive_to_edges(p);
         match (is_cut, is_closed, is_mark) {
-            (true, true, _) => closed.push(edges),
-            (true, false, _) => open_edges.extend(edges),
-            (false, _, true) if !edges.is_empty() => {
-                mark_chains.push(edges);
-                if mark_attr.is_empty() {
-                    mark_attr = layer;
+            (true, true, _) => {
+                let name = if keep_layers { layer } else { cut_attr.clone() };
+                closed.push((edges, name));
+            }
+            (true, false, _) => {
+                let name = if keep_layers { layer } else { cut_attr.clone() };
+                match open_by_layer.iter_mut().find(|(l, _)| *l == name) {
+                    Some((_, es)) => es.extend(edges),
+                    None => open_by_layer.push((name, edges)),
                 }
+            }
+            (false, _, true) if !edges.is_empty() => {
+                if mark_attr.is_empty() {
+                    mark_attr = layer.clone();
+                }
+                let name = if keep_layers { layer } else { mark_attr.clone() };
+                mark_chains.push((edges, name));
             }
             _ => {}
         }
     }
 
-    // 2. Chain open cut edges into closed/open contours.
-    let (cut_chains, open_chains) = chain(&open_edges, join_tol);
-    closed.extend(cut_chains);
+    // 2. Chain open cut edges into closed/open contours, layer by layer.
+    let mut open_chains: Vec<(Vec<Edge>, String)> = Vec::new();
+    for (layer, edges) in &open_by_layer {
+        let (cut_chains, open) = chain(edges, join_tol);
+        closed.extend(cut_chains.into_iter().map(|c| (c, layer.clone())));
+        open_chains.extend(open.into_iter().map(|c| (c, layer.clone())));
+    }
 
     // 3. Materialize contours.
     let mut contours: Vec<Contour> = Vec::new();
-    for c in &closed {
-        if let Some(cont) = build_contour(c, &cut_attr, chord_tol) {
-            contours.push(cont);
-        }
-    }
-    for c in &open_chains {
-        if let Some(cont) = build_contour(c, &cut_attr, chord_tol) {
+    for (c, layer) in closed.iter().chain(&open_chains) {
+        if let Some(cont) = build_contour(c, layer, chord_tol) {
             contours.push(cont);
         }
     }
     // Build mark contours (for later transformation + export). Marks may be a
     // single line, so allow as few as one tessellated point.
     let mut marks: Vec<Contour> = Vec::new();
-    for c in &mark_chains {
-        if let Some(cont) = build_contour_min(c, &mark_attr, chord_tol, 1) {
+    for (c, layer) in &mark_chains {
+        if let Some(cont) = build_contour_min(c, layer, chord_tol, 1) {
             marks.push(cont);
         }
     }
@@ -416,7 +467,14 @@ pub fn assemble(
         }
         // Ensure hole winding is opposite to the outer (CW). We store tessellated
         // points; the solver only needs the outer, so winding is advisory.
-        let area = outer.abs_area() - holes.iter().map(|h| h.abs_area()).sum::<f64>();
+        // With kept layers, a blind feature (`DEPTH_<mm>`) leaves material under
+        // it: not a hole in the area.
+        let area = outer.abs_area()
+            - holes
+                .iter()
+                .filter(|h| !(keep_layers && crate::cnc_layers::is_blind_layer(&h.layer)))
+                .map(|h| h.abs_area())
+                .sum::<f64>();
         parts.push(Part {
             outer: outer.clone(),
             holes: holes.into_iter().cloned().collect(),
@@ -448,7 +506,7 @@ pub fn assemble(
         parts,
         open_chains: open_chains
             .iter()
-            .filter_map(|c| build_contour(c, &cut_attr, chord_tol))
+            .filter_map(|(c, layer)| build_contour(c, layer, chord_tol))
             .collect(),
     })
 }
@@ -1183,5 +1241,64 @@ mod tests {
         let prims = crate::dxf::to_mm(&d, "unknown", "mm");
         let a = assemble(&prims, &["cut".to_string()], &[], 0.05, 0.01).unwrap();
         assert_eq!(a.parts.len(), 1);
+    }
+
+    /// An outline drawn as four LINEs on OUTLINE, a through hole on THROUGH and a
+    /// blind pocket on DEPTH_6.35 (router layers).
+    fn router_panel() -> (Vec<Primitive>, Vec<String>, Vec<String>) {
+        let mut e = String::from("0\nSECTION\n2\nENTITIES\n");
+        for (a, b) in [
+            ((0, 0), (100, 0)),
+            ((100, 0), (100, 60)),
+            ((100, 60), (0, 60)),
+            ((0, 60), (0, 0)),
+        ] {
+            e.push_str(&format!(
+                "0\nLINE\n8\nOUTLINE\n10\n{}\n20\n{}\n11\n{}\n21\n{}\n",
+                a.0, a.1, b.0, b.1
+            ));
+        }
+        e.push_str("0\nCIRCLE\n8\nTHROUGH\n10\n20\n20\n20\n40\n5\n");
+        e.push_str("0\nCIRCLE\n8\nDEPTH_6.35\n10\n60\n20\n30\n40\n17.5\n");
+        e.push_str("0\nENDSEC\n0\nEOF\n");
+        let d = crate::dxf::parse(&e).unwrap();
+        let (cuts, marks) = auto_layers(&d, &[]);
+        (crate::dxf::to_mm(&d, "mm", "mm"), cuts, marks)
+    }
+
+    #[test]
+    fn each_contour_keeps_its_router_layer() {
+        let (prims, cuts, marks) = router_panel();
+        let a = assemble_keeping_layers(&prims, &cuts, &marks, 0.05, 0.01).unwrap();
+        assert_eq!(a.parts.len(), 1);
+        let p = &a.parts[0];
+        assert_eq!(p.outer.layer, "OUTLINE");
+        let mut holes: Vec<&str> = p.holes.iter().map(|h| h.layer.as_str()).collect();
+        holes.sort();
+        assert_eq!(holes, ["DEPTH_6.35", "THROUGH"]);
+        assert!(p.has_blind_features());
+        // The pocket leaves material: only the through hole comes off the area.
+        let want = 100.0 * 60.0 - std::f64::consts::PI * 25.0;
+        assert!((p.area - want).abs() < 1.0, "{} vs {want}", p.area);
+        // A mirror keeps the layers.
+        let m = mirror_part(p);
+        assert_eq!(m.outer.layer, "OUTLINE");
+        assert!(m.has_blind_features());
+    }
+
+    #[test]
+    fn assemble_still_names_every_contour_after_the_first_cut_layer() {
+        // The same drawing through plain `assemble`: as before, one layer name for
+        // every cut contour, and every hole off the area.
+        let (prims, cuts, marks) = router_panel();
+        let a = assemble(&prims, &cuts, &marks, 0.05, 0.01).unwrap();
+        let p = &a.parts[0];
+        let first = cuts[0].as_str();
+        assert!(p.holes.iter().chain([&p.outer]).all(|c| c.layer == first), "{cuts:?}");
+        assert!(!p.has_blind_features());
+        // Both circles come off the area (their tessellated areas).
+        let want = p.outer.abs_area() - p.holes.iter().map(|h| h.abs_area()).sum::<f64>();
+        assert_eq!(p.holes.len(), 2);
+        assert!((p.area - want).abs() < 1e-6, "{} vs {want}", p.area);
     }
 }
