@@ -110,6 +110,9 @@ cargo test --workspace --locked
 node --test crates/pdm-api/tests/web-ui.test.cjs
 ```
 
+Portal changes (`crates/pdm-api/static/`) follow [`docs/ui-guidelines.md`](docs/ui-guidelines.md);
+its checklist says what to check before merging.
+
 The last-administrator concurrency test uses an isolated Postgres database:
 
 ```sh
