@@ -62,9 +62,26 @@ Set these on **pdm** and **pdm-worker**. Compose already sets them for the bundl
 | `PDM_WORKER` | `0` on API, `1` on worker | Whether this process claims jobs |
 | `PDM_WORKER_CONCURRENCY` | `4` | Parallel jobs on the worker |
 | `PDM_LOCK_LEASE_HOURS` | `24` | Check-out lease |
+| `PDM_SESSION_IDLE_MINUTES` | `120` | A web sign-in ends after this many minutes without a request (`0` = never); see [Sign-in sessions](#sign-in-sessions) |
+| `PDM_SESSION_LIFETIME_MINUTES` | `720` | A web sign-in ends this many minutes after it was made, however busy (`0` = no limit) |
 | `PDM_MAX_UPLOAD_BYTES` | `2147483648` | Upload cap (2 GiB) |
 | `SOLIDCRAFT_GPU` | `auto` | `auto` / `hardware` / `software` / `cpu` |
 | `PDM_PORTAL_DIR` | `/opt/pdm/portal` | Static web UI (index.html, app.js) |
+
+### Sign-in sessions
+
+Signing in with a password (the portal or the Onshape panel, `POST /auth/login`) makes a web
+sign-in. It ends after `PDM_SESSION_IDLE_MINUTES` without a request (default 120) or
+`PDM_SESSION_LIFETIME_MINUTES` after it was made (default 720, 12 hours), whichever comes first,
+and the portal asks the person to sign in again. Signing out ends it at once. Two things count
+as use besides clicking around: the portal's optional auto-refresh, whenever it refreshes, and
+an open web editor (SolidCraft or another CAD editor) in a visible tab, so modelling for a long
+time doesn't end the sign-in; the lifetime still applies. If a sign-in ends while a web editor is
+open, the portal stays on the editor so the model can still be downloaded. A value that is not a
+whole number of minutes keeps the default.
+
+CAD connectors, agents and scripts should use an API token, which an administrator creates for
+a user in Administration (or with `pdm-cli create-token`): API tokens never expire on their own.
 
 ### External Postgres
 

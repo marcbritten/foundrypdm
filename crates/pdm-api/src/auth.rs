@@ -78,6 +78,27 @@ pub async fn auth_middleware(
     if tok.expires_at.is_some_and(|exp| exp < Utc::now()) {
         return Err(AppError(pdm_core::PdmError::AuthFailed));
     }
+    // A web sign-in ends when idle too long or at its lifetime; API tokens never do. An ended
+    // sign-in is deleted when it is presented, so it stays refused even if the limits are raised
+    // later. A failed check refuses the request, and so does a token deleted since the lookup.
+    let limits = state.sessions;
+    if limits.any() {
+        let ended = pdm_db::session_expired(
+            &state.pool,
+            tok.id,
+            limits.idle_minutes,
+            limits.lifetime_minutes,
+        )
+        .await?;
+        match ended {
+            None => return Err(AppError(pdm_core::PdmError::AuthFailed)),
+            Some(true) => {
+                pdm_db::delete_token(&state.pool, tok.id).await?;
+                return Err(AppError(pdm_core::PdmError::SessionExpired));
+            }
+            Some(false) => {}
+        }
+    }
     let user = match user {
         Some(u) => {
             if !u.active {

@@ -26,6 +26,9 @@ pub enum PdmError {
     Conflict(String),
     #[error("authentication failed")]
     AuthFailed,
+    /// A web sign-in that was idle too long or reached its lifetime.
+    #[error("your session expired — sign in again")]
+    SessionExpired,
     #[error("bad credentials")]
     BadCredentials,
     #[error("forbidden: {0}")]
@@ -50,6 +53,7 @@ impl PdmError {
             Self::NotFound(_) => 404,
             Self::Conflict(_) => 409,
             Self::AuthFailed => 401,
+            Self::SessionExpired => 401,
             Self::BadCredentials => 401,
             Self::Forbidden(_) => 403,
             Self::BadRequest(_) => 400,
@@ -66,6 +70,7 @@ impl PdmError {
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
             Self::AuthFailed => "auth_failed",
+            Self::SessionExpired => "session_expired",
             Self::BadCredentials => "bad_credentials",
             Self::Forbidden(_) => "forbidden",
             Self::BadRequest(_) => "bad_request",
@@ -1588,6 +1593,8 @@ mod tests {
         assert_eq!(PdmError::NotFound("x".into()).status_code(), 404);
         assert_eq!(PdmError::Conflict("x".into()).status_code(), 409);
         assert_eq!(PdmError::AuthFailed.status_code(), 401);
+        assert_eq!(PdmError::SessionExpired.status_code(), 401);
+        assert_eq!(PdmError::SessionExpired.code(), "session_expired");
         assert_eq!(PdmError::BadCredentials.status_code(), 401);
         assert_eq!(PdmError::Forbidden("x".into()).status_code(), 403);
         assert_eq!(PdmError::BadRequest("x".into()).status_code(), 400);

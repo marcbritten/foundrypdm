@@ -187,7 +187,7 @@ const PAGE: &str = r##"<!DOCTYPE html>
         <div class="divider">or connect with a token</div>
         <div class="f"><input id="token" placeholder="API token (pdm_…)" autocomplete="off"></div>
         <button id="connect">Connect</button>
-        <p class="auth-help">Tokens are minted when you sign in, or on the server with
+        <p class="auth-help">API tokens: an administrator creates them, or on the server with
           <span class="mono">pdm-cli create-token</span>.</p>
         <div id="authbuild" class="muted" style="font-size:11px; margin-top:12px;"></div>
       </div>

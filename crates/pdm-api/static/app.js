@@ -58,7 +58,9 @@ async function api(method, path, body, rawBody){
     else if (typeof data === "string" && data.trim()) msg = data;
     else msg = "HTTP " + r.status;
     const e = new Error(msg); e.status = r.status;
-    if (r.status === 401 && ME && !AUTH_BUSY) location.reload();
+    // Back to sign-in, but never under an open web editor: a reload would lose its model.
+    if (r.status === 401 && ME && !AUTH_BUSY && !document.querySelector("dialog.web-editor[open]"))
+      location.reload();
     throw e;
   }
   return data;
@@ -208,7 +210,9 @@ async function connectFromToken(){
   } catch(e){
     authBusy(false);
     if (silent){ TOKEN = ""; localStorage.removeItem("pdm_token");
-      toast("Saved session ended (" + e.message + ") — sign in again", "err", 6000); }
+      $("login-view").classList.remove("hidden");
+      toast(e.status === 401 ? "Your session expired — sign in again"
+        : "Saved session ended (" + e.message + ") — sign in again", "err", 6000); }
     else toast("Connect failed: " + e.message, "err");
   }
 }
@@ -5271,6 +5275,13 @@ function startPolling(){
     if (CUR_RELOAD) Promise.resolve(CUR_RELOAD()).catch(() => {});
     refreshApprovalsBadge();
   }, POLL_MS);
+  // A web editor makes no PDM requests while someone models in it, so an open editor in a
+  // visible tab counts as use: the sign-in doesn't idle out (its lifetime still applies).
+  // A raw fetch, so an ended sign-in never reloads the page under the editor.
+  setInterval(() => {
+    if (!ME || !TOKEN || document.hidden || !document.querySelector("dialog.web-editor[open]")) return;
+    fetch("/me", { headers: { "Authorization": "Bearer " + TOKEN } }).catch(() => {});
+  }, 30000);
 }
 
 // ── init ────────────────────────────────────────────────────────────────
