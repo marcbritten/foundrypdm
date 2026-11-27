@@ -36,40 +36,164 @@ const BLOB_MAP = new Map();
 let PZ = null;
 
 // ── API ──────────────────────────────────────────────────────────────────
-async function api(method, path, body, rawBody){
-  const headers = {};
+// A failed request throws an Error whose message reads on its own or after a "Couldn't …: " prefix:
+// the server's message without its category prefix, or a plain sentence for the status when the
+// body is empty, an HTML error page (a proxy's 502) or too long to be a message. The error also
+// carries status, code (the server's error code) and detail (the cleaned server text, may be "").
+async function api(method, path, body, rawBody, retried){
+  const headers = {}, sentToken = TOKEN;
   if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
   let payload;
   if (rawBody !== undefined) payload = rawBody;
   else if (body !== undefined){ headers["Content-Type"] = "application/json"; payload = JSON.stringify(body); }
   let r;
   try { r = await fetch(path, { method, headers, body: payload }); }
-  catch(e){ throw new Error("network error — is the server reachable?"); }
+  catch(e){ const ne = new Error("network error — is the server reachable?"); ne.status = 0; ne.code = "network"; throw ne; }
   const ctype = r.headers.get("content-type") || "";
   let data;
   if (ctype.includes("application/json")) data = await r.json().catch(()=>null);
   else if (ctype.startsWith("text/")) data = await r.text();
   else data = await r.arrayBuffer();
   if (!r.ok){
-    let msg;
-    if (r.status === 401) msg = "session expired — please sign in again";
-    else if (data && typeof data === "object" && data.error)
-      msg = typeof data.error === "string" ? data.error : (data.error.message || "error");
-    else if (typeof data === "string" && data.trim()) msg = data;
-    else msg = "HTTP " + r.status;
-    const e = new Error(msg); e.status = r.status;
-    // Back to sign-in, but never under an open web editor: a reload would lose its model.
-    if (r.status === 401 && ME && !AUTH_BUSY && !document.querySelector("dialog.web-editor[open]"))
-      location.reload();
+    const info = apiErrorText(r.status, data);
+    const e = new Error(info.message);
+    e.status = r.status; e.code = info.code; e.detail = info.detail;
+    // A signed-in session ended (signed out in another tab, account disabled): keep the page and
+    // what was typed on it, ask for the password again, then repeat this request once.
+    if (r.status === 401 && ME && !AUTH_BUSY && !retried && !String(path).startsWith("/auth/")){
+      // A session without a user (an API token) has no password to ask for: back to sign-in,
+      // but never under an open web editor, where a reload would lose its model.
+      if (!ME.user && !document.querySelector("dialog.web-editor[open]")){ location.reload(); throw e; }
+      // Sent before a sign-in that has happened since: just send it again with the new token.
+      if (TOKEN !== sentToken || await reauth()) return api(method, path, body, rawBody, true);
+    }
     throw e;
   }
   return data;
 }
+function apiErrorText(status, data){
+  let detail = "", code = "";
+  if (data && typeof data === "object" && data.error){
+    if (typeof data.error === "string") detail = data.error;
+    else { detail = data.error.message || ""; code = data.error.code || ""; }
+  } else if (typeof data === "string") detail = data.trim();
+  if (/<\s*(!doctype|html|head|body)\b/i.test(detail) || detail.length > 300) detail = "";
+  detail = detail
+    .replace(/^(not found|conflict|forbidden|bad request|validation error|database error|storage error|internal error|integrity mismatch):\s*/i, "")
+    .replace(/\b(size|limit) (\d{4,})\b/g, (m, w, n) => w + " " + bytes(n));
+  // A 404's text is mostly the missing record's id or a bare noun ("item 3fa8…", "laser nest"), and a
+  // server fault's text is for the log: those keep the plain sentence as the message and the server
+  // text as detail only. A 404 that says something ("no versions", "sheet DXF not produced") stays.
+  const says = status === 404 && /\b(no|not)\b/i.test(detail) && !/[0-9a-f]{8}-[0-9a-f]{4}/i.test(detail);
+  const own = (status === 404 && !says) || status >= 500;
+  let plain;
+  if (status === 401) plain = "your session ended — sign in again to continue";
+  else if (status === 403) plain = "you don't have permission to do this";
+  else if (status === 404) plain = "not found; it may have been deleted";
+  else if (status === 409) plain = "someone else changed it first; reload and try again";
+  else if (status === 413) plain = "the file is larger than the server accepts";
+  else if (status === 502 || status === 503 || status === 504)
+    plain = "the server did not answer; try again in a moment, and check the server log if it keeps happening";
+  else if (status >= 500) plain = "the server ran into a problem; check the server log if it keeps happening";
+  else plain = "the server refused the request";
+  const message = status === 401 || (status === 404 && !says) ? plain
+    : (!own && detail) || plain + " (HTTP " + status + ")";
+  return { message, detail, code };
+}
+// One sign-in dialog for every request that hit the ended session; resolves true once signed in.
+// Declining keeps the page as it is and offers the dialog again from a message.
+let REAUTH = null, REAUTH_DECLINED = false;
+// Shown once (not re-announced while it is still on screen). After signing in from it, the view is
+// rebuilt only if it never finished loading (no reload hook yet), so typed work is not wiped.
+function signedOutNotice(){
+  const msg = "You are signed out. Changes are not saved until you sign in again.";
+  const host = placeToasts();
+  if (host && [...host.querySelectorAll(".toast.err")].some(t => t.dataset.msg === msg)) return;
+  toast(msg, "err", { action: { label:"Sign in", run: () => reauth(true).then(ok => { if (ok && !CUR_RELOAD) render(false); }) } });
+}
+function reauth(again){
+  if (REAUTH) return REAUTH;
+  if (REAUTH_DECLINED && !again){ signedOutNotice(); return Promise.resolve(false); }
+  REAUTH_DECLINED = false;
+  const u = ME && ME.user;
+  REAUTH = openModal("Sign in again", [
+    { id:"email", label:"Email", value: u ? (u.email || "") : "", required:true, autocomplete:"username" },
+    { id:"password", label:"Password", type:"password", required:true, autocomplete:"current-password" },
+    { id:"org", label:"Organization (only if your email is in several)", autocomplete:"off",
+      value: ($("login_org") && $("login_org").value) || "" },
+  ], { label:"Sign in", busyLabel:"Signing in…", onSubmit: async v => {
+    let r;
+    try {
+      r = await fetch("/auth/login", { method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ username: v.email.trim(), password: v.password, ...(v.org.trim() ? { org: v.org.trim() } : {}) }) });
+    } catch(e){ throw new Error("network error — is the server reachable?"); }
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(r.status === 401 ? "The email or password is not right." : apiErrorText(r.status, d).message);
+    return d;
+  } }, "<p class='modal-note'>Your session ended. Sign in to carry on: what you typed on this page stays, " +
+    "and the change you were making is sent again.</p>").then(d => {
+    if (!d || !d.token){
+      REAUTH_DECLINED = true;
+      signedOutNotice();
+      return false;
+    }
+    // Someone else signed in on this page: start their workspace fresh.
+    if (d.user && ME.user && d.user.id !== ME.user.id){ localStorage.setItem("pdm_token", d.token); location.reload(); return false; }
+    TOKEN = d.token; localStorage.setItem("pdm_token", TOKEN);
+    if (d.user) ME.user = d.user;   // a changed role shows in the menus
+    return true;
+  }).finally(() => { REAUTH = null; });
+  return REAUTH;
+}
 
-let toastTimer = null;
-function toast(msg, kind, ms){ const t = $("toast"); if (!t) return;
-  t.textContent = msg; t.className = "toast " + (kind || "");
-  clearTimeout(toastTimer); toastTimer = setTimeout(()=>t.classList.add("hidden"), ms || 4200); }
+// ── toasts ───────────────────────────────────────────────────────────────
+// Information (role=status) hides by itself; errors (role=alert) stay until dismissed. opts is the
+// old hide delay in ms, or { ms, action: { label, run } } for a button such as Undo.
+function toast(msg, kind, opts){
+  const host = placeToasts(); if (!host) return;
+  const o = typeof opts === "number" ? { ms: opts } : (opts || {});
+  const isErr = kind === "err";
+  const region = host.querySelector(isErr ? "[role=alert]" : "[role=status]") || host;
+  for (const old of [...region.children])
+    if (!isErr || old.dataset.msg === String(msg)) old.remove();
+  while (isErr && region.children.length >= 3) region.firstElementChild.remove();
+  const t = document.createElement("div");
+  t.className = "toast " + (kind || ""); t.dataset.msg = String(msg);
+  if (isErr){
+    const ic = document.createElement("span"); ic.className = "ticon"; ic.setAttribute("aria-hidden", "true");
+    ic.innerHTML = "<svg class='icon sm'><use href='#ic-warning'/></svg>"; t.appendChild(ic);
+  }
+  const text = document.createElement("span"); text.className = "tmsg"; text.textContent = msg; t.appendChild(text);
+  const close = () => { clearTimeout(t._timer); t.remove(); };
+  if (o.action){
+    const b = document.createElement("button"); b.type = "button"; b.className = "small";
+    b.textContent = o.action.label;
+    b.onclick = () => { close(); o.action.run(); };
+    t.appendChild(b);
+  }
+  if (isErr){
+    const x = document.createElement("button"); x.type = "button"; x.className = "small";
+    x.textContent = "Dismiss"; x.onclick = close; t.appendChild(x);
+  } else t._timer = setTimeout(close, o.ms || (o.action ? 8000 : 4200));
+  region.appendChild(t);
+}
+// A modal <dialog> sits in the top layer and makes the rest of the page inert, so the messages
+// live in the topmost open one, else on the page. `leaving` is a dialog that is closing (with any
+// dialog inside it). The container is kept by reference, so a dialog removed by other code cannot
+// take it away for good.
+function placeToasts(leaving){
+  const host = placeToasts.host || (placeToasts.host = $("toast"));
+  if (!host) return null;
+  const modal = [...document.querySelectorAll("dialog[open]")]
+    .filter(d => d.matches(":modal") && !(leaving && leaving.contains(d))).pop();
+  const want = modal || document.body;
+  if (host.parentNode !== want){
+    want.appendChild(host);
+    // (A dialog that opened again straight away keeps them.)
+    if (modal) modal.addEventListener("close", () => placeToasts(modal.open ? null : modal), { once:true });
+  }
+  return host;
+}
 
 // ── thumbnails (auth-gated → fetch with the token, cache object URLs) ────
 async function thumbUrl(src){
@@ -134,14 +258,28 @@ function lockName(lock){ if (!lock) return ""; const u = UMAP[lock.user_id];
 function actorName(ev){ const u = UMAP[ev.actor_id];
   return (u && (u.display_name || u.email)) || (ev.actor_name || "system"); }
 
-// ── modal (fields: {id,label,type,options,value,required,placeholder}) ───
-function openModal(title, fields, submitLabel, extraHtml, into){
+// ── modal (fields: {id,label,type,options,value,required,placeholder,autocomplete}) ───
+// `submit` is the button label, or { label, busyLabel, danger, onSubmit }. Without onSubmit the
+// promise resolves with the field values as soon as the form is submitted. With onSubmit(values)
+// the dialog stays open while it runs (fields and buttons disabled, button shows busyLabel, a second
+// submit does nothing); a thrown error is shown inside the dialog (err.field marks that field) and
+// the user can correct and retry; the promise resolves with onSubmit's result (or the values) once
+// it succeeds. Cancel, Escape and the close button resolve null. A native modal <dialog> keeps focus
+// inside and stacks above any open dialog (`into` is still honoured), and focus returns to the
+// control that opened it.
+function openModal(title, fields, submit, extraHtml, into){
+  const opt = submit && typeof submit === "object" ? submit : { label: submit };
+  const label = opt.label || "Save";
   return new Promise(resolve => {
-    const wrap = document.createElement("div"); wrap.className = "modal-backdrop";
+    const opener = document.activeElement;
+    const uid = "md" + Math.random().toString(36).slice(2, 8);
+    const wrap = document.createElement("dialog"); wrap.className = "modal-backdrop";
+    wrap.setAttribute("aria-labelledby", uid + "-t");
     const win = document.createElement("div"); win.className = "modal";
     const head = document.createElement("div"); head.className = "modal-head";
-    const ht = document.createElement("h3"); ht.textContent = title; head.appendChild(ht);
-    const x = document.createElement("button"); x.className = "modal-x"; x.textContent = "✕"; head.appendChild(x);
+    const ht = document.createElement("h3"); ht.id = uid + "-t"; ht.textContent = title; head.appendChild(ht);
+    const x = document.createElement("button"); x.type = "button"; x.className = "modal-x"; x.textContent = "✕";
+    x.setAttribute("aria-label", "Close"); x.title = "Close"; head.appendChild(x);
     // A real form: reportValidity() (below) is a form method — a plain div threw and the
     // upload never left the page. onsubmit keeps Enter in a field from navigating away.
     const body = document.createElement("form"); body.className = "modal-body";
@@ -154,7 +292,9 @@ function openModal(title, fields, submitLabel, extraHtml, into){
       if (f.type === "select"){ el = document.createElement("select"); }
       else if (f.type === "textarea"){ el = document.createElement("textarea"); el.rows = 4; }
       else { el = document.createElement("input"); el.type = f.type === "password" ? "password" : "text"; }
+      el.id = uid + "-" + f.id; lab.htmlFor = el.id;
       if (f.placeholder) el.placeholder = f.placeholder;
+      if (f.autocomplete) el.setAttribute("autocomplete", f.autocomplete);
       if (f.required) el.required = true;
       if (f.options) for (const o of f.options){ const op = document.createElement("option");
         const isObj = typeof o === "object" && o !== null;
@@ -162,32 +302,101 @@ function openModal(title, fields, submitLabel, extraHtml, into){
       if (f.value !== undefined) el.value = f.value;
       div.appendChild(el); body.appendChild(div); inputs[f.id] = el;
     }
+    const err = document.createElement("div"); err.className = "modal-err"; err.id = uid + "-err";
+    err.setAttribute("role", "alert"); err.hidden = true; body.appendChild(err);
     const foot = document.createElement("div"); foot.className = "modal-foot";
-    const cancel = document.createElement("button"); cancel.textContent = "Cancel";
-    const submit = document.createElement("button"); submit.textContent = submitLabel || "OK";
-    submit.style.background = "#2f4a77";
-    foot.appendChild(cancel); foot.appendChild(submit);
-    let closed = false;
-    const done = v => { if (closed) return; closed = true; wrap.remove();
-      document.removeEventListener("keydown", onKey); resolve(v); };
-    const onKey = e => { if (e.key === "Escape" && document.querySelector(".modal-backdrop:last-of-type") === wrap) done(null); };
-    cancel.onclick = () => done(null);
-    x.onclick = () => done(null);
-    wrap.onmousedown = e => { if (e.target === wrap) done(null); };
-    const submitForm = () => {
+    const cancel = document.createElement("button"); cancel.type = "button"; cancel.textContent = "Cancel";
+    const ok = document.createElement("button"); ok.type = "button"; ok.textContent = label;
+    ok.className = opt.danger ? "danger" : "primary";
+    foot.appendChild(cancel); foot.appendChild(ok);
+    const values = () => { const v = {}; for (const k in inputs) v[k] = inputs[k].value; return v; };
+    const start = JSON.stringify(values());
+    let busy = false, gone = false, settled = false;
+    const settle = v => { if (!settled){ settled = true; resolve(v); } };
+    const teardown = () => {
+      if (gone) return; gone = true;
+      document.removeEventListener("keydown", onKey);
+      // Messages shown while the dialog was open move out to the dialog under it, or the page.
+      placeToasts(wrap);
+      if (wrap.open && wrap.close) wrap.close();
+      wrap.remove();
+      if (opener && opener.isConnected && opener.focus) opener.focus();
+    };
+    const finish = v => { teardown(); settle(v); };
+    // While a request runs the dialog stays; if the browser closes it anyway, the result is still
+    // delivered (an error as a message) when the request ends.
+    const dismiss = () => { if (busy) teardown(); else finish(null); };
+    const onKey = e => { if (e.key === "Escape" && !busy && document.querySelector(".modal-backdrop:last-of-type") === wrap) finish(null); };
+    cancel.onclick = dismiss;
+    x.onclick = dismiss;
+    // Escape while a request runs does nothing. The browser can still close a dialog without asking
+    // (a second Escape while busy, or one Escape that also closes a dialog opened on top of it, such
+    // as the sign-in after a session ended): unless this code closed it, it opens again.
+    // One Escape closes one dialog: the browser sends it to every dialog opened without a click
+    // (the sign-in over a busy delete), and only the first one takes it.
+    wrap.addEventListener("cancel", e => {
+      e.preventDefault();
+      if (busy || openModal.escTaken) return;
+      openModal.escTaken = true; setTimeout(() => { openModal.escTaken = false; }, 0);
+      dismiss();
+    });
+    wrap.addEventListener("close", () => {
+      if (gone) return;
+      if (wrap.isConnected && typeof wrap.showModal === "function"){
+        try { wrap.showModal(); placeToasts(); return; } catch(e){}
+      }
+      dismiss();
+    });
+    // A click beside the dialog closes it only while nothing has been typed (not on its scrollbar).
+    wrap.onmousedown = e => {
+      if (e.target !== wrap || busy || JSON.stringify(values()) !== start) return;
+      if (wrap.clientWidth && (e.offsetX >= wrap.clientWidth || e.offsetY >= wrap.clientHeight)) return;
+      finish(null);
+    };
+    const setBusy = on => {
+      busy = on;
+      for (const k in inputs) inputs[k].disabled = on;
+      ok.disabled = cancel.disabled = x.disabled = on;
+      ok.textContent = on ? (opt.busyLabel || "Working…") : label;
+      wrap.setAttribute("aria-busy", on ? "true" : "false");
+    };
+    const showErr = (msg, field) => {
+      msg = String(msg || "This did not finish; try again.");
+      err.textContent = msg.charAt(0).toUpperCase() + msg.slice(1); err.hidden = false;
+      for (const k in inputs){ inputs[k].removeAttribute("aria-invalid"); inputs[k].removeAttribute("aria-describedby"); }
+      const el = field && inputs[field];
+      if (el){ el.setAttribute("aria-invalid", "true"); el.setAttribute("aria-describedby", err.id); }
+      const to = el || body.querySelector("input,select,textarea") || ok;
+      if (to && to.focus) to.focus();
+    };
+    const submitForm = async () => {
+      if (busy || gone) return;
       if (!body.reportValidity()) return;
-      const v = {}; for (const k in inputs) v[k] = inputs[k].value;
-      done(v);
+      const v = values();
+      if (!opt.onSubmit) return finish(v);
+      err.hidden = true;
+      setBusy(true);
+      try {
+        const r = await opt.onSubmit(v);
+        busy = false;
+        finish(r === undefined || r === null ? v : r);   // null is not a cancel
+      } catch(e){
+        busy = false;
+        if (gone){ settle(null); toast("Couldn't finish “" + title.replace(/\?$/, "") + "”: " + e.message, "err"); return; }
+        setBusy(false);
+        showErr(e.message, e.field);
+      }
     };
     body.onsubmit = e => { e.preventDefault(); submitForm(); };
     const implicitSubmit = document.createElement("button");
     implicitSubmit.type = "submit"; implicitSubmit.hidden = true;
     body.appendChild(implicitSubmit);
-    submit.onclick = submitForm;
+    ok.onclick = submitForm;
     win.appendChild(head); win.appendChild(body); win.appendChild(foot);
     wrap.appendChild(win); (into || document.body).appendChild(wrap);
-    document.addEventListener("keydown", onKey);
-    const first = body.querySelector("input,select,textarea"); if (first) first.focus();
+    if (typeof wrap.showModal === "function") wrap.showModal();
+    else { wrap.setAttribute("open", ""); document.addEventListener("keydown", onKey); }
+    const first = body.querySelector("input,select,textarea") || cancel; if (first) first.focus();
   });
 }
 
@@ -669,18 +878,18 @@ function feed(events, max){
 
 // ── approvals (shared by dashboard widget, approval center, detail) ─────
 async function decideApproval(id, decision){
-  const f = await openModal(decision === "approve" ? "Approve release" : "Reject approval",
+  const approve = decision === "approve";
+  const f = await openModal(approve ? "Approve release" : "Reject approval",
     [{ id:"note", label:"Note (optional)", type:"textarea",
-       placeholder: decision === "approve" ? "e.g. meets the release criteria" : "why is this being rejected?" }],
-    decision === "approve" ? "Approve" : "Reject");
+       placeholder: approve ? "e.g. meets the release criteria" : "why is this being rejected?" }],
+    { label: approve ? "Approve" : "Reject", busyLabel: approve ? "Approving…" : "Rejecting…",
+      onSubmit: v => api("POST", "/approvals/" + id + "/decide", { decision, note: v.note || null }) });
   if (!f) return;
-  try {
-    await api("POST", "/approvals/" + id + "/decide", { decision, note: f.note || null });
-    toast(decision === "approve" ? "Approved — item released" : "Approval rejected", "ok");
-    ALLITEMS = [];
-    CUR_RELOAD && CUR_RELOAD();
-    refreshApprovalsBadge();
-  } catch(e){ toast("Decision failed: " + e.message, "err"); }
+  // The approval leaves the list in place; the release itself happens on the item's page.
+  if (approve) toast("Approved — item released", "ok");
+  ALLITEMS = [];
+  CUR_RELOAD && CUR_RELOAD();
+  refreshApprovalsBadge();
 }
 async function refreshApprovalsBadge(kpis){
   try {
@@ -696,13 +905,25 @@ async function refreshApprovalsBadge(kpis){
     b.style.display = n > 0 ? "" : "none";
   } catch(e){}
 }
-async function doLifecycle(id, state){
-  try {
-    await api("PATCH", "/items/" + id + "/lifecycle", { state });
-    toast("Lifecycle → " + state, "ok");
-    ALLITEMS = [];
-    CUR_RELOAD && CUR_RELOAD();
-  } catch(e){ toast("Lifecycle: " + e.message, "err"); }
+// Asks first (the portal has no way back), names the item and the change, and explains the
+// server's refusal when the organization has no lifecycle rules. The new state shows on the item.
+async function doLifecycle(id, state, it){
+  const pn = (it && it.part_number) || "this item";
+  const to = String(state).charAt(0).toUpperCase() + String(state).slice(1);
+  const from = it && it.lifecycle_state ? String(it.lifecycle_state).charAt(0).toUpperCase() + String(it.lifecycle_state).slice(1) : "";
+  const f = await openModal("Mark " + pn + " as " + state + "?", [],
+    { label: "Mark " + state, busyLabel: "Saving…", onSubmit: async () => {
+      try { await api("PATCH", "/items/" + id + "/lifecycle", { state }); }
+      catch(e){
+        if (/no lifecycle definition/i.test(e.message))
+          throw new Error("This organization has no lifecycle rules set up, so items cannot change lifecycle state from here.");
+        throw e;
+      }
+    } },
+    "<p class='modal-note'>Its lifecycle state changes " + (from ? "from " + esc(from) + " " : "") + "to " + esc(to) + ".</p>");
+  if (!f) return;
+  ALLITEMS = [];
+  CUR_RELOAD && CUR_RELOAD();
 }
 
 // ── shared data ─────────────────────────────────────────────────────────
@@ -854,129 +1075,206 @@ function wireItemTable(container, opts){
 function openDetail(id){ go("detail", { id, origin: ROUTE.name === "explorer" ? "explorer" : ROUTE.name,
   _epid: ROUTE.pid || null, _back: routeToHash() }); }
 
-// ── context menu ────────────────────────────────────────────────────────
-function showCtxMenu(x, y, it){
-  const pid = it._project_id || it.project_id || ROUTE.pid;
-  const entries = [
-    { label:"Open details", key:"↵", act: () => openDetail(it.id) },
-  ];
-  const mainId = PMAP[pid] && PMAP[pid].main_assembly_id;
-  entries.push(mainId === it.id
-    ? { label:"Unset main assembly", act: () => setMainAssembly(pid, null) }
-    : { label:"Set as main assembly", act: () => setMainAssembly(pid, it.id) });
+// ── item actions menus (right-click and ⋮ share one list) ───────────────
+// The item a menu acts on: the open item page, a loaded list row, or a fresh fetch (Items, Search and
+// the Dashboard keep no row cache, so their menus used to do nothing or guess the archived state).
+function cachedItem(id){
+  if (ROUTE.name === "detail" && DETAIL.id === id && DETAIL.data && DETAIL.data.item) return DETAIL.data.item;
+  return (ROUTE._items || []).find(x => x.id === id) || ALLITEMS.find(x => x.id === id) || null;
+}
+async function menuItem(id){
+  return cachedItem(id) || (await api("GET", "/items/" + id)).item;
+}
+// Filtered by role (viewers browse and download; editors change) and by state. On the item's own
+// page the header already offers opening, uploading and releasing.
+function itemMenuEntries(it){
+  const ed = isRole("editor"), pid = it._project_id || it.project_id || ROUTE.pid;
+  const onPage = ROUTE.name === "detail" && DETAIL.id === it.id;
+  const entries = [];
+  if (!onPage) entries.push({ label:"Open details", key:"↵", act: () => openDetail(it.id) });
   if (it.head_version_seq) entries.push({ label:"Download latest", act: () => downloadLatest(it) });
   const editor = PdmEditors.forFile(it.mime_type, it.filename);
   if (it.head_version_seq && editor) entries.push({ label:"Open in " + editor.label + " (web)", act: () => openWebEditor(it.id) });
-  if (it.head_version_seq && isRole("editor") && convertibleByName(it.filename))
+  if (it.head_version_seq && ed && convertibleByName(it.filename))
     entries.push({ label:"Import to SolidCraft (Dutchman)", act: () => importItemHead(it) });
-  if (!it.locked_by) entries.push({ label:"Check out", act: () => doCheckout(it.id) });
-  else if (it.locked_by === myName()) entries.push({ label:"Undo checkout", act: () => doUndo(it.id) });
-  entries.push({ label:"Upload new version", act: () => openDetail(it.id) });
+  if (it.locked_by && it.locked_by === myName()) entries.push({ label:"Undo checkout", act: () => doUndo(it.id, it) });
+  else if (ed && !it.locked_by && !it.archived_at) entries.push({ label:"Check out", act: () => doCheckout(it.id, it) });
+  if (ed && !onPage && !it.archived_at) entries.push({ label:"Open to upload a new version", act: () => openDetail(it.id) });
+  if (!ed) return entries;
   entries.push("sep");
-  entries.push({ label:"Move to folder…", act: () => moveItems(pid, [it.id]) });
-  entries.push({ label:"Assign owner…", act: () => assignOwner([it.id]) });
-  entries.push({ label:"Release revision…", act: () => openDetail(it.id) });
+  entries.push({ label:"Move to folder…", act: () => moveItems(pid, [it.id], [it]) });
+  entries.push({ label:"Assign owner…", act: () => assignOwner([it.id], [it]) });
+  if (pid){
+    const mainId = PMAP[pid] && PMAP[pid].main_assembly_id;
+    entries.push(mainId === it.id
+      ? { label:"Unset main assembly", act: () => setMainAssembly(pid, null) }
+      : { label:"Set as main assembly", act: () => setMainAssembly(pid, it.id) });
+  }
+  if (!onPage && !it.archived_at) entries.push({ label:"Open to release", act: () => openDetail(it.id) });
   if (!it.archived_at && it.lifecycle_state === "released")
-    entries.push({ label:"Mark obsolete", act: () => doLifecycle(it.id, "obsolete") });
+    entries.push({ label:"Mark obsolete…", act: () => doLifecycle(it.id, "obsolete", it) });
   entries.push("sep");
-  entries.push({ label: it.archived_at ? "Unarchive" : "Archive", act: () => doArchiveItem(it.id) });
-  entries.push({ label:"Delete", danger:true, act: () => doDeleteItem(it.id) });
-  const m = $("ctxmenu");
-  m.innerHTML = entries.map((en, i) => en === "sep" ? "<div class='sep'></div>" :
-    "<div class='ci" + (en.danger ? " danger" : "") + "' data-i='" + i + "'><span>" + esc(en.label) + "</span>" +
-    (en.key ? "<span class='k'>" + esc(en.key) + "</span>" : "") + "</div>").join("");
-  m.classList.remove("hidden");
-  const r = m.getBoundingClientRect();
-  m.style.left = Math.max(4, Math.min(x, innerWidth - r.width - 8)) + "px";
-  m.style.top = Math.max(4, Math.min(y, innerHeight - r.height - 8)) + "px";
-  m.onclick = e => { const ci = e.target.closest(".ci"); if (!ci) return;
-    const en = entries[+ci.dataset.i]; hideCtx(); if (en && en.act) en.act(); };
+  entries.push({ label: it.archived_at ? "Unarchive" : "Archive", act: () => doArchiveItem(it.id, it) });
+  entries.push({ label:"Delete…", danger:true, act: () => doDeleteItem(it.id, it) });
+  return entries;
 }
-function hideCtx(){ $("ctxmenu").classList.add("hidden"); }
+// Menu items are buttons: arrow keys move, Escape closes and returns focus to what opened the menu.
+function showMenu(m, entries, trigger, place){
+  const cls = m.id === "ctxmenu" ? "ci" : "ki";
+  m.setAttribute("role", "menu");
+  m.innerHTML = entries.length ? entries.map((en, i) => en === "sep" ? "<div class='sep' role='separator'></div>" :
+    "<button type='button' role='menuitem' class='" + cls + (en.danger ? " danger" : "") + "' data-i='" + i + "'><span>" +
+    esc(en.label) + "</span>" + (en.key ? "<span class='k'>" + esc(en.key) + "</span>" : "") + "</button>").join("")
+    : "<div class='ki-note dim'>Your role can view this but not change it.</div>";
+  m.classList.remove("hidden");
+  m._trigger = trigger || null;
+  place(m);
+  const btns = [...m.querySelectorAll("button[role=menuitem]")];
+  const close = refocus => { m.classList.add("hidden"); if (refocus && m._trigger && m._trigger.isConnected) m._trigger.focus(); };
+  m.onclick = e => { const b = e.target.closest("button[data-i]"); if (!b) return;
+    const en = entries[+b.dataset.i]; close(true); if (en && en.act) en.act(); };
+  m.onkeydown = e => {
+    const i = btns.indexOf(document.activeElement);
+    if (e.key === "ArrowDown" || e.key === "ArrowUp"){
+      e.preventDefault();
+      const n = btns.length; if (!n) return;
+      btns[((i < 0 ? (e.key === "ArrowDown" ? -1 : 0) : i) + (e.key === "ArrowDown" ? 1 : n - 1)) % n].focus();
+    } else if (e.key === "Home" || e.key === "End"){ e.preventDefault(); if (btns.length) btns[e.key === "Home" ? 0 : btns.length - 1].focus(); }
+    else if (e.key === "Escape"){ e.preventDefault(); e.stopPropagation(); close(true); }
+    else if (e.key === "Tab") close(true);
+  };
+  if (btns.length) btns[0].focus();
+}
+function showCtxMenu(x, y, it, trigger){
+  hideKebab();
+  showMenu($("ctxmenu"), itemMenuEntries(it), trigger || document.activeElement, m => {
+    const r = m.getBoundingClientRect();
+    m.style.left = Math.max(4, Math.min(x, innerWidth - r.width - 8)) + "px";
+    m.style.top = Math.max(4, Math.min(y, innerHeight - r.height - 8)) + "px";
+  });
+}
+// Closing a menu (or opening another) also cancels one still waiting for its item to load.
+function hideCtx(){ MENU_SEQ.n++; $("ctxmenu").classList.add("hidden"); }
+const MENU_SEQ = { n: 0 };
 document.addEventListener("click", e => { if (!e.target.closest("#ctxmenu")) hideCtx(); });
 document.addEventListener("scroll", hideCtx, true);
 window.addEventListener("resize", hideCtx);
+// Item rows whose list keeps no row cache: the row's own handler shows nothing, so the menu is shown
+// here from the item fetched by id. The capture-phase hide stops a menu from another row lingering.
+document.addEventListener("contextmenu", () => hideCtx(), true);
+document.addEventListener("contextmenu", async e => {
+  const tr = e.target.closest && e.target.closest("tr.clickable[data-id]");
+  if (!tr || !tr.querySelector("button.kebab-btn[data-kb='item']")) return;
+  if (!$("ctxmenu").classList.contains("hidden")) return;
+  e.preventDefault();
+  const x = e.clientX, y = e.clientY, kb = tr.querySelector("button.kebab-btn"), seq = MENU_SEQ.n;
+  let it;
+  try { it = await menuItem(tr.dataset.id); }
+  catch(err){ toast("Couldn't load the item's actions: " + err.message, "err"); return; }
+  if (seq === MENU_SEQ.n && tr.isConnected) showCtxMenu(x, y, it, kb);
+});
 
-// ── kebab (⋮) menu: archive / delete for projects & items ───────────────
-function openKebabMenu(ev, id, kind){
+// ── kebab (⋮) menu: the item actions above, or edit / archive / delete for projects ──
+async function openKebabMenu(ev, id, kind){
   ev.stopPropagation();
-  const p = kind === "proj" ? PMAP[id] : null;
-  const it = (ALLITEMS.find(x => x.id === id)) || (ROUTE._items || []).find(x => x.id === id) || null;
-  const archived = kind === "proj" ? !!(p && p.archived_at) : !!(it && it.archived_at);
-  const entries = [];
-  if (kind === "proj")
-    entries.push({ label: "Edit", act: () => doEditProject(id) });
-  if (kind === "item" && it && isRole("editor") && it.head_version_seq && convertibleByName(it.filename))
-    entries.push({ label: "Import to SolidCraft (Dutchman)", act: () => importItemHead(it) });
-  entries.push(
-    { label: archived ? "Unarchive" : "Archive", act: () =>
-        (kind === "proj" ? doArchiveProject(id) : doArchiveItem(id)) },
-    "sep",
-    { label: "Delete", danger: true, act: () =>
-        (kind === "proj" ? doDeleteProject(id) : doDeleteItem(id)) },
-  );
+  const trigger = ev.currentTarget;
   const m = $("kebabmenu");
-  m.innerHTML = entries.map((en, i) => en === "sep" ? "<div class='sep'></div>" :
-    "<div class='ki" + (en.danger ? " danger" : "") + "' data-i='" + i + "'><span>" +
-    esc(en.label) + "</span></div>").join("");
-  m.classList.remove("hidden");
-  const r = ev.currentTarget.getBoundingClientRect();
-  let left = Math.max(6, Math.min(r.right - m.offsetWidth, innerWidth - m.offsetWidth - 6));
-  let top = r.bottom + 4;
-  if (top + m.offsetHeight > innerHeight - 6) top = Math.max(6, r.top - m.offsetHeight - 4);
-  m.style.left = left + "px";
-  m.style.top = top + "px";
-  m.onclick = e => {
-    const ki = e.target.closest(".ki"); if (!ki) return;
-    const en = entries[+ki.dataset.i];
-    hideKebab(); if (en && en.act) en.act();
-  };
+  if (!m.classList.contains("hidden") && m._trigger === trigger){ hideKebab(); return; }
+  hideCtx();
+  let entries;
+  if (kind === "proj"){
+    const p = PMAP[id];
+    entries = !isRole("editor") ? [] : [
+      { label: "Edit", act: () => doEditProject(id) },
+      { label: p && p.archived_at ? "Unarchive" : "Archive", act: () => doArchiveProject(id) },
+      "sep",
+      { label: "Delete…", danger: true, act: () => doDeleteProject(id) },
+    ];
+  } else {
+    const seq = MENU_SEQ.n;
+    let it;
+    try { it = await menuItem(id); }
+    catch(e){ toast("Couldn't load the item's actions: " + e.message, "err"); return; }
+    if (seq !== MENU_SEQ.n || !trigger.isConnected) return;   // closed or left meanwhile
+    entries = itemMenuEntries(it);
+  }
+  showMenu(m, entries, trigger, menu => {
+    const r = trigger.getBoundingClientRect();
+    const left = Math.max(6, Math.min(r.right - menu.offsetWidth, innerWidth - menu.offsetWidth - 6));
+    let top = r.bottom + 4;
+    if (top + menu.offsetHeight > innerHeight - 6) top = Math.max(6, r.top - menu.offsetHeight - 4);
+    menu.style.left = left + "px";
+    menu.style.top = top + "px";
+  });
 }
-function hideKebab(){ const m = $("kebabmenu"); if (m) m.classList.add("hidden"); }
+function hideKebab(){ MENU_SEQ.n++; const m = $("kebabmenu"); if (m) m.classList.add("hidden"); }
 function wireKebabs(container){
-  container.querySelectorAll("button.kebab-btn[data-kid]").forEach(b =>
-    b.addEventListener("click", e => openKebabMenu(e, b.dataset.kid, b.dataset.kb || "item")));
+  container.querySelectorAll("button.kebab-btn[data-kid]").forEach(b => {
+    b.setAttribute("aria-haspopup", "menu");
+    if (!b.getAttribute("aria-label")) b.setAttribute("aria-label", b.title || "Actions");
+    b.addEventListener("click", e => openKebabMenu(e, b.dataset.kid, b.dataset.kb || "item"));
+  });
 }
 document.addEventListener("click", e => {
   if (!e.target.closest("#kebabmenu") && !e.target.closest("button.kebab-btn")) hideKebab();
 });
-document.addEventListener("keydown", e => { if (e.key === "Escape") hideKebab(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape"){ hideKebab(); hideCtx(); } });
 document.addEventListener("scroll", hideKebab, true);
 
-async function doArchiveItem(id){
-  const it = (ALLITEMS.find(x => x.id === id)) || (ROUTE._items || []).find(x => x.id === id);
-  const wasArchived = !!(it && it.archived_at);
+// Archive and unarchive run at once and offer Undo (archived items leave the lists). `item`, when the
+// caller has it, says which way to go; otherwise the item is looked up so the state is never guessed.
+async function doArchiveItem(id, item){
+  let it = item;
+  if (!it){
+    try { it = await menuItem(id); }
+    catch(e){ toast("Couldn't archive the item: " + e.message, "err"); return; }
+  }
+  const was = !!it.archived_at, pn = it.part_number || "the item";
   try {
-    await api("PATCH", "/items/" + id + (wasArchived ? "/unarchive" : "/archive"));
-    toast(wasArchived ? "Unarchived" : "Archived", "ok");
+    await api("PATCH", "/items/" + id + (was ? "/unarchive" : "/archive"));
     ALLITEMS = [];
     CUR_RELOAD && CUR_RELOAD();
-  } catch(e){ toast("Archive: " + e.message, "err"); }
+    const now = Object.assign({}, it, { archived_at: was ? null : new Date().toISOString() });
+    toast((was ? "Unarchived " : "Archived ") + pn, "ok",
+      { action: { label:"Undo", run: () => doArchiveItem(id, now) } });
+  } catch(e){ toast("Couldn't " + (was ? "unarchive " : "archive ") + pn + ": " + e.message, "err"); }
 }
-async function doDeleteItem(id){
-  const f = await openModal("Delete item", [
-    { id:"confirm", label:"Type “delete” to confirm — this cannot be undone",
-      required:true, placeholder:"delete" }
-   ], "Delete");
-  if (!f || (f.confirm || "").trim().toLowerCase() !== "delete") return;
-  try {
+// Deleting cannot be undone: the dialog names the item and what goes with it, asks for its part
+// number, and keeps a wrong entry or a server error in the dialog.
+async function doDeleteItem(id, item){
+  let it = item;
+  if (!it){
+    try { it = await menuItem(id); }
+    catch(e){ toast("Couldn't delete the item: " + e.message, "err"); return; }
+  }
+  const pn = it.part_number || "", n = Number(it.head_version_seq) || 0;
+  const what = n ? "the item and its " + n + (n === 1 ? " version" : " versions") : "the item";
+  const ok = await openModal("Delete " + pn + (it.description ? " — " + it.description : "") + "?", [
+    { id:"confirm", label:"Type " + pn + " to confirm", required:true, autocomplete:"off" }
+  ], { label:"Delete item", busyLabel:"Deleting…", danger:true, onSubmit: async v => {
+    if (v.confirm.trim().toUpperCase() !== pn.toUpperCase())
+      throw Object.assign(new Error("Type " + pn + " exactly to confirm."), { field:"confirm" });
     await api("DELETE", "/items/" + id);
-    toast("Item deleted", "ok");
-    ALLITEMS = [];
-    if (ROUTE.name === "detail" && DETAIL.id === id)
-      go(ROUTE.origin || "dashboard", { pid: ROUTE._epid || undefined });
-    else CUR_RELOAD && CUR_RELOAD();
-  } catch(e){ toast("Delete: " + e.message, "err"); }
+  } }, "<p class='modal-note'>Deletes " + esc(what) + ". This cannot be undone." +
+    (it.latest_revision ? " It has released revision " + esc(it.latest_revision) + "." : "") + "</p>");
+  if (!ok) return;
+  ALLITEMS = [];
+  if (ROUTE.name === "detail" && DETAIL.id === id){
+    toast("Deleted " + pn, "ok");
+    go(ROUTE.origin || "dashboard", { pid: ROUTE._epid || undefined });
+  } else CUR_RELOAD && CUR_RELOAD();
 }
-async function doArchiveProject(id){
-  const p = PMAP[id];
-  const wasArchived = !!(p && p.archived_at);
+async function doArchiveProject(id, project){
+  const p = project || PMAP[id] || { id, name: "the project" };
+  const was = !!p.archived_at;
   try {
-    await api("PATCH", "/projects/" + id + (wasArchived ? "/unarchive" : "/archive"));
-    toast(wasArchived ? "Project unarchived" : "Project archived", "ok");
+    await api("PATCH", "/projects/" + id + (was ? "/unarchive" : "/archive"));
     await loadCommon();
     CUR_RELOAD && CUR_RELOAD();
-  } catch(e){ toast("Archive: " + e.message, "err"); }
+    const now = Object.assign({}, p, { archived_at: was ? null : new Date().toISOString() });
+    toast((was ? "Unarchived project " : "Archived project ") + p.name, "ok",
+      { action: { label:"Undo", run: () => doArchiveProject(id, now) } });
+  } catch(e){ toast("Couldn't " + (was ? "unarchive " : "archive ") + "project " + p.name + ": " + e.message, "err"); }
 }
 function loadImg(src){ return new Promise((res, rej) => { const im = new Image();
   im.onload = () => res(im); im.onerror = () => rej(new Error("could not load image")); im.src = src; }); }
@@ -1046,22 +1344,30 @@ async function doEditProject(id){
     CUR_RELOAD && CUR_RELOAD();
   } catch(e){ toast("Edit: " + e.message, "err"); }
 }
+// Deleting a project takes its items with it, so the user types the project's name.
 async function doDeleteProject(id){
+  if (!PMAP[id]) await loadCommon().catch(() => {});
   const p = PMAP[id];
-  const f = await openModal("Delete project", [
-    { id:"confirm", label:"Type “delete” to confirm — project “" +
-      (p ? p.name : id) + "” and all its items will be removed",
-      required:true, placeholder:"delete" }
-   ], "Delete");
-  if (!f || (f.confirm || "").trim().toLowerCase() !== "delete") return;
-  try {
+  // Never ask for a name the dialog cannot show.
+  if (!p || !String(p.name || "").trim()){
+    toast("Couldn't delete the project: it is no longer in the list; reload and try again", "err"); return;
+  }
+  const n = await api("GET", "/projects/" + id + "/items?limit=1&include_archived=true")
+    .then(d => d.total).catch(() => null);
+  const items = n == null ? "all its items" : n === 1 ? "its 1 item" : "its " + n + " items";
+  const ok = await openModal("Delete project " + p.name + "?", [
+    { id:"confirm", label:"Type the project name to confirm", required:true, autocomplete:"off" }
+  ], { label:"Delete project", busyLabel:"Deleting…", danger:true, onSubmit: async v => {
+    if (v.confirm.trim() !== p.name.trim())
+      throw Object.assign(new Error("Type " + p.name + " exactly to confirm."), { field:"confirm" });
     await api("DELETE", "/projects/" + id);
-    toast("Project deleted", "ok");
-    ALLITEMS = [];
-    await loadCommon();
-    if (ROUTE.name === "explorer" && ROUTE.pid === id) go("projects");
-    else CUR_RELOAD && CUR_RELOAD();
-  } catch(e){ toast("Delete: " + e.message, "err"); }
+  } }, "<p class='modal-note'>Deletes the project and " + esc(items) +
+    ", with all their versions and files. This cannot be undone.</p>");
+  if (!ok) return;
+  ALLITEMS = [];
+  await loadCommon().catch(() => {});
+  if (ROUTE.name === "explorer" && ROUTE.pid === id){ toast("Deleted project " + p.name, "ok"); go("projects"); }
+  else CUR_RELOAD && CUR_RELOAD();
 }
 
 // ── project main assembly ───────────────────────────────────────────────
@@ -1113,21 +1419,33 @@ async function chooseMainAssembly(pid){
 }
 
 // ── item actions (shared) ───────────────────────────────────────────────
-async function doCheckout(id){
+// A second click while the request runs does nothing. The lock shows on the row or page, so a
+// checkout has no toast; undoing one offers Undo.
+async function doCheckout(id, item){
+  if (doCheckout.busy.has(id)) return;
+  doCheckout.busy.add(id);
+  const pn = ((item || cachedItem(id) || {}).part_number) || "the item";
   try {
     await api("POST", "/items/" + id + "/checkout", { workstation: location.hostname });
-    toast("Checked out", "ok");
     if (ROUTE.name === "detail" && DETAIL.id === id) render(false);
     else CUR_RELOAD && CUR_RELOAD();
-  } catch(e){ toast("Checkout: " + e.message, "err"); }
+  } catch(e){ toast("Couldn't check out " + pn + ": " + e.message, "err"); }
+  finally { doCheckout.busy.delete(id); }
 }
-async function doUndo(id){
+doCheckout.busy = new Set();
+async function doUndo(id, item){
+  if (doUndo.busy.has(id)) return;
+  doUndo.busy.add(id);
+  const it = item || cachedItem(id), pn = (it && it.part_number) || "the item";
   try {
     await api("DELETE", "/items/" + id + "/checkout");
-    toast("Checkout undone", "ok");
-    CUR_RELOAD && CUR_RELOAD();
-  } catch(e){ toast("Undo: " + e.message, "err"); }
+    if (ROUTE.name === "detail" && DETAIL.id === id) render(false);
+    else CUR_RELOAD && CUR_RELOAD();
+    toast("Checkout undone for " + pn, "ok", { action: { label:"Undo", run: () => doCheckout(id, it) } });
+  } catch(e){ toast("Couldn't undo the checkout of " + pn + ": " + e.message, "err"); }
+  finally { doUndo.busy.delete(id); }
 }
+doUndo.busy = new Set();
 async function saveVersionBlob(v, fallbackName){
   const buf = await api("GET", "/versions/" + v.id + "/blob");
   const a = document.createElement("a");
@@ -1815,9 +2133,9 @@ async function downloadLatest(it){
   try {
     const d = await api("GET", "/items/" + it.id);
     const head = d.head_version;
-    if (!head){ toast("No versions to download", "err"); return; }
+    if (!head){ toast(it.part_number + " has no versions to download yet", "err"); return; }
     await saveVersionBlob(head, head.filename || it.filename || it.part_number);
-  } catch(e){ toast("Download failed: " + e.message, "err"); }
+  } catch(e){ toast("Couldn't download " + it.part_number + ": " + e.message, "err"); }
 }
 // "V2 - R3": a version's major version and revision (the label the server's agent portal uses).
 function versionRevLabel(v){
@@ -2062,40 +2380,71 @@ async function openWebEditor(itemId, versionId){
 }
 
 // ── bulk / folder / owner / upload ──────────────────────────────────────
-async function moveItems(pid, ids){
+// Bulk actions go on past a failure and then say which items were not changed and why. Each
+// returns the ids that failed (empty when all went through, null when cancelled).
+async function bulkRun(ids, one){
+  const failed = [];
+  for (const id of ids){
+    try { await one(id); } catch(e){ failed.push({ id, why: e.message }); }
+  }
+  return failed;
+}
+// `known` are item rows the caller already has (a menu passes its item), used for part numbers.
+function bulkItem(id, known){ return (known || []).find(x => x && x.id === id) || cachedItem(id); }
+function bulkReport(ids, failed, done, notDone, known){
+  const name = id => { const it = bulkItem(id, known); return it ? it.part_number : "an item no longer listed"; };
+  const n = ids.length, ok = n - failed.length;
+  const count = k => k + (k === 1 ? " item" : " items");
+  if (!failed.length) return done + " " + count(n) + ".";
+  const shown = failed.slice(0, 5).map(f => name(f.id) + " (" + f.why + ")").join("; ");
+  return done + " " + ok + " of " + count(n) + ". " + notDone + ": " + shown +
+    (failed.length > 5 ? "; and " + (failed.length - 5) + " more" : "") + ".";
+}
+function itemCountLabel(ids, known){
+  const one = ids.length === 1 && bulkItem(ids[0], known);
+  return one ? one.part_number : ids.length + (ids.length === 1 ? " item" : " items");
+}
+async function moveItems(pid, ids, known){
   const folders = ROUTE._folders ||
     await api("GET", "/projects/" + pid + "/folders").then(d => d.folders).catch(() => []);
-  const f = await openModal("Move " + ids.length + " item(s) to folder", [
+  let failed = null;
+  const f = await openModal("Move " + itemCountLabel(ids, known) + " to a folder", [
     { id:"folder", label:"Folder", type:"select",
       options:[{value:"",label:"(project root)"}].concat(folders.map(x=>({value:x.id,label:x.name}))) }
-  ], "Move");
-  if (!f) return;
-  try {
-    for (const id of ids) await api("PUT", "/items/" + id, { folder_id: f.folder || null });
-    toast("Moved " + ids.length + " item(s)", "ok");
-    ALLITEMS = [];
-    CUR_RELOAD && CUR_RELOAD();
-  } catch(e){ toast("Move failed: " + e.message, "err"); }
+  ], { label:"Move", busyLabel:"Moving…", onSubmit: async v => {
+    failed = await bulkRun(ids, id => api("PUT", "/items/" + id, { folder_id: v.folder || null }));
+  } });
+  if (!f) return null;
+  ALLITEMS = [];
+  CUR_RELOAD && CUR_RELOAD();
+  // Moved items can leave the folder on screen, so the result is reported either way.
+  toast(bulkReport(ids, failed, "Moved", "Not moved", known), failed.length ? "err" : "ok");
+  return failed.map(x => x.id);
 }
-async function assignOwner(ids){
-  const f = await openModal("Assign owner", [
-    { id:"owner", label:"Owner", type:"select",
+async function assignOwner(ids, known){
+  const one = ids.length === 1 ? bulkItem(ids[0], known) : null;
+  let failed = null;
+  const f = await openModal("Assign an owner to " + itemCountLabel(ids, known), [
+    { id:"owner", label:"Owner", type:"select", value: one && one.owner_id ? one.owner_id : undefined,
       options: USERS.map(u=>({value:u.id,label:u.display_name||u.email})) }
-  ], "Assign");
-  if (!f) return;
-  try {
-    for (const id of ids) await api("PUT", "/items/" + id, { owner_id: f.owner });
-    toast("Owner updated for " + ids.length + " item(s)", "ok");
-    ALLITEMS = [];
-    CUR_RELOAD && CUR_RELOAD();
-  } catch(e){ toast("Assign failed: " + e.message, "err"); }
+  ], { label:"Assign owner", busyLabel:"Assigning…", onSubmit: async v => {
+    failed = await bulkRun(ids, id => api("PUT", "/items/" + id, { owner_id: v.owner }));
+  } });
+  if (!f) return null;
+  ALLITEMS = [];
+  CUR_RELOAD && CUR_RELOAD();
+  if (failed.length) toast(bulkReport(ids, failed, "Assigned", "Not changed", known), "err");
+  return failed.map(x => x.id);
 }
 async function checkoutBulk(ids){
+  if (checkoutBulk.busy) return null;   // a second click while the first run is going does nothing
+  checkoutBulk.busy = true;
   try {
-    for (const id of ids) await api("POST", "/items/" + id + "/checkout", { workstation: location.hostname });
-    toast("Checked out " + ids.length + " item(s)", "ok");
+    const failed = await bulkRun(ids, id => api("POST", "/items/" + id + "/checkout", { workstation: location.hostname }));
     CUR_RELOAD && CUR_RELOAD();
-  } catch(e){ toast("Checkout: " + e.message, "err"); }
+    if (failed.length) toast(bulkReport(ids, failed, "Checked out", "Not checked out"), "err");
+    return failed.map(x => x.id);
+  } finally { checkoutBulk.busy = false; }
 }
 // Category choices for a new item: the org's configured categories (Settings ▸ Part-number
 // prefixes) first, then the legacy classes that aren't configured yet. The part-number
@@ -2535,6 +2884,22 @@ function dirOptions(key){
     : "<option value='asc'>A to Z</option><option value='desc'>Z to A</option>";
 }
 
+// Words for the stored codes the machine, post-processor and manufacturing pages show.
+const ENUM_LABELS = {
+  machine_kind: { cnc_mill:"CNC mill", cnc_lathe:"CNC lathe", cnc_laser:"CNC laser", router:"Router",
+    printer:"Printer", other:"Other" },
+  maintenance: { ok:"OK", due:"Due", overdue:"Overdue" },
+  dialect: { gcode:"G-code", rs274ngc:"RS274/NGC", fanuc:"Fanuc", heidenhain:"Heidenhain", other:"Other" },
+  job_status: { pending:"Pending", in_progress:"In progress", done:"Done", rework:"Rework",
+    queued:"Queued", printing:"Printing", failed:"Failed", cancelled:"Cancelled" },
+};
+function enumLabel(kind, v){
+  const m = ENUM_LABELS[kind];
+  if (m && m[v]) return m[v];
+  return v ? String(v).replace(/_/g, " ") : "—";
+}
+function enumOptions(kind){ return Object.entries(ENUM_LABELS[kind]).map(([value, label]) => ({ value, label })); }
+
 // ── machines & tools registry (MFG master data) ─────────────────────────
 async function viewMachines(v){
   if (!PROJECTS.length) await loadCommon();
@@ -2557,11 +2922,11 @@ async function viewMachines(v){
         "<th>Axes</th><th>In use</th><th>Maintenance</th></tr></thead><tbody>" +
         machines.map(m => "<tr>" +
           "<td><b>" + esc(m.name) + "</b></td>" +
-          "<td class='muted'>" + esc(m.kind || "—") + "</td>" +
+          "<td class='muted'>" + esc(enumLabel("machine_kind", m.kind)) + "</td>" +
           "<td class='muted'>" + esc(((m.manufacturer || "") + " " + (m.model || "")).trim() || "—") + "</td>" +
           "<td class='muted'>" + esc((m.axes || []).join(", ")) + "</td>" +
           "<td class='muted'>" + (inUse(m.id) || "—") + "</td>" +
-          "<td class='muted'>" + esc(m.maintenance_status || "—") + "</td>" +
+          "<td class='muted'>" + esc(enumLabel("maintenance", m.maintenance_status)) + "</td>" +
           "</tr>").join("") + "</tbody></table>" :
         emptyState("ic-machine", "No machines yet",
           "Register the CNC mills, lathes, lasers and printers that production jobs run on.")) +
@@ -2571,32 +2936,27 @@ async function viewMachines(v){
         "<table><thead><tr><th>Name</th><th>Kind</th><th>Inventory</th><th>Materials</th></tr></thead><tbody>" +
         tools.map(t => "<tr>" +
           "<td><b>" + esc(t.name) + "</b></td>" +
-          "<td class='muted'>" + esc(t.kind || "—") + "</td>" +
+          "<td class='muted'>" + esc(kindLabel(t.kind)) + "</td>" +
           "<td class='muted'>" + (t.inventory != null ? t.inventory : "—") + "</td>" +
           "<td class='muted dim'>" + esc((t.material_compatibility || []).join(", ")) + "</td>" +
           "</tr>").join("") + "</tbody></table>" :
         emptyState("ic-tool", "No tools yet",
           "Add the end mills, drills and other tooling that CAM programs select from.")) +
     "</div>";
+  // The new row shows in the table, so success needs no message; a refusal stays in the dialog.
   $("newmachine").onclick = async () => {
     const f = await openModal("New machine", [
       { id:"name", label:"Name", required:true, placeholder:"e.g. Shop mill 1" },
-      { id:"kind", label:"Kind", type:"select",
-        options:["cnc_mill","cnc_lathe","cnc_laser","router","printer","other"], value:"cnc_mill" },
+      { id:"kind", label:"Kind", type:"select", options:enumOptions("machine_kind"), value:"cnc_mill" },
       { id:"manufacturer", label:"Manufacturer", placeholder:"optional" },
       { id:"model", label:"Model", placeholder:"optional" },
       { id:"maintenance", label:"Maintenance status", type:"select",
-        options:["ok","due","overdue"], value:"ok" },
-    ], "Add machine");
-    if (!f) return;
-    try {
-      await api("POST", "/machines", {
+        options:enumOptions("maintenance"), value:"ok" },
+    ], { label:"Add machine", busyLabel:"Adding…", onSubmit: f => api("POST", "/machines", {
         name: f.name, kind: f.kind,
         manufacturer: f.manufacturer || null, model: f.model || null,
-        maintenance_status: f.maintenance || null });
-      toast("Machine added", "ok");
-      render(false);
-    } catch(e){ toast("Add machine: " + e.message, "err"); }
+        maintenance_status: f.maintenance || null }) });
+    if (f) render(false);
   };
   $("newtool").onclick = async () => {
     const f = await openModal("New tool", [
@@ -2604,17 +2964,12 @@ async function viewMachines(v){
       { id:"kind", label:"Kind", type:"select", options:TOOL_KINDS, value:"end_mill" },
       { id:"inventory", label:"Inventory count", placeholder:"0" },
       { id:"materials", label:"Compatible materials (comma-separated)", placeholder:"e.g. Aluminum, Steel" },
-    ], "Add tool");
-    if (!f) return;
-    try {
-      await api("POST", "/tools", {
+    ], { label:"Add tool", busyLabel:"Adding…", onSubmit: f => api("POST", "/tools", {
         name: f.name, kind: f.kind,
         inventory: f.inventory === "" ? null : Number(f.inventory),
         material_compatibility: f.materials
-          ? f.materials.split(",").map(s => s.trim()).filter(Boolean) : null });
-      toast("Tool added", "ok");
-      render(false);
-    } catch(e){ toast("Add tool: " + e.message, "err"); }
+          ? f.materials.split(",").map(s => s.trim()).filter(Boolean) : null }) });
+    if (f) render(false);
   };
 }
 
@@ -3011,8 +3366,8 @@ async function viewPostProcessors(v){
       "<table><thead><tr><th>Name</th><th>Dialect</th><th>Machine kind</th><th>Version</th><th>Added</th></tr></thead><tbody>" +
       list.map(p => "<tr>" +
         "<td><b>" + esc(p.name) + "</b></td>" +
-        "<td class='mono muted'>" + esc(p.dialect || "—") + "</td>" +
-        "<td class='muted'>" + esc(p.machine_kind || "—") + "</td>" +
+        "<td class='mono muted'>" + esc(enumLabel("dialect", p.dialect)) + "</td>" +
+        "<td class='muted'>" + esc(enumLabel("machine_kind", p.machine_kind)) + "</td>" +
         "<td class='muted'>" + esc(p.version || "—") + "</td>" +
         "<td class='muted'>" + fmtDate(p.created_at) + "</td>" +
         "</tr>").join("") + "</tbody></table>" :
@@ -3021,20 +3376,14 @@ async function viewPostProcessors(v){
   $("newpp").onclick = async () => {
     const f = await openModal("New post-processor", [
       { id:"name", label:"Name", required:true, placeholder:"e.g. Haas VF-2 G-code" },
-      { id:"dialect", label:"Dialect", type:"select",
-        options:["gcode","rs274ngc","fanuc","heidenhain","other"], value:"gcode" },
+      { id:"dialect", label:"Dialect", type:"select", options:enumOptions("dialect"), value:"gcode" },
       { id:"machine_kind", label:"Machine kind", type:"select",
-        options:["cnc_mill","cnc_lathe","cnc_laser","router","printer","other"], value:"cnc_mill" },
+        options:enumOptions("machine_kind"), value:"cnc_mill" },
       { id:"version", label:"Version", placeholder:"optional" },
-    ], "Add post-processor");
-    if (!f) return;
-    try {
-      await api("POST", "/post-processors", {
+    ], { label:"Add post-processor", busyLabel:"Adding…", onSubmit: f => api("POST", "/post-processors", {
         name: f.name, dialect: f.dialect,
-        machine_kind: f.machine_kind, version: f.version || null });
-      toast("Post-processor added", "ok");
-      render(false);
-    } catch(e){ toast("Add post-processor: " + e.message, "err"); }
+        machine_kind: f.machine_kind, version: f.version || null }) });
+    if (f) render(false);
   };
 }
 
@@ -3055,17 +3404,20 @@ function mfgStepper(status){
 }
 async function viewMfg(v){
   if (!PROJECTS.length) await loadCommon();
-  const [dash, ncd, jbd, prd, ind, mcfg, md] = await Promise.all([
+  // The item list is paged (at most 200 a page): the first page loads alongside the rest, and
+  // further pages only while an item the hub shows is still unnamed.
+  const firstPage = api("GET", "/items?include_archived=true&limit=200&page=1").catch(() => ({ items: [] }));
+  const [dash, ncd, jbd, prd, ind, md] = await Promise.all([
     api("GET", "/manufacturing/dashboard").catch(() => ({ items: [], buckets: {} })),
     api("GET", "/nc-programs").catch(() => ({ nc_programs: [] })),
     api("GET", "/production-jobs").catch(() => ({ production_jobs: [] })),
     api("GET", "/print-jobs").catch(() => ({ print_jobs: [] })),
     api("GET", "/inspections").catch(() => ({ inspections: [] })),
-    api("GET", "/items?limit=1000&include_archived=true").catch(() => ({ items: [] })),
     api("GET", "/machines").catch(() => ({ machines: [] }))
   ]);
-  const itemMap = {};
-  for (const it of mcfg.items || []) itemMap[it.id] = it;
+  const shownIds = [...(dash.items || []), ...(ncd.nc_programs || []), ...(jbd.production_jobs || []),
+    ...(prd.print_jobs || [])].map(r => r.item_id);
+  const itemMap = await itemsById(shownIds, firstPage);
   const machMap = {};
   for (const m of md.machines || []) machMap[m.id] = m.name;
   const nameOf = id => {
@@ -3114,7 +3466,7 @@ async function viewMfg(v){
         "<td>" + (j.item_id ? nameOf(j.item_id) : "—") + "</td>" +
         "<td class='muted'>" + esc(machMap[j.machine_id] || "—") + "</td>" +
         "<td class='muted'>" + esc(j.operator || "—") + "</td>" +
-        "<td><span class='jobstat " + j.status + "'>" + esc(j.status) + "</span></td>" +
+        "<td><span class='jobstat " + j.status + "'>" + esc(enumLabel("job_status", j.status)) + "</span></td>" +
         "<td class='muted'>" + fmtTime(j.completed_at || j.created_at) + "</td>" +
         "<td style='white-space:nowrap'>" +
           (j.status === "pending" ? "<button class='small' data-ps='" + j.id + "' data-to='in_progress'>Start</button> " : "") +
@@ -3132,7 +3484,7 @@ async function viewMfg(v){
         prints.map(p => "<tr>" +
           "<td>" + nameOf(p.item_id) + "</td>" +
           "<td class='muted'>" + esc(p.material || "—") + "</td>" +
-          "<td><span class='jobstat " + p.status + "'>" + esc(p.status) + "</span></td>" +
+          "<td><span class='jobstat " + p.status + "'>" + esc(enumLabel("job_status", p.status)) + "</span></td>" +
           "<td style='white-space:nowrap'>" +
             (p.status === "queued" ? "<button class='small' data-pjs='" + p.id + "' data-to='printing'>Start</button> " : "") +
             ((p.status === "queued" || p.status === "printing") ?
@@ -3155,29 +3507,34 @@ async function viewMfg(v){
         "<div class='empty'>No inspection records yet.</div>") +
       "</div>" +
     "</div>";
-  v.querySelectorAll("[data-ncr]").forEach(b => b.addEventListener("click", async () => {
-    try {
-      await api("POST", "/nc-programs/" + b.dataset.ncr + "/release");
-      toast("NC program released", "ok");
-      render(false);
-    } catch(e){ toast("Release: " + e.message, "err"); }
-  }));
-  v.querySelectorAll("[data-ps]").forEach(b => b.addEventListener("click", async () => {
-    try {
-      await api("POST", "/production-jobs/" + b.dataset.ps + "/status",
-        { status: b.dataset.to });
-      toast("Job " + b.dataset.to, "ok");
-      render(false);
-    } catch(e){ toast("Job status: " + e.message, "err"); }
-  }));
-  v.querySelectorAll("[data-pjs]").forEach(b => b.addEventListener("click", async () => {
-    try {
-      await api("POST", "/print-jobs/" + b.dataset.pjs + "/status",
-        { status: b.dataset.to });
-      toast("Print job " + b.dataset.to, "ok");
-      render(false);
-    } catch(e){ toast("Print job: " + e.message, "err"); }
-  }));
+  // Each button is busy while its request runs; the new state shows in the table, a failure in a
+  // message that stays.
+  const act = (b, busyLabel, run, failed) => b.addEventListener("click", async () => {
+    if (b.disabled) return;
+    const was = b.textContent; b.disabled = true; b.textContent = busyLabel;
+    try { await run(); render(false); }
+    catch(e){ b.disabled = false; b.textContent = was; toast(failed + ": " + e.message, "err"); }
+  });
+  const STEP = { in_progress:["Starting…", "Couldn't start the job"], printing:["Starting…", "Couldn't start the print"],
+    done:["Saving…", "Couldn't mark it done"], rework:["Saving…", "Couldn't send it for rework"] };
+  const step = to => STEP[to] || ["Saving…", "Couldn't change the status"];
+  v.querySelectorAll("[data-ncr]").forEach(b => act(b, "Releasing…",
+    () => api("POST", "/nc-programs/" + b.dataset.ncr + "/release"), "Couldn't release the NC program"));
+  v.querySelectorAll("[data-ps]").forEach(b => act(b, step(b.dataset.to)[0],
+    () => api("POST", "/production-jobs/" + b.dataset.ps + "/status", { status: b.dataset.to }), step(b.dataset.to)[1]));
+  v.querySelectorAll("[data-pjs]").forEach(b => act(b, step(b.dataset.to)[0],
+    () => api("POST", "/print-jobs/" + b.dataset.pjs + "/status", { status: b.dataset.to }), step(b.dataset.to)[1]));
+}
+// Items by id for the ids given: pages through the org's item list (newest first) until each id is
+// found or the list ends. `firstPage` is the already-requested first page.
+async function itemsById(ids, firstPage){
+  const want = new Set(ids.filter(Boolean)), map = {};
+  let d = await firstPage;
+  for (let page = 1; ; page++){
+    for (const it of (d && d.items) || []){ map[it.id] = it; want.delete(it.id); }
+    if (!want.size || !d || !d.has_more || page >= 10) return map;
+    d = await api("GET", "/items?include_archived=true&limit=200&page=" + (page + 1)).catch(() => null);
+  }
 }
 
 // ── sheet-metal standards library (MFG reference data) ──────────────────
@@ -5691,14 +6048,22 @@ function tabComments(box){
       "<textarea id='comtxt' placeholder='Add a comment…'></textarea>" +
       "<button id='compost' class='primary'>Post</button>" +
     "</div>";
+  // The comment appears in the list once posted; while posting the button is busy, and on a failure
+  // the typed text stays.
   $("compost").onclick = async () => {
-    const t = $("comtxt").value.trim();
-    if (!t){ toast("Comment is empty", "err"); return; }
+    const ta = $("comtxt"), b = $("compost");
+    if (b.disabled) return;
+    const t = ta.value.trim();
+    if (!t){ ta.value = ""; ta.required = true; ta.reportValidity(); return; }
+    b.disabled = true; b.textContent = "Posting…";
     try {
       await api("POST", "/items/" + DETAIL.id + "/comments", { body: t });
-      toast("Comment posted", "ok");
-      CUR_RELOAD && CUR_RELOAD();
-    } catch(e){ toast("Comment: " + e.message, "err"); }
+      if (CUR_RELOAD) CUR_RELOAD();
+      else { ta.value = ""; b.disabled = false; b.textContent = "Post"; }
+    } catch(e){
+      b.disabled = false; b.textContent = "Post";
+      toast("Couldn't post the comment: " + e.message, "err");
+    }
   };
   $("comtxt").addEventListener("keydown", e => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") $("compost").click();

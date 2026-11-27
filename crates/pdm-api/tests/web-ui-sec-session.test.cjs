@@ -55,29 +55,44 @@ test("an expired saved sign-in says so and asks to sign in again", async () => {
   assert.equal(r.signInShown(), true, "the sign-in form is shown, not a blank page");
 });
 
-function call401(editorOpen){
-  let reloaded = false;
-  const context = loadFunctions(["api"], {
-    TOKEN:"pdm_session", ME:{ user:{} }, AUTH_BUSY:false,
+function call401(editorOpen, me){
+  let reloaded = false, reauths = 0;
+  const context = loadFunctions(["api", "apiErrorText", "bytes"], {
+    TOKEN:"pdm_session", ME: me === undefined ? { user:{} } : me, AUTH_BUSY:false,
     fetch:async () => ({ ok:false, status:401,
       headers:{ get:() => "application/json" },
       json:async () => ({ error:{ code:"session_expired", message:"your session expired — sign in again" } }) }),
     location:{ reload(){ reloaded = true; } },
     document:{ querySelector:sel => editorOpen && sel === "dialog.web-editor[open]" ? {} : null },
+    reauth:async () => { reauths++; return false; },
   });
-  return { context, reloaded:() => reloaded };
+  return { context, reloaded:() => reloaded, reauths:() => reauths };
 }
 
 test("an expired sign-in while a web editor is open keeps the page (and the unsaved model)", async () => {
   const r = call401(true);
   await assert.rejects(r.context.api("POST", "/items/i/checkin", {}), e => e.status === 401);
   assert.equal(r.reloaded(), false, "reloading would throw away the open editor's work");
+  assert.equal(r.reauths(), 1, "a sign-in with a user asks for the password in place instead");
 });
 
-test("an expired sign-in with no editor open reloads to the sign-in form", async () => {
+test("an expired sign-in with no editor open asks for the password in place", async () => {
   const r = call401(false);
   await assert.rejects(r.context.api("GET", "/projects"), e => e.status === 401);
+  assert.equal(r.reloaded(), false, "the page and what was typed on it stay");
+  assert.equal(r.reauths(), 1);
+});
+
+test("an ended session without a user reloads to the sign-in form when no editor is open", async () => {
+  const r = call401(false, {});
+  await assert.rejects(r.context.api("GET", "/projects"), e => e.status === 401);
   assert.equal(r.reloaded(), true);
+});
+
+test("an ended session without a user keeps the page under an open web editor", async () => {
+  const r = call401(true, {});
+  await assert.rejects(r.context.api("GET", "/projects"), e => e.status === 401);
+  assert.equal(r.reloaded(), false, "reloading would throw away the open editor's work");
 });
 
 test("an open web editor in a visible tab keeps the sign-in in use", () => {
