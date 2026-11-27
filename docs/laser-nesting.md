@@ -141,7 +141,8 @@ The create panel mirrors a professional nesting tool (Sheets | Parts tabs).
 Beyond stock, spacing, grain, and mirrors:
 
 - **Sheet**: *nesting corner* (which corner the fill starts from — the layout is
-  whole-flipped to that corner), *origin X/Y* (offset of the nesting origin),
+  moved to that corner without mirroring any part: see below), *origin X/Y*
+  (offset of the nesting origin),
   *sheet-sheet distance* (reference gap between sheets), *guillotine cut*
   (request a guillotine-cuttable layout), *automatic sheet origins*, *fill
   direction*, and *create as many sheets as needed*.
@@ -158,6 +159,18 @@ direction, fill-all-sheets, optimized pairs, minimum/filler qty, and
 sheet-sheet distance are stored on the run and surfaced in the manifest and
 preview (the layout preferences are recorded even where the engine treats them
 as advisory).
+
+**Nesting corner and mirroring.** The solver always fills from the lower-left.
+Upper-right is reached by turning the whole layout 180°. Lower-right and
+upper-left need a reflection of the layout, and a reflection on its own would
+mirror every part, whatever its line's mirror setting. For those two corners
+the solver is given each part's mirror image instead, so the layout reflection
+turns every copy back to how it was drawn: a line set to *Original Only* stays
+unmirrored at every corner. A copy the solver flipped (a line set to *Both*) is
+still flipped. The solver is also given the rotations that the corner turns
+back into the line's allowed ones, so a corner never turns a part to an angle
+its line (or `allowed_rotations`) doesn't allow: an upper-right fill with
+`allowed_rotations: [0]` still cuts every part at 0°, not 180°.
 
 ### Units (inches → millimetres)
 

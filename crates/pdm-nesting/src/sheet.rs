@@ -85,12 +85,70 @@ impl StockMapping {
         crate::part::dilate_box(&part.outer.points, m, m)
     }
 
+    /// Whether the nesting corner is reached by reflecting the layout (lower-right, upper-left).
+    ///
+    /// A reflection on its own would mirror every part, whatever its line allows: a line set to
+    /// "Original Only" would be cut as its mirror image, which bends into the opposite-hand part
+    /// and puts a one-sided finish face-down. So for these corners the solver nests each part's
+    /// mirror image ([`Self::solver_part`], [`Self::solver_rotations`]) and
+    /// [`Self::stock_transform`] composes that mirror back in: every copy comes out as drawn, and
+    /// only a copy the solver itself flipped (a line that allows mirroring) is mirrored.
+    pub fn corner_reflects(&self) -> bool {
+        matches!(
+            self.corner,
+            NestingCorner::LowerRight | NestingCorner::UpperLeft
+        )
+    }
+
+    /// The geometry the solver nests for `part`: the part itself, or its mirror image when the
+    /// corner is a reflection (see [`Self::corner_reflects`]).
+    pub fn solver_part<'a>(&self, part: &'a Part) -> std::borrow::Cow<'a, Part> {
+        if self.corner_reflects() {
+            std::borrow::Cow::Owned(crate::part::mirror_part(part))
+        } else {
+            std::borrow::Cow::Borrowed(part)
+        }
+    }
+
+    /// The solver rotations (degrees) that come out as `rotations` on the sheet, so a corner never
+    /// turns a part to an angle its line doesn't allow. The corner maps a solver rotation θ to
+    /// 180° − θ (lower-right: the solver turns the mirror image), −θ (upper-left, likewise) or
+    /// θ + 180° (upper-right: the layout's half-turn); each mapping is its own inverse. Sets
+    /// closed under a half-turn (grain and step-angle sets) come out the same; an explicit
+    /// `allowed_rotations` such as `[0]` would not, without this.
+    pub fn solver_rotations(&self, rotations: Vec<f64>) -> Vec<f64> {
+        let turn: fn(f64) -> f64 = match self.corner {
+            NestingCorner::LowerLeft => return rotations,
+            NestingCorner::LowerRight => |r| 180.0 - r,
+            NestingCorner::UpperLeft => |r| -r,
+            NestingCorner::UpperRight => |r| r - 180.0,
+        };
+        rotations
+            .into_iter()
+            .map(|r| turn(r).rem_euclid(360.0))
+            .collect()
+    }
+
+    /// The stock-space transform of a solver placement, moved to the requested corner. For a
+    /// reflecting corner the solver placed the part's mirror image, so the part is mirrored
+    /// first and the corner's reflection turns it back.
+    pub fn stock_transform(&self, p: &Placed, cfg: &NestConfig) -> Transform {
+        let t = solver_to_stock(p, self.offset);
+        if self.corner == NestingCorner::LowerLeft {
+            t
+        } else if self.corner_reflects() {
+            MIRROR_X.then(t).then(self.corner_transform(cfg))
+        } else {
+            t.then(self.corner_transform(cfg))
+        }
+    }
+
     /// The whole-layout flip that moves the (lower-left fill) layout to the
     /// requested nesting corner. The identity for the lower-left corner.
     ///
     /// Note: upper-right is a 180° *rotation* about the stock center
     /// ((w−x, h−y), proper — not a reflection); the single-axis corners are
-    /// reflections.
+    /// reflections, which [`Self::stock_transform`] cancels per part.
     pub fn corner_transform(&self, cfg: &NestConfig) -> Transform {
         let (w, h) = (cfg.stock_width, cfg.stock_height);
         match self.corner {
@@ -116,6 +174,14 @@ impl StockMapping {
         }
     }
 }
+
+/// A mirror across the local x axis (the same reflection as [`crate::part::mirror_part`]).
+const MIRROR_X: Transform = Transform {
+    reflected: true,
+    rotation_deg: 0.0,
+    tx: 0.0,
+    ty: 0.0,
+};
 
 #[derive(Debug, Error)]
 pub enum SheetError {
@@ -170,7 +236,9 @@ pub struct CopyRef {
 ///
 /// `copies` must be exactly the set of copies the solver was asked to place, and
 /// `item_id` assignment is `copied[0].part * 1000 + ...` — see
-/// [`assign_item_ids`].
+/// [`assign_item_ids`]. For a reflecting nesting corner the solution must come from an
+/// instance of the parts' mirror images, as [`crate::batch::build_instance`] builds it
+/// (see [`StockMapping::corner_reflects`]).
 pub fn build_sheet(
     solution: &SolverSolution,
     item_ids: &[u64],
@@ -198,14 +266,9 @@ pub fn build_sheet(
         if part >= parts.len() {
             return Err(SheetError::UnknownItem(p.item_id));
         }
-        let t = solver_to_stock(p, mapping.offset);
         // Move the whole layout to the requested nesting corner (identity for
-        // lower-left; a global flip otherwise, preserving relative orientation).
-        let t = if mapping.corner == NestingCorner::LowerLeft {
-            t
-        } else {
-            t.then(mapping.corner_transform(cfg))
-        };
+        // lower-left), without mirroring any part (see `StockMapping::corner_reflects`).
+        let t = mapping.stock_transform(p, cfg);
         placed.push((part, copy, t));
     }
     for (i, &want) in item_ids.iter().enumerate() {
