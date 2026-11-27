@@ -1654,6 +1654,20 @@ async function downloadLatest(it){
     await saveVersionBlob(head, head.filename || it.filename || it.part_number);
   } catch(e){ toast("Download failed: " + e.message, "err"); }
 }
+// "V2 - R3": a version's major version and revision (the label the server's agent portal uses).
+function versionRevLabel(v){
+  return v && v.version != null && v.revision != null ? "V" + v.version + " - R" + v.revision : "";
+}
+// The check-in question "What changed?". A design change starts a new major version and flags
+// NC programs and laser nests made from this part for review; a minor update is the next
+// revision of the current version. Nothing is preselected: the user answers each time.
+function changeKindField(head){
+  const known = head.version != null && head.revision != null;
+  return { id:"change", label:"What changed? (required)", type:"select", required:true, value:"",
+    options:[{ value:"", label:"Choose one" },
+      { value:"design", label:"Design change" + (known ? ": V" + (head.version + 1) + " - R1" : "") },
+      { value:"minor", label:"Minor update" + (known ? ": V" + head.version + " - R" + (head.revision + 1) : "") }] };
+}
 // A local clock time ("17:05"), with the date when it is not today. For a lock's end (fmtTime
 // only knows the past) and for messages that stay on screen (a relative time goes stale).
 function clockTime(iso){
@@ -1758,12 +1772,15 @@ function uploadBlob(data, onProgress){
 }
 // Upload a file and check it in on top of `base` (see checkinPrecheck). With "head", the head
 // as read before the upload is the base: a version checked in during the upload still wins.
-async function checkinItem(itemId, file, msg, filename, base, onProgress){
+// newVersion: true for a design change (a new major version, V2 - R1, which flags NC programs
+// and laser nests made from the old one for review), false for a minor update (V1 - R2).
+async function checkinItem(itemId, file, msg, filename, base, onProgress, newVersion){
   const cur = await checkinPrecheck(itemId, base);
   if (base === "head") base = cur.head_version ? cur.head_version.seq : null;
   const up = await uploadBlob(file, onProgress);
   return commitVersion(itemId, base, up.blob, {
     commit_message: msg || "", filename: filename || file.name, mime_type: file.type || null,
+    new_version: newVersion === true,
   });
 }
 // A floating panel listing uploads with their progress, outcome and a Retry for failures.
@@ -4755,14 +4772,16 @@ async function viewDetail(v){
     const base = head ? head.seq : null;
     const f = await openModal("Check in new version", [
       { id:"msg", label:"Commit message", placeholder:"describe the change" }
-    ], "Check in v" + ((base || 0) + 1),
+    ].concat(head ? [changeKindField(head)] : []), "Check in v" + ((base || 0) + 1),
       "<div class='modal-note' style='margin-bottom:10px'>" + esc(file.name) + " (" + bytes(file.size) + ")" +
-      (head ? " · goes on top of v" + base + ", the version shown on this page" : "") + "</div>");
+      (head ? " · goes on top of v" + base + ", the version shown on this page.<br>A design change flags the NC programs " +
+        "and laser nests made from this part for review. A minor update (drawing, metadata, no change to the geometry) does not." : "") +
+      "</div>");
     if (!f) return;
     const row = uploadPanel().add(it.part_number + ": " + file.name);
     try {
-      const r = await checkinItem(id, file, f.msg || "", file.name, base, (a, b) => row.progress(a, b));
-      row.done("Checked in as v" + r.version.seq);
+      const r = await checkinItem(id, file, f.msg || "", file.name, base, (a, b) => row.progress(a, b), f.change === "design");
+      row.done("Checked in as v" + r.version.seq + (versionRevLabel(r.version) ? " (" + versionRevLabel(r.version) + ")" : ""));
       DETAIL.conflict = null;
       CUR_RELOAD && CUR_RELOAD();
     } catch(err){
@@ -4969,7 +4988,8 @@ async function tabOverview(box){
           "<div><span class='k'>Latest revision</span> " +
             (it.latest_revision ? "<span class='rev'>" + esc(it.latest_revision) + "</span>" : "—") + "</div>" +
           "<div><span class='k'>Head version</span> " +
-            (head ? "v" + head.seq + " · " + bytes(head.size_bytes) : "—") + "</div>" +
+            (head ? "v" + head.seq + (versionRevLabel(head) ? " (" + versionRevLabel(head) + ")" : "") +
+              " · " + bytes(head.size_bytes) : "—") + "</div>" +
           "<div><span class='k'>File</span> " +
             (d.file ? esc(d.file.filename || "—") + " " + kindBadge(d.file.mime_type, d.file.filename) : "no file yet") + "</div>" +
           "<div><span class='k'>Owner</span> " + esc(it.owner_name || "—") + "</div>" +
@@ -5258,6 +5278,7 @@ async function tabVersions(box){
         " data-thumb='" +
         (vv.thumbnail_sha256 ? "/versions/" + vv.id + "/thumbnail" : "") + "'></span>" +
         "<b>v" + vv.seq + "</b>" +
+        (versionRevLabel(vv) ? " <span class='dim' style='white-space:nowrap'>" + versionRevLabel(vv) + "</span>" : "") +
         (head && head.id === vv.id ? " <span class='badge'>head</span>" : "") + "</span></td>" +
       "<td>" + kindBadge(vv.mime_type, sourceFilename(vv,d) || vv.native_format) + "</td>" +
       "<td class='muted'>" + bytes(vv.size_bytes) + "</td>" +
