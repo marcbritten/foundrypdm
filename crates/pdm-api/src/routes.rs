@@ -760,7 +760,7 @@ pub async fn onshape_send(
     Extension(authed): Extension<Authed>,
     Json(body): Json<OnshapeSendReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     let org = require_org(&authed);
     if body.document_id.trim().is_empty() || body.element_id.trim().is_empty() {
         return Err(AppError(PdmError::Validation(
@@ -1334,7 +1334,7 @@ pub async fn archive_project(
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     let project = pdm_db::archive_project(&state.pool, org, project_id).await?;
     pdm_db::record_audit(
         &state.pool,
@@ -1357,7 +1357,7 @@ pub async fn unarchive_project(
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     let project = pdm_db::unarchive_project(&state.pool, org, project_id).await?;
     pdm_db::record_audit(
         &state.pool,
@@ -1463,7 +1463,7 @@ pub async fn delete_project(
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     let project = pdm_db::delete_project(&state.pool, org, project_id).await?;
     pdm_db::record_audit(
         &state.pool,
@@ -1487,7 +1487,7 @@ pub async fn update_project(
     Json(body): Json<UpdateProjectReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     let desc = body.description.unwrap_or_default();
     let project = pdm_db::update_project(
         &state.pool,
@@ -1522,7 +1522,7 @@ pub async fn set_main_assembly(
     Json(body): Json<SetMainAssemblyReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     let project = pdm_db::set_main_assembly(&state.pool, org, project_id, body.item_id).await?;
     let action = if body.item_id.is_some() {
         "project.main_assembly_set"
@@ -1552,6 +1552,7 @@ pub async fn create_project(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreateProjectReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let desc = body.description.unwrap_or_default();
     let project = pdm_db::create_project(&state.pool, org, &body.name, &desc).await?;
@@ -1568,7 +1569,7 @@ pub async fn create_item(
     Json(body): Json<CreateItemReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     // Without this, a missing project id was a 500, and another organization's project id made an
     // item in this organization pointing at it.
     require_project_and_folder(&state, org, project_id, body.folder_id).await?;
@@ -1636,7 +1637,7 @@ pub async fn create_folder(
     Json(body): Json<CreateFolderReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     require_project_and_folder(&state, org, project_id, body.parent_id).await?;
     let folder =
         pdm_db::create_folder(&state.pool, org, project_id, body.parent_id, &body.name).await?;
@@ -1766,7 +1767,7 @@ pub async fn archive_item(
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     let item = pdm_db::archive_item(&state.pool, org, item_id).await?;
     pdm_db::record_audit(
         &state.pool,
@@ -1789,7 +1790,7 @@ pub async fn unarchive_item(
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     let item = pdm_db::unarchive_item(&state.pool, org, item_id).await?;
     pdm_db::record_audit(
         &state.pool,
@@ -1812,7 +1813,7 @@ pub async fn delete_item(
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     let item = pdm_db::delete_item(&state.pool, org, item_id).await?;
     pdm_db::record_audit(
         &state.pool,
@@ -1838,7 +1839,7 @@ pub async fn checkout(
     Json(body): Json<CheckoutReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     require_item_in_org(&state, org, item_id).await?;
     let workstation = body.workstation.unwrap_or_else(|| "unknown".to_string());
 
@@ -1913,7 +1914,7 @@ pub async fn checkin(
     Json(body): Json<CheckinReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     require_item_in_org(&state, org, item_id).await?;
 
     // 1. Verify lock is held by this user (a quick refusal; checked again in step 4)
@@ -2037,6 +2038,7 @@ pub async fn upload_blob(
     Extension(authed): Extension<Authed>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     if body.len() as u64 > state.max_upload {
         return Err(AppError(PdmError::Validation(format!(
@@ -2473,6 +2475,7 @@ pub async fn upload_version_thumbnail(
     Path(version_id): Path<Uuid>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     if body.is_empty() {
         return Err(AppError(PdmError::Validation("empty image".into())));
@@ -2719,7 +2722,7 @@ pub async fn set_property(
     Json(body): Json<SetPropertyReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let _org = require_org(&authed);
-    let _user = require_user(&authed)?;
+    require_role(&authed, "editor")?;
     let value_type = body.value_type.unwrap_or_else(|| "text".to_string());
     let prop =
         pdm_db::upsert_property(&state.pool, item_id, &key, &value_type, &body.value).await?;
@@ -2736,7 +2739,7 @@ pub async fn release(
     Json(body): Json<ReleaseReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
 
     let file = pdm_db::get_file(&state.pool, item_id)
         .await?
@@ -3215,7 +3218,7 @@ pub async fn create_approval_request_handler(
     Json(body): Json<ApprovalCreateReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     let item = pdm_db::get_item(&state.pool, body.item_id, org)
         .await?
         .ok_or_else(|| AppError(PdmError::NotFound(format!("item {}", body.item_id))))?;
@@ -3602,6 +3605,7 @@ pub async fn create_machine(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreateMachineReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let kind = body.kind.as_deref().unwrap_or("cnc_mill");
     let axes: &[String] = body.axes.as_deref().unwrap_or(&[]);
@@ -3640,6 +3644,7 @@ pub async fn create_tool(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreateToolReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let kind = body.kind.as_deref().unwrap_or("end_mill");
     let units = body.units.as_deref().unwrap_or("mm");
@@ -3703,6 +3708,7 @@ pub async fn update_tool(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateToolReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let cur = pdm_db::get_tool(&state.pool, org, id)
         .await?
@@ -3756,6 +3762,7 @@ pub async fn delete_tool(
     Extension(authed): Extension<Authed>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     pdm_db::delete_tool(&state.pool, org, id).await?;
     Ok(serde_json::json!({ "ok": true }).into())
@@ -3782,6 +3789,7 @@ pub async fn create_tool_cutting_data(
     Path(id): Path<Uuid>,
     Json(body): Json<CuttingDataReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     require_tool_exists(&state.pool, org, id).await?;
     let row = pdm_db::create_cutting_data(
@@ -3814,6 +3822,7 @@ pub async fn update_tool_cutting_data(
     Path((id, cid)): Path<(Uuid, Uuid)>,
     Json(body): Json<CuttingDataReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     require_tool_exists(&state.pool, org, id).await?;
     let row = pdm_db::update_cutting_data(
@@ -3846,6 +3855,7 @@ pub async fn delete_tool_cutting_data(
     Extension(authed): Extension<Authed>,
     Path((id, cid)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     require_tool_exists(&state.pool, org, id).await?;
     pdm_db::delete_cutting_data(&state.pool, id, cid).await?;
@@ -3880,6 +3890,7 @@ pub async fn add_tool_document(
     Path(id): Path<Uuid>,
     Json(body): Json<AddToolDocumentReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     require_tool_exists(&state.pool, org, id).await?;
     let blob = pdm_db::get_blob_by_id(&state.pool, body.blob_id)
@@ -3942,6 +3953,7 @@ pub async fn delete_tool_document(
     Extension(authed): Extension<Authed>,
     Path((id, doc_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     require_tool_exists(&state.pool, org, id).await?;
     pdm_db::delete_tool_document(&state.pool, id, doc_id).await?;
@@ -3964,6 +3976,7 @@ pub async fn create_post_processor(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreatePostProcessorReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let pp = pdm_db::create_post_processor(
         &state.pool,
@@ -4048,6 +4061,7 @@ pub async fn create_mfg_setup(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreateMfgSetupReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let s = pdm_db::create_mfg_setup(
         &state.pool,
@@ -4081,6 +4095,7 @@ pub async fn create_cam_project(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreateCamProjectReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let tools = body.tool_ids.clone().unwrap_or_default();
     let c = pdm_db::create_cam_project(
@@ -4113,6 +4128,7 @@ pub async fn create_nc_program(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreateNcProgramReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let n = pdm_db::create_nc_program(
         &state.pool,
@@ -4136,6 +4152,7 @@ pub async fn release_nc_program(
     Extension(authed): Extension<Authed>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let n = pdm_db::release_nc_program(&state.pool, org, id).await?;
     Ok(serde_json::json!({ "nc_program": n }).into())
@@ -4156,6 +4173,7 @@ pub async fn create_production_job(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreateProductionJobReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let j = pdm_db::create_production_job(
         &state.pool,
@@ -4175,6 +4193,7 @@ pub async fn set_production_job_status(
     Path(id): Path<Uuid>,
     Json(body): Json<SetJobStatusReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let j = pdm_db::set_production_job_status(&state.pool, org, id, &body.status).await?;
     Ok(serde_json::json!({ "production_job": j }).into())
@@ -4198,6 +4217,7 @@ pub async fn create_inspection(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreateInspectionReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let i = pdm_db::create_inspection(
         &state.pool,
@@ -4419,6 +4439,7 @@ pub async fn create_print_job(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreatePrintJobReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let p = pdm_db::create_print_job(
         &state.pool,
@@ -4445,6 +4466,7 @@ pub async fn set_print_job_status(
     Path(id): Path<Uuid>,
     Json(body): Json<SetPrintJobStatusReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let p = pdm_db::set_print_job_status(&state.pool, org, id, &body.status).await?;
     Ok(serde_json::json!({ "print_job": p }).into())
@@ -4468,6 +4490,7 @@ pub async fn create_sheet_metal(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreateSheetMetalReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let s = pdm_db::create_sheet_metal(
         &state.pool,
@@ -5001,6 +5024,7 @@ pub async fn create_sheet_material_standard(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreateSheetMaterialStandardReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    require_role(&authed, "editor")?;
     let org = require_org(&authed);
     let row = pdm_db::create_sheet_material_standard(
         &state.pool,
