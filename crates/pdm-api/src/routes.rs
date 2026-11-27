@@ -2480,6 +2480,9 @@ pub async fn upload_version_thumbnail(
 // ── Item metadata update ────────────────────────────────────────────────
 
 /// PUT /items/{item_id} — update mutable metadata (description, folder, owner).
+///
+/// Editors and admins only: the route had no role check, which went unnoticed while its SQL
+/// failed every change; once it works, viewers must not move or reassign items.
 pub async fn update_item(
     State(state): State<AppState>,
     Extension(authed): Extension<Authed>,
@@ -2487,7 +2490,7 @@ pub async fn update_item(
     Json(body): Json<UpdateItemReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
-    let user = require_user(&authed)?.clone();
+    let user = require_role(&authed, "editor")?.clone();
     let desc = body.description.as_deref();
     let item = pdm_db::update_item(
         &state.pool,
