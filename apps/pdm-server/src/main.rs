@@ -77,6 +77,12 @@ async fn main() -> Result<(), MainError> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(24);
+    let sessions = pdm_api::SessionLimits::from_env();
+    info!(
+        idle_minutes = sessions.idle_minutes,
+        lifetime_minutes = sessions.lifetime_minutes,
+        "web sign-in limits (0 = off; API tokens never expire)"
+    );
 
     // The key that signs the SolidCraft web editor's short-lived design links: random, made
     // once and kept in the database (shared by every API process on it), so nothing to set.
@@ -91,6 +97,7 @@ async fn main() -> Result<(), MainError> {
         started_at: std::time::Instant::now(),
         update: std::sync::Arc::new(tokio::sync::RwLock::new(pdm_update::UpdateState::default())),
         design_links,
+        sessions,
     };
     let app = pdm_api::build_router(state.clone());
 

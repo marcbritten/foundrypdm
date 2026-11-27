@@ -32,8 +32,9 @@ docker exec -it docker-pdm-1 pdm-cli create-user \
 ```
 
 Then open **http://localhost:8080/** and sign in with the email + password.
-The portal shows your issued token (copyable) — that's the bearer token for the
-REST API. `pdm-cli create-token` also works for machine tokens.
+Signing in gives the portal a bearer token that expires (see `docs/docker-server.md`,
+"Sign-in sessions"). For the REST API, scripts and CAD clients use an API token, which
+an administrator creates in the portal or with `pdm-cli create-token`.
 
 ## 2. Multi-arch images (arm64 + amd64)
 
@@ -87,8 +88,9 @@ cargo run -p solvecraft          # add --release for a faster UI
 
 1. Click **PDM** in the top app bar (right of Home) — the panel opens on the left.
 2. Enter the server (default `http://127.0.0.1:8080`; use
-   `http://<host>:8080` if the PDM stack runs elsewhere) and a token
-   (from the portal's sign-in screen, or prefill both via env):
+   `http://<host>:8080` if the PDM stack runs elsewhere) and an API token
+   (an administrator creates one for you in the portal's Administration, or with
+   `pdm-cli create-token`; a portal sign-in expires, so don't paste that), or prefill both via env:
 
    ```sh
    export SOLVECRAFT_PDM_SERVER=http://127.0.0.1:8080

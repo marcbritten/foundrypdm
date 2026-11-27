@@ -25,12 +25,14 @@ mod mail;
 mod onshape;
 mod portal;
 mod routes;
+mod session;
 mod state;
 
 pub use auth::{Authed, auth_middleware};
 pub use design_link::DesignLinks;
 pub use error::AppError;
 pub use routes::version_info;
+pub use session::SessionLimits;
 pub use state::AppState;
 
 /// Resolve the portal static directory. Uses PDM_PORTAL_DIR if set, otherwise the

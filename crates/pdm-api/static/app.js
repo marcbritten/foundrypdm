@@ -58,12 +58,19 @@ async function api(method, path, body, rawBody, retried){
     const info = apiErrorText(r.status, data);
     const e = new Error(info.message);
     e.status = r.status; e.code = info.code; e.detail = info.detail;
-    // A signed-in session ended (signed out in another tab, account disabled): keep the page and
-    // what was typed on it, ask for the password again, then repeat this request once.
+    // A signed-in session ended (it expired, was signed out in another tab, or the account was
+    // disabled): keep the page and what was typed on it, ask for the password again, then repeat
+    // this request once. The sign-in dialog opens above an open web editor, so its model is kept.
     if (r.status === 401 && ME && !AUTH_BUSY && !retried && !String(path).startsWith("/auth/")){
-      if (!ME.user){ location.reload(); throw e; }
+      // Connected with an API token (no password to ask for): back to the sign-in form, but never
+      // reload under an open web editor, which would lose its model.
+      if (!ME.user){
+        if (!document.querySelector("dialog.web-editor[open]")) location.reload();
+        throw e;
+      }
       // Sent before a sign-in that has happened since: just send it again with the new token.
-      if (TOKEN !== sentToken || await reauth()) return api(method, path, body, rawBody, true);
+      if (TOKEN !== sentToken || await reauth(false, info.code === "session_expired"))
+        return api(method, path, body, rawBody, true);
     }
     throw e;
   }
@@ -85,7 +92,9 @@ function apiErrorText(status, data){
   const says = status === 404 && /\b(no|not)\b/i.test(detail) && !/[0-9a-f]{8}-[0-9a-f]{4}/i.test(detail);
   const own = (status === 404 && !says) || status >= 500;
   let plain;
-  if (status === 401) plain = "your session ended — sign in again to continue";
+  if (status === 401) plain = code === "session_expired"
+    ? "your session expired — sign in again to continue"
+    : "your session ended — sign in again to continue";
   else if (status === 403) plain = "you don't have permission to do this";
   else if (status === 404) plain = "not found; it may have been deleted";
   else if (status === 409) plain = "someone else changed it first; reload and try again";
@@ -109,7 +118,7 @@ function signedOutNotice(){
   if (host && [...host.querySelectorAll(".toast.err")].some(t => t.dataset.msg === msg)) return;
   toast(msg, "err", { action: { label:"Sign in", run: () => reauth(true).then(ok => { if (ok && !CUR_RELOAD) render(false); }) } });
 }
-function reauth(again){
+function reauth(again, expired){
   if (REAUTH) return REAUTH;
   if (REAUTH_DECLINED && !again){ signedOutNotice(); return Promise.resolve(false); }
   REAUTH_DECLINED = false;
@@ -128,7 +137,8 @@ function reauth(again){
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(r.status === 401 ? "The email or password is not right." : apiErrorText(r.status, d).message);
     return d;
-  } }, "<p class='modal-note'>Your session ended. Sign in to carry on: what you typed on this page stays, " +
+  } }, "<p class='modal-note'>" + (expired ? "Your session expired." : "Your session ended.") +
+    " Sign in to carry on: what you typed on this page stays, " +
     "and the change you were making is sent again.</p>").then(d => {
     if (!d || !d.token){
       REAUTH_DECLINED = true;
@@ -417,7 +427,9 @@ async function connectFromToken(){
   } catch(e){
     authBusy(false);
     if (silent){ TOKEN = ""; localStorage.removeItem("pdm_token");
-      toast("Saved session ended (" + e.message + ") — sign in again", "err", 6000); }
+      $("login-view").classList.remove("hidden");
+      toast(e.status === 401 ? "Your session expired — sign in again"
+        : "Saved session ended (" + e.message + ") — sign in again", "err", 6000); }
     else toast("Connect failed: " + e.message, "err");
   }
 }
@@ -5636,6 +5648,13 @@ function startPolling(){
     if (CUR_RELOAD) Promise.resolve(CUR_RELOAD()).catch(() => {});
     refreshApprovalsBadge();
   }, POLL_MS);
+  // A web editor makes no PDM requests while someone models in it, so an open editor in a
+  // visible tab counts as use: the sign-in doesn't idle out (its lifetime still applies).
+  // A raw fetch, so an ended sign-in never reloads the page under the editor.
+  setInterval(() => {
+    if (!ME || !TOKEN || document.hidden || !document.querySelector("dialog.web-editor[open]")) return;
+    fetch("/me", { headers: { "Authorization": "Bearer " + TOKEN } }).catch(() => {});
+  }, 30000);
 }
 
 // ── init ────────────────────────────────────────────────────────────────

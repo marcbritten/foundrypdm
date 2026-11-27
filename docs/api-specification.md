@@ -11,7 +11,11 @@ Base URL in the dev image: `http://<host>:8080`.
 - `GET /healthz`, `GET /readyz` — probes.
 - `GET /version` — public. `{ name, version, build, commit, built_at }`. `build` = test-build tag
   (`PDM_BUILD_TAG`, e.g. `V.01-03`), `commit` baked at build (`PDM_GIT_COMMIT`).
-- `POST /auth/login` — `{ username, password, org? }` → `{ token, user, org }`.
+- `POST /auth/login` — `{ username, password, org? }` → `{ token, user, org }`. The token is a web
+  sign-in: it ends after an idle spell or at its lifetime (`PDM_SESSION_IDLE_MINUTES`,
+  `PDM_SESSION_LIFETIME_MINUTES`). The first request after that gets 401 with code
+  `session_expired` and the token is deleted, so later ones get 401 `auth_failed`. Tokens from
+  `POST /users/{id}/tokens` never expire on their own.
 - `POST /auth/logout` — invalidate the current token.
 - `GET /me` — the signed-in identity.
 - `GET /me/settings`, `PUT /me/settings` — per-user jsonb payload (`{ payload }`). SolidCraft
