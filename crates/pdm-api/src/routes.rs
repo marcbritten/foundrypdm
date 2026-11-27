@@ -698,6 +698,15 @@ pub async fn put_onshape_settings(
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_admin(&authed)?;
     let org = require_org(&authed);
+    if let Some(project_id) = body.default_project_id
+        && pdm_db::get_project(&state.pool, project_id, org)
+            .await?
+            .is_none()
+    {
+        return Err(AppError(PdmError::NotFound(format!(
+            "project {project_id}"
+        ))));
+    }
     let current = crate::onshape::OnshapeSettings::from_json(
         &pdm_db::get_onshape_settings(&state.pool, org).await?,
     );
@@ -946,6 +955,7 @@ pub async fn onshape_import_request(
     };
     let _ = pdm_db::upsert_property(
         &state.pool,
+        org,
         item.id,
         "onshape.document_id",
         "string",
@@ -954,6 +964,7 @@ pub async fn onshape_import_request(
     .await;
     let _ = pdm_db::upsert_property(
         &state.pool,
+        org,
         item.id,
         "onshape.element_id",
         "string",
@@ -2487,10 +2498,8 @@ pub async fn upload_version_thumbnail(
             state.max_upload
         ))));
     }
-    // The version must exist.
-    pdm_db::get_version(&state.pool, version_id)
-        .await?
-        .ok_or_else(|| AppError(PdmError::NotFound(format!("version {version_id}"))))?;
+    // The version must be one of the organization's.
+    owned_version_source(&state, &authed, version_id).await?;
 
     let (sha, size) = state
         .store
@@ -2586,7 +2595,7 @@ pub async fn add_comment(
     if text.is_empty() {
         return Err(AppError(PdmError::Validation("empty comment".into())));
     }
-    let comment = pdm_db::add_comment(&state.pool, item_id, user.id, text).await?;
+    let comment = pdm_db::add_comment(&state.pool, org, item_id, user.id, text).await?;
     pdm_db::record_audit(
         &state.pool,
         org,
@@ -2721,11 +2730,11 @@ pub async fn set_property(
     Path((item_id, key)): Path<(Uuid, String)>,
     Json(body): Json<SetPropertyReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let _org = require_org(&authed);
+    let org = require_org(&authed);
     require_role(&authed, "editor")?;
     let value_type = body.value_type.unwrap_or_else(|| "text".to_string());
     let prop =
-        pdm_db::upsert_property(&state.pool, item_id, &key, &value_type, &body.value).await?;
+        pdm_db::upsert_property(&state.pool, org, item_id, &key, &value_type, &body.value).await?;
     Ok(serde_json::json!({ "property": prop }).into())
 }
 
@@ -2740,6 +2749,7 @@ pub async fn release(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
     let user = require_role(&authed, "editor")?.clone();
+    require_item_in_org(&state, org, item_id).await?;
 
     let file = pdm_db::get_file(&state.pool, item_id)
         .await?
@@ -2811,8 +2821,9 @@ pub async fn release(
         .into());
     }
 
-    let revision = pdm_db::create_revision(
+    let revision = pdm_db::release_revision(
         &state.pool,
+        org,
         item_id,
         &label,
         head.id,
@@ -2821,8 +2832,6 @@ pub async fn release(
         "alpha",
     )
     .await?;
-
-    let _ = pdm_db::set_item_lifecycle_state(&state.pool, org, item_id, "released").await?;
 
     pdm_db::record_audit(
         &state.pool,
@@ -3292,9 +3301,8 @@ pub async fn decide_approval_handler(
     let mut revision: Option<serde_json::Value> = None;
     let mut item: Option<serde_json::Value> = None;
     if let Some(item_id) = request.item_id {
-        item = pdm_db::get_item(&state.pool, item_id, org)
-            .await?
-            .map(|it| serde_json::json!(it));
+        let owned = owned_item(&state, org, item_id).await?;
+        item = Some(serde_json::json!(owned));
         if decision == "approve" {
             let file = pdm_db::get_file(&state.pool, item_id)
                 .await?
@@ -3305,8 +3313,9 @@ pub async fn decide_approval_handler(
             let existing = pdm_db::list_revisions(&state.pool, item_id).await?.len();
             let label = auto_revision_label(existing);
             let note = body.note.unwrap_or_default();
-            let rev = pdm_db::create_revision(
+            let rev = pdm_db::release_revision(
                 &state.pool,
+                org,
                 item_id,
                 &label,
                 head.id,
@@ -3315,7 +3324,6 @@ pub async fn decide_approval_handler(
                 "alpha",
             )
             .await?;
-            let _ = pdm_db::set_item_lifecycle_state(&state.pool, org, item_id, "released").await?;
             revision = Some(serde_json::json!(rev));
             pdm_db::record_audit(
                 &state.pool,

@@ -1002,9 +1002,9 @@ pub async fn list_items_paginated(
     }
     if let Some(sm) = sheet_metal {
         where_clauses.push(if sm {
-            "AND EXISTS (SELECT 1 FROM sheet_metal_specs s WHERE s.item_id = i.id)".into()
+            "AND EXISTS (SELECT 1 FROM sheet_metal_specs s WHERE s.item_id = i.id AND s.org_id = i.org_id)".into()
         } else {
-            "AND NOT EXISTS (SELECT 1 FROM sheet_metal_specs s WHERE s.item_id = i.id)".into()
+            "AND NOT EXISTS (SELECT 1 FROM sheet_metal_specs s WHERE s.item_id = i.id AND s.org_id = i.org_id)".into()
         });
     }
 
@@ -1159,8 +1159,128 @@ pub async fn search_items_paginated(
     .await
 }
 
+// ── Organization checks on the ids a write names ───────────────────────
+
+/// A row that a new record points at. The foreign keys accept any organization's ids, so a
+/// write checks each one against the writer's organization first.
+#[derive(Debug, Clone, Copy)]
+pub enum OrgRef {
+    Project(Uuid),
+    Item(Uuid),
+    /// A version of this item.
+    ItemVersion {
+        item_id: Uuid,
+        version_id: Uuid,
+    },
+    Machine(Uuid),
+    PostProcessor(Uuid),
+    Tool(Uuid),
+    MfgSetup(Uuid),
+    CamProject(Uuid),
+    NcProgram(Uuid),
+    ProductionJob(Uuid),
+}
+
+impl OrgRef {
+    fn describe(&self) -> String {
+        match self {
+            OrgRef::Project(id) => format!("project {id}"),
+            OrgRef::Item(id) => format!("item {id}"),
+            OrgRef::ItemVersion {
+                item_id,
+                version_id,
+            } => format!("version {version_id} of item {item_id}"),
+            OrgRef::Machine(id) => format!("machine {id}"),
+            OrgRef::PostProcessor(id) => format!("post-processor {id}"),
+            OrgRef::Tool(id) => format!("tool {id}"),
+            OrgRef::MfgSetup(id) => format!("manufacturing setup {id}"),
+            OrgRef::CamProject(id) => format!("CAM project {id}"),
+            OrgRef::NcProgram(id) => format!("NC program {id}"),
+            OrgRef::ProductionJob(id) => format!("production job {id}"),
+        }
+    }
+}
+
+/// NotFound for the first reference that is not the organization's, so another organization's
+/// ids look the same as ids that do not exist.
+pub async fn require_org_refs(
+    conn: &mut sqlx::PgConnection,
+    org_id: Uuid,
+    refs: &[OrgRef],
+) -> Result<(), PdmError> {
+    for r in refs {
+        let (sql, id, item) = match *r {
+            OrgRef::ItemVersion {
+                item_id,
+                version_id,
+            } => (
+                "SELECT EXISTS (SELECT 1 FROM file_versions v JOIN files f ON f.id = v.file_id
+                   JOIN items i ON i.id = f.item_id
+                  WHERE v.id = $1 AND i.org_id = $2 AND i.id = $3)",
+                version_id,
+                Some(item_id),
+            ),
+            OrgRef::Project(id) => (
+                "SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1 AND org_id = $2)",
+                id,
+                None,
+            ),
+            OrgRef::Item(id) => (
+                "SELECT EXISTS (SELECT 1 FROM items WHERE id = $1 AND org_id = $2)",
+                id,
+                None,
+            ),
+            OrgRef::Machine(id) => (
+                "SELECT EXISTS (SELECT 1 FROM machines WHERE id = $1 AND org_id = $2)",
+                id,
+                None,
+            ),
+            OrgRef::PostProcessor(id) => (
+                "SELECT EXISTS (SELECT 1 FROM post_processors WHERE id = $1 AND org_id = $2)",
+                id,
+                None,
+            ),
+            OrgRef::Tool(id) => (
+                "SELECT EXISTS (SELECT 1 FROM tools WHERE id = $1 AND org_id = $2)",
+                id,
+                None,
+            ),
+            OrgRef::MfgSetup(id) => (
+                "SELECT EXISTS (SELECT 1 FROM mfg_setups WHERE id = $1 AND org_id = $2)",
+                id,
+                None,
+            ),
+            OrgRef::CamProject(id) => (
+                "SELECT EXISTS (SELECT 1 FROM cam_projects WHERE id = $1 AND org_id = $2)",
+                id,
+                None,
+            ),
+            OrgRef::NcProgram(id) => (
+                "SELECT EXISTS (SELECT 1 FROM nc_programs WHERE id = $1 AND org_id = $2)",
+                id,
+                None,
+            ),
+            OrgRef::ProductionJob(id) => (
+                "SELECT EXISTS (SELECT 1 FROM production_jobs WHERE id = $1 AND org_id = $2)",
+                id,
+                None,
+            ),
+        };
+        let mut q = sqlx::query_scalar::<_, bool>(sql).bind(id).bind(org_id);
+        if let Some(item_id) = item {
+            q = q.bind(item_id);
+        }
+        if !q.fetch_one(&mut *conn).await.map_err(PdmError::Db)? {
+            return Err(PdmError::NotFound(r.describe()));
+        }
+    }
+    Ok(())
+}
+
 // ── Items (continued) ──────────────────────────────────────────────────
 
+/// Create an item. NotFound unless the project is the organization's and, when one is given,
+/// the folder is in that project.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_item(
     pool: &PgPool,
@@ -1174,7 +1294,10 @@ pub async fn create_item(
 ) -> Result<Item, PdmError> {
     sqlx::query_as::<_, Item>(
         "INSERT INTO items (org_id, project_id, folder_id, part_number, description, classification, owner_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         SELECT $1, $2, $3, $4, $5, $6, $7
+          WHERE EXISTS (SELECT 1 FROM projects WHERE id = $2 AND org_id = $1)
+            AND ($3::uuid IS NULL
+                 OR EXISTS (SELECT 1 FROM folders WHERE id = $3 AND org_id = $1 AND project_id = $2))
          RETURNING id, org_id, project_id, folder_id, part_number, description, classification, doc_id,
                    lifecycle_state, owner_id, created_at, updated_at, archived_at",
     )
@@ -1185,7 +1308,7 @@ pub async fn create_item(
     .bind(description)
     .bind(classification)
     .bind(owner_id)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .map_err(|e| {
         if e.to_string().contains("duplicate key") {
@@ -1193,6 +1316,10 @@ pub async fn create_item(
         } else {
             PdmError::Db(e)
         }
+    })?
+    .ok_or_else(|| match folder_id {
+        Some(f) => PdmError::NotFound(format!("folder {f} in project {project_id}")),
+        None => PdmError::NotFound(format!("project {project_id}")),
     })
 }
 
@@ -1280,13 +1407,13 @@ const ITEM_SUMMARY_COLUMNS: &str = "SELECT i.id, i.org_id, i.project_id, i.folde
                 hv.revision AS head_revision,
                 (SELECT f.filename FROM files f WHERE f.item_id = i.id LIMIT 1) AS filename,
                 (SELECT f.mime_type FROM files f WHERE f.item_id = i.id LIMIT 1) AS mime_type,
-                (SELECT EXISTS (SELECT 1 FROM sheet_metal_specs sm WHERE sm.item_id = i.id)) AS sheet_metal,
-                (SELECT sm.material FROM sheet_metal_specs sm WHERE sm.item_id = i.id
+                (SELECT EXISTS (SELECT 1 FROM sheet_metal_specs sm WHERE sm.item_id = i.id AND sm.org_id = i.org_id)) AS sheet_metal,
+                (SELECT sm.material FROM sheet_metal_specs sm WHERE sm.item_id = i.id AND sm.org_id = i.org_id
                  ORDER BY sm.created_at DESC LIMIT 1) AS sheet_metal_material,
-                (SELECT sm.thickness_mm FROM sheet_metal_specs sm WHERE sm.item_id = i.id
+                (SELECT sm.thickness_mm FROM sheet_metal_specs sm WHERE sm.item_id = i.id AND sm.org_id = i.org_id
                  ORDER BY sm.created_at DESC LIMIT 1) AS sheet_metal_thickness_mm,
                 (SELECT sm.flat_pattern_sha IS NOT NULL FROM sheet_metal_specs sm
-                 WHERE sm.item_id = i.id ORDER BY sm.created_at DESC LIMIT 1) AS sheet_metal_flat_pattern
+                 WHERE sm.item_id = i.id AND sm.org_id = i.org_id ORDER BY sm.created_at DESC LIMIT 1) AS sheet_metal_flat_pattern
          FROM items i
         LEFT JOIN users ou ON ou.id = i.owner_id
          LEFT JOIN LATERAL (
@@ -2262,20 +2389,20 @@ pub async fn home_dashboard(
     .await
     .map_err(PdmError::Db)?;
 
-    let pending_approvals: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*)::bigint FROM approval_requests
-         WHERE org_id = $1 AND status = 'pending'",
-    )
+    let pending_approvals: i64 = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*)::bigint FROM approval_requests ar
+         WHERE ar.org_id = $1 AND ar.status = 'pending' AND {OWN_ITEM_REQUEST}"
+    ))
     .bind(org_id)
     .fetch_one(pool)
     .await
     .map_err(PdmError::Db)?;
 
-    let pending_approvals_mine: i64 = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*)::bigint FROM approval_requests
-         WHERE org_id = $1 AND status = 'pending'
-           AND (requested_by = $2 OR assignees @> $3::jsonb)",
-    )
+    let pending_approvals_mine: i64 = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*)::bigint FROM approval_requests ar
+         WHERE ar.org_id = $1 AND ar.status = 'pending' AND {OWN_ITEM_REQUEST}
+           AND (ar.requested_by = $2 OR ar.assignees @> $3::jsonb)"
+    ))
     .bind(org_id)
     .bind(user_id)
     .bind(mine_json.clone())
@@ -2496,8 +2623,10 @@ pub async fn record_job_attempt(
 
 // ── Properties ───────────────────────────────────────────────────────────
 
+/// Set a property on one of the organization's items; NotFound for any other item.
 pub async fn upsert_property(
     pool: &PgPool,
+    org_id: Uuid,
     item_id: Uuid,
     key: &str,
     value_type: &str,
@@ -2505,7 +2634,8 @@ pub async fn upsert_property(
 ) -> Result<Property, PdmError> {
     sqlx::query_as::<_, Property>(
         "INSERT INTO properties (item_id, prop_key, value_type, value)
-         VALUES ($1, $2, $3, $4)
+         SELECT $1, $2, $3, $4
+          WHERE EXISTS (SELECT 1 FROM items WHERE id = $1 AND org_id = $5)
          ON CONFLICT (item_id, prop_key)
          DO UPDATE SET value_type = EXCLUDED.value_type, value = EXCLUDED.value, updated_at = now()
          RETURNING id, item_id, prop_key, value_type, value, computed, updated_at",
@@ -2514,9 +2644,11 @@ pub async fn upsert_property(
     .bind(key)
     .bind(value_type)
     .bind(value)
-    .fetch_one(pool)
+    .bind(org_id)
+    .fetch_optional(pool)
     .await
-    .map_err(PdmError::Db)
+    .map_err(PdmError::Db)?
+    .ok_or_else(|| PdmError::NotFound(format!("item {item_id}")))
 }
 
 pub async fn list_properties(pool: &PgPool, item_id: Uuid) -> Result<Vec<Property>, PdmError> {
@@ -2532,8 +2664,13 @@ pub async fn list_properties(pool: &PgPool, item_id: Uuid) -> Result<Vec<Propert
 
 // ── Revisions ────────────────────────────────────────────────────────────
 
-pub async fn create_revision(
+/// Release a version of one of the organization's items: record the revision and mark the item
+/// released, together or not at all. NotFound when the item is not the organization's or the
+/// version is not the item's.
+#[allow(clippy::too_many_arguments)]
+pub async fn release_revision(
     pool: &PgPool,
+    org_id: Uuid,
     item_id: Uuid,
     label: &str,
     version_id: Uuid,
@@ -2541,7 +2678,27 @@ pub async fn create_revision(
     release_note: &str,
     scheme: &str,
 ) -> Result<FileRevision, PdmError> {
-    sqlx::query_as::<_, FileRevision>(
+    let mut tx = pool.begin().await.map_err(PdmError::Db)?;
+    let owned: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM items WHERE id = $1 AND org_id = $2 FOR UPDATE")
+            .bind(item_id)
+            .bind(org_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(PdmError::Db)?;
+    if owned.is_none() {
+        return Err(PdmError::NotFound(format!("item {item_id}")));
+    }
+    require_org_refs(
+        &mut tx,
+        org_id,
+        &[OrgRef::ItemVersion {
+            item_id,
+            version_id,
+        }],
+    )
+    .await?;
+    let revision = sqlx::query_as::<_, FileRevision>(
         "INSERT INTO file_revisions (item_id, label, version_id, released_by, release_note, scheme)
          VALUES ($1, $2, $3, $4, $5, $6)
          RETURNING id, item_id, label, version_id, released_by, released_at, release_note, scheme",
@@ -2552,7 +2709,7 @@ pub async fn create_revision(
     .bind(released_by)
     .bind(release_note)
     .bind(scheme)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         if e.to_string().contains("duplicate key") {
@@ -2560,7 +2717,18 @@ pub async fn create_revision(
         } else {
             PdmError::Db(e)
         }
-    })
+    })?;
+    sqlx::query(
+        "UPDATE items SET lifecycle_state = 'released', updated_at = now()
+          WHERE id = $1 AND org_id = $2",
+    )
+    .bind(item_id)
+    .bind(org_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?;
+    tx.commit().await.map_err(PdmError::Db)?;
+    Ok(revision)
 }
 
 pub async fn list_revisions(pool: &PgPool, item_id: Uuid) -> Result<Vec<FileRevision>, PdmError> {
@@ -2576,14 +2744,17 @@ pub async fn list_revisions(pool: &PgPool, item_id: Uuid) -> Result<Vec<FileRevi
 
 // ── Comments ─────────────────────────────────────────────────────────────
 
+/// Comment on one of the organization's items; NotFound for any other item.
 pub async fn add_comment(
     pool: &PgPool,
+    org_id: Uuid,
     item_id: Uuid,
     user_id: Uuid,
     body: &str,
 ) -> Result<ItemComment, PdmError> {
     sqlx::query_as::<_, ItemComment>(
-        "INSERT INTO item_comments (item_id, user_id, body) VALUES ($1, $2, $3)
+        "INSERT INTO item_comments (item_id, user_id, body)
+         SELECT $1, $2, $3 WHERE EXISTS (SELECT 1 FROM items WHERE id = $1 AND org_id = $4)
          RETURNING item_comments.id,
                    item_comments.item_id,
                    item_comments.user_id,
@@ -2595,9 +2766,11 @@ pub async fn add_comment(
     .bind(item_id)
     .bind(user_id)
     .bind(body)
-    .fetch_one(pool)
+    .bind(org_id)
+    .fetch_optional(pool)
     .await
-    .map_err(PdmError::Db)
+    .map_err(PdmError::Db)?
+    .ok_or_else(|| PdmError::NotFound(format!("item {item_id}")))
 }
 
 pub async fn list_comments(pool: &PgPool, item_id: Uuid) -> Result<Vec<ItemComment>, PdmError> {
@@ -2754,8 +2927,10 @@ pub async fn list_pending_approvals(
     );
     let rows: Vec<ApprovalRow> = sqlx::query_as(
         "SELECT ar.id, ar.item_id, i.part_number, i.description, ar.created_at
-                 FROM approval_requests ar LEFT JOIN items i ON i.id = ar.item_id
+                 FROM approval_requests ar
+                 LEFT JOIN items i ON i.id = ar.item_id AND i.org_id = ar.org_id
                 WHERE ar.org_id = $1 AND ar.status = 'pending'
+                  AND (ar.item_id IS NULL OR i.id IS NOT NULL)
                 ORDER BY ar.created_at DESC LIMIT $2",
     )
     .bind(org_id)
@@ -2779,6 +2954,12 @@ pub async fn list_pending_approvals(
 
 // ── Approvals (decisions + inbox) ────────────────────────────────────────
 
+/// SQL condition on `approval_requests ar`: the request names no item, or one of its own
+/// organization's. Lists and counts leave out requests that name another organization's item.
+const OWN_ITEM_REQUEST: &str = "(ar.item_id IS NULL OR EXISTS (SELECT 1 FROM items it
+      WHERE it.id = ar.item_id AND it.org_id = ar.org_id))";
+
+/// Raise an approval request for one of the organization's items; NotFound for any other item.
 pub async fn create_approval_request(
     pool: &PgPool,
     org_id: Uuid,
@@ -2790,7 +2971,8 @@ pub async fn create_approval_request(
     type CreatedRow = (Uuid, Uuid, Uuid, Option<Uuid>, String, DateTime<Utc>);
     let row: Option<CreatedRow> = sqlx::query_as(
         "INSERT INTO approval_requests (org_id, item_id, requested_by, status, assignees)
-             VALUES ($1, $2, $3, 'pending', $4::jsonb)
+             SELECT $1, $2, $3, 'pending', $4::jsonb
+              WHERE EXISTS (SELECT 1 FROM items WHERE id = $2 AND org_id = $1)
              RETURNING id, org_id, item_id, requested_by, status, created_at",
     )
     .bind(org_id)
@@ -2801,7 +2983,7 @@ pub async fn create_approval_request(
     .await
     .map_err(PdmError::Db)?;
     let Some((id, _org, req_item, requested_by, status, created_at)) = row else {
-        return Err(PdmError::Internal("insert returned no row".into()));
+        return Err(PdmError::NotFound(format!("item {item_id}")));
     };
     Ok(pdm_core::ApprovalRequest {
         id,
@@ -2827,7 +3009,8 @@ pub async fn list_approval_requests(
 ) -> Result<Paginated<pdm_core::ApprovalRequestSummary>, PdmError> {
     let offset = (page - 1) * limit;
 
-    let mut where_clauses: Vec<String> = vec!["ar.org_id = $1".to_string()];
+    // A request naming another organization's item is left out.
+    let mut where_clauses: Vec<String> = vec![format!("ar.org_id = $1 AND {OWN_ITEM_REQUEST}")];
     let mut param: i32 = 2;
     if status.is_some() {
         where_clauses.push(format!("AND ar.status = ${param}"));
@@ -2849,7 +3032,7 @@ pub async fn list_approval_requests(
                 COALESCE(NULLIF(u.display_name, ''), u.email),
                 ar.assignees::text, ar.status, ar.created_at
              FROM approval_requests ar
-             LEFT JOIN items i ON i.id = ar.item_id
+             LEFT JOIN items i ON i.id = ar.item_id AND i.org_id = ar.org_id
              LEFT JOIN users u ON u.id = ar.requested_by
              WHERE {where_sql}
              ORDER BY ar.created_at DESC
@@ -2956,9 +3139,14 @@ pub async fn decide_approval_request(
         String,
         DateTime<Utc>,
     );
+    // A request naming another organization's item is treated as missing.
     let row: Option<LockedRow> = sqlx::query_as(
-        "SELECT id, item_id, requested_by, status, assignees::text, created_at
-             FROM approval_requests WHERE id = $1 AND org_id = $2 FOR UPDATE",
+        "SELECT ar.id, ar.item_id, ar.requested_by, ar.status, ar.assignees::text, ar.created_at
+             FROM approval_requests ar
+            WHERE ar.id = $1 AND ar.org_id = $2
+              AND (ar.item_id IS NULL
+                   OR EXISTS (SELECT 1 FROM items i WHERE i.id = ar.item_id AND i.org_id = ar.org_id))
+              FOR UPDATE",
     )
     .bind(request_id)
     .bind(org_id)
@@ -3555,6 +3743,13 @@ pub async fn create_mfg_setup(
     workholding: Option<&str>,
     wcs: Option<&str>,
 ) -> Result<MfgSetup, PdmError> {
+    let mut conn = pool.acquire().await.map_err(PdmError::Db)?;
+    let mut refs = vec![OrgRef::Item(item_id)];
+    refs.extend(file_version_id.map(|version_id| OrgRef::ItemVersion {
+        item_id,
+        version_id,
+    }));
+    require_org_refs(&mut conn, org_id, &refs).await?;
     sqlx::query_as::<_, MfgSetup>(
         "INSERT INTO mfg_setups (org_id, item_id, file_version_id, name, stock, workholding, wcs)
          VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
@@ -3566,7 +3761,7 @@ pub async fn create_mfg_setup(
     .bind(stock)
     .bind(workholding)
     .bind(wcs)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .map_err(PdmError::Db)
 }
@@ -3589,6 +3784,10 @@ pub async fn create_cam_project(
     source: Option<&str>,
     tool_ids: &[Uuid],
 ) -> Result<CamProject, PdmError> {
+    let mut conn = pool.acquire().await.map_err(PdmError::Db)?;
+    let mut refs = vec![OrgRef::MfgSetup(mfg_setup_id)];
+    refs.extend(tool_ids.iter().copied().map(OrgRef::Tool));
+    require_org_refs(&mut conn, org_id, &refs).await?;
     sqlx::query_as::<_, CamProject>(
         "INSERT INTO cam_projects (org_id, mfg_setup_id, name, source, tool_ids)
          VALUES ($1,$2,$3,$4,$5) RETURNING *",
@@ -3598,7 +3797,7 @@ pub async fn create_cam_project(
     .bind(name)
     .bind(source)
     .bind(tool_ids)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .map_err(PdmError::Db)
 }
@@ -3626,6 +3825,17 @@ pub async fn create_nc_program(
     post_processor_version: Option<&str>,
     gcode_sha256: Option<&str>,
 ) -> Result<NcProgram, PdmError> {
+    let mut conn = pool.acquire().await.map_err(PdmError::Db)?;
+    let mut refs = vec![OrgRef::Item(item_id)];
+    refs.extend(file_version_id.map(|version_id| OrgRef::ItemVersion {
+        item_id,
+        version_id,
+    }));
+    refs.extend(mfg_setup_id.map(OrgRef::MfgSetup));
+    refs.extend(cam_project_id.map(OrgRef::CamProject));
+    refs.extend(machine_id.map(OrgRef::Machine));
+    refs.extend(post_processor_id.map(OrgRef::PostProcessor));
+    require_org_refs(&mut conn, org_id, &refs).await?;
     sqlx::query_as::<_, NcProgram>(
         "INSERT INTO nc_programs (org_id, item_id, file_version_id, mfg_setup_id, cam_project_id,
             machine_id, post_processor_id, post_processor_version, gcode_sha256)
@@ -3640,7 +3850,7 @@ pub async fn create_nc_program(
     .bind(post_processor_id)
     .bind(post_processor_version)
     .bind(gcode_sha256)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .map_err(PdmError::Db)
 }
@@ -3701,6 +3911,10 @@ pub async fn create_production_job(
     machine_id: Option<Uuid>,
     operator: Option<&str>,
 ) -> Result<ProductionJob, PdmError> {
+    let mut conn = pool.acquire().await.map_err(PdmError::Db)?;
+    let mut refs = vec![OrgRef::NcProgram(nc_program_id)];
+    refs.extend(machine_id.map(OrgRef::Machine));
+    require_org_refs(&mut conn, org_id, &refs).await?;
     sqlx::query_as::<_, ProductionJob>(
         "INSERT INTO production_jobs (org_id, nc_program_id, machine_id, operator) VALUES ($1,$2,$3,$4) RETURNING *",
     )
@@ -3708,7 +3922,7 @@ pub async fn create_production_job(
     .bind(nc_program_id)
     .bind(machine_id)
     .bind(operator)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .map_err(PdmError::Db)
 }
@@ -3754,6 +3968,13 @@ pub async fn create_inspection(
     notes: Option<&str>,
     measured: Option<&serde_json::Value>,
 ) -> Result<InspectionRecord, PdmError> {
+    let mut conn = pool.acquire().await.map_err(PdmError::Db)?;
+    let refs: Vec<OrgRef> = production_job_id
+        .map(OrgRef::ProductionJob)
+        .into_iter()
+        .chain(item_id.map(OrgRef::Item))
+        .collect();
+    require_org_refs(&mut conn, org_id, &refs).await?;
     sqlx::query_as::<_, InspectionRecord>(
         "INSERT INTO inspection_records (org_id, production_job_id, item_id, passed, notes, measured)
          VALUES ($1,$2,$3,$4,$5,$6) RETURNING *",
@@ -3764,7 +3985,7 @@ pub async fn create_inspection(
     .bind(passed)
     .bind(notes)
     .bind(measured)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .map_err(PdmError::Db)
 }
@@ -3796,6 +4017,14 @@ pub async fn create_print_job(
     estimated_minutes: Option<i32>,
     machine_file_sha: Option<&str>,
 ) -> Result<PrintJob, PdmError> {
+    let mut conn = pool.acquire().await.map_err(PdmError::Db)?;
+    let mut refs = vec![OrgRef::Item(item_id)];
+    refs.extend(file_version_id.map(|version_id| OrgRef::ItemVersion {
+        item_id,
+        version_id,
+    }));
+    refs.extend(printer_id.map(OrgRef::Machine));
+    require_org_refs(&mut conn, org_id, &refs).await?;
     sqlx::query_as::<_, PrintJob>(
         "INSERT INTO print_jobs (org_id, item_id, file_version_id, printer_id, material, slicer_profile,
                                  orientation, supports, layer_height_mm, estimated_minutes, machine_file_sha)
@@ -3812,7 +4041,7 @@ pub async fn create_print_job(
     .bind(layer_height_mm)
     .bind(estimated_minutes)
     .bind(machine_file_sha)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .map_err(PdmError::Db)
 }
@@ -3862,6 +4091,13 @@ pub async fn create_sheet_metal(
     cutting_operation: Option<&str>,
     forming_operation: Option<&str>,
 ) -> Result<SheetMetalSpec, PdmError> {
+    let mut conn = pool.acquire().await.map_err(PdmError::Db)?;
+    let mut refs = vec![OrgRef::Item(item_id)];
+    refs.extend(file_version_id.map(|version_id| OrgRef::ItemVersion {
+        item_id,
+        version_id,
+    }));
+    require_org_refs(&mut conn, org_id, &refs).await?;
     sqlx::query_as::<_, SheetMetalSpec>(
         "INSERT INTO sheet_metal_specs (org_id, item_id, file_version_id, material, thickness_mm, bend_radius_mm,
                                         k_factor, bend_table, flat_pattern_sha, cutting_operation, forming_operation)
@@ -3878,7 +4114,7 @@ pub async fn create_sheet_metal(
     .bind(flat_pattern_sha)
     .bind(cutting_operation)
     .bind(forming_operation)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .map_err(PdmError::Db)
 }
@@ -4150,6 +4386,13 @@ pub async fn create_laser_nest_run(
         ));
     }
     let mut tx = pool.begin().await.map_err(PdmError::Db)?;
+    let refs: Vec<OrgRef> = params
+        .project_id
+        .map(OrgRef::Project)
+        .into_iter()
+        .chain(params.machine_id.map(OrgRef::Machine))
+        .collect();
+    require_org_refs(&mut tx, org_id, &refs).await?;
 
     let nest: pdm_core::LaserNest = sqlx::query_as(
         r#"INSERT INTO laser_nests (
@@ -4860,6 +5103,173 @@ mod tests {
         ));
         sqlx::query("DELETE FROM organizations WHERE id = ANY($1)")
             .bind(vec![org.id, other.id])
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PDM_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+    async fn writes_refuse_another_organizations_ids() -> Result<(), Box<dyn std::error::Error>> {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&std::env::var("PDM_TEST_DATABASE_URL")?)
+            .await?;
+        migrate(&pool).await?;
+        let stamp = Uuid::new_v4();
+        let a = create_org(&pool, &format!("refs-a-{stamp}")).await?;
+        let b = create_org(&pool, &format!("refs-b-{stamp}")).await?;
+        let user_b = create_user(&pool, b.id, "b@test.invalid", "B", "editor", None).await?;
+        let project_a = create_project(&pool, a.id, "A", "").await?;
+        let project_b = create_project(&pool, b.id, "B", "").await?;
+        let folder_a = create_folder(&pool, a.id, project_a.id, None, "A").await?;
+        let item_a = create_item(&pool, a.id, project_a.id, None, "A-1", "", "BE", None).await?;
+        let item_b = create_item(&pool, b.id, project_b.id, None, "B-1", "", "BE", None).await?;
+        let machine_a = create_machine(
+            &pool,
+            a.id,
+            "A",
+            "printer",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+        )
+        .await?;
+        let not_found = |r: Result<(), PdmError>| matches!(r, Err(PdmError::NotFound(_)));
+
+        // Items go only into the writer's own projects and folders.
+        let r = create_item(&pool, b.id, project_a.id, None, "B-2", "", "BE", None).await;
+        assert!(not_found(r.map(|_| ())), "item in another org's project");
+        let r = create_item(
+            &pool,
+            b.id,
+            project_b.id,
+            Some(folder_a.id),
+            "B-3",
+            "",
+            "BE",
+            None,
+        );
+        assert!(
+            not_found(r.await.map(|_| ())),
+            "item in another org's folder"
+        );
+
+        // Properties, comments, approval requests and releases only touch own items.
+        let v = serde_json::json!("x");
+        let r = upsert_property(&pool, b.id, item_a.id, "k", "text", &v).await;
+        assert!(not_found(r.map(|_| ())), "property");
+        let r = add_comment(&pool, b.id, item_a.id, user_b.id, "x").await;
+        assert!(not_found(r.map(|_| ())), "comment");
+        let r = create_approval_request(&pool, b.id, item_a.id, Some(user_b.id), &[]).await;
+        assert!(not_found(r.map(|_| ())), "approval request");
+        // A request an older server stored for another org's item is neither listed nor decided.
+        let legacy: Uuid = sqlx::query_scalar(
+            "INSERT INTO approval_requests (org_id, item_id, status, assignees)
+             VALUES ($1, $2, 'pending', '[]'::jsonb) RETURNING id",
+        )
+        .bind(b.id)
+        .bind(item_a.id)
+        .fetch_one(&pool)
+        .await?;
+        let listed = list_approval_requests(&pool, b.id, None, None, 1, 50).await?;
+        assert!(listed.items.iter().all(|r| r.id != legacy), "legacy listed");
+        assert_eq!(listed.total, 0);
+        let r = decide_approval_request(&pool, b.id, legacy, user_b.id, true, "approve", "").await;
+        assert!(not_found(r.map(|_| ())), "decide a legacy request");
+        let decisions: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM approval_decisions WHERE request_id = $1")
+                .bind(legacy)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(decisions, 0);
+        let r = release_revision(
+            &pool,
+            b.id,
+            item_a.id,
+            "X",
+            Uuid::new_v4(),
+            None,
+            "",
+            "alpha",
+        );
+        assert!(not_found(r.await.map(|_| ())), "release another org's item");
+        // A version that is not the item's leaves no revision and no state change behind.
+        let r = release_revision(
+            &pool,
+            a.id,
+            item_a.id,
+            "A",
+            Uuid::new_v4(),
+            None,
+            "",
+            "alpha",
+        );
+        assert!(
+            not_found(r.await.map(|_| ())),
+            "release with a foreign version"
+        );
+        assert!(list_revisions(&pool, item_a.id).await?.is_empty());
+        let item = get_item(&pool, item_a.id, a.id).await?.ok_or("item")?;
+        assert_eq!(item.lifecycle_state, "wip");
+
+        // Manufacturing records only point at the writer's own rows.
+        let r = create_mfg_setup(&pool, b.id, item_a.id, None, "x", None, None, None).await;
+        assert!(not_found(r.map(|_| ())), "setup for another org's item");
+        let r = create_print_job(
+            &pool,
+            b.id,
+            item_b.id,
+            None,
+            Some(machine_a.id),
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            not_found(r.map(|_| ())),
+            "print job on another org's printer"
+        );
+        let r = create_sheet_metal(
+            &pool, b.id, item_a.id, None, None, None, None, None, None, None, None, None,
+        )
+        .await;
+        assert!(
+            not_found(r.map(|_| ())),
+            "sheet metal for another org's item"
+        );
+
+        // The same writes inside one organization still work.
+        create_mfg_setup(&pool, a.id, item_a.id, None, "own", None, None, None).await?;
+        upsert_property(&pool, a.id, item_a.id, "k", "text", &v).await?;
+        create_print_job(
+            &pool,
+            a.id,
+            item_a.id,
+            None,
+            Some(machine_a.id),
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        sqlx::query("DELETE FROM organizations WHERE id = ANY($1)")
+            .bind(vec![a.id, b.id])
             .execute(&pool)
             .await?;
         Ok(())

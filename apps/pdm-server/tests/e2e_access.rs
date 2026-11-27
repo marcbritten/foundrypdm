@@ -4,6 +4,8 @@
 //!   PDM_E2E=1
 //!   PDM_E2E_BASE   (default http://127.0.0.1:8080)
 //!   PDM_E2E_ADMIN_TOKEN
+//!   PDM_E2E_OTHER_ORG_TOKEN  (an editor of a second organization; the cross-organization
+//!                             test skips without it)
 //!
 //! Run against a disposable server, never one people use: it creates users,
 //! projects, items, tools and manufacturing records.
@@ -294,4 +296,206 @@ async fn e2e_viewer_cannot_change_the_vault() {
         assert!(s.is_success(), "editor {method} {path}: {s}");
     }
     eprintln!("PASS: a viewer is refused every vault and library write; an editor keeps them");
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_other_org_cannot_write_to_this_orgs_records() {
+    if std::env::var("PDM_E2E").ok().as_deref() != Some("1") {
+        eprintln!("PDM_E2E not set; skipping");
+        return;
+    }
+    let Ok(other) = std::env::var("PDM_E2E_OTHER_ORG_TOKEN") else {
+        eprintln!("PDM_E2E_OTHER_ORG_TOKEN not set; skipping");
+        return;
+    };
+    let c = client();
+    let key = uuid::Uuid::new_v4().to_string();
+    let (_, editor) = user_with_role(&c, &key, "editor").await;
+    let (s, v) = send(
+        &c,
+        Method::POST,
+        "/projects",
+        &editor,
+        Some(json!({ "name": format!("owner-{key}") })),
+    )
+    .await;
+    assert!(s.is_success(), "owner project: {s}");
+    let project = v["project"]["id"].as_str().unwrap().to_string();
+    let (item, version) = item_with_version(&c, &editor, &project).await;
+    let (_, v) = send(
+        &c,
+        Method::POST,
+        "/machines",
+        &editor,
+        Some(json!({ "name": format!("m-{key}"), "kind": "printer" })),
+    )
+    .await;
+    let machine = v["machine"]["id"].as_str().unwrap().to_string();
+    let (_, v) = send(
+        &c,
+        Method::POST,
+        "/tools",
+        &editor,
+        Some(json!({ "name": format!("t-{key}") })),
+    )
+    .await;
+    let tool = v["tool"]["id"].as_str().unwrap().to_string();
+    let owner_png = b"\x89PNG\r\n\x1a\nowner".to_vec();
+    let r = c
+        .put(format!("{}/versions/{version}/thumbnail", base()))
+        .bearer_auth(&editor)
+        .body(owner_png.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "owner thumbnail: {}", r.status());
+
+    // The other organization's own records to point from.
+    let (s, v) = send(
+        &c,
+        Method::POST,
+        "/projects",
+        &other,
+        Some(json!({ "name": format!("other-{key}") })),
+    )
+    .await;
+    assert!(s.is_success(), "other org project: {s}");
+    let other_project = v["project"]["id"].as_str().unwrap().to_string();
+    let (other_item, _) = item_with_version(&c, &other, &other_project).await;
+    let (_, v) = send(
+        &c,
+        Method::POST,
+        "/mfg-setups",
+        &other,
+        Some(json!({ "item_id": other_item, "name": "own" })),
+    )
+    .await;
+    let other_setup = v["mfg_setup"]["id"].as_str().unwrap().to_string();
+
+    // Each write naming this organization's ids answers 404, as for an id that does not exist.
+    for (method, path, body) in [
+        (
+            Method::PUT,
+            format!("/items/{item}/properties/onshape.document_id"),
+            json!({ "value": "other" }),
+        ),
+        (
+            Method::POST,
+            format!("/items/{item}/release"),
+            json!({ "label": "X" }),
+        ),
+        (
+            Method::POST,
+            format!("/items/{item}/comments"),
+            json!({ "body": "other" }),
+        ),
+        (
+            Method::POST,
+            "/sheet-metal".into(),
+            json!({ "item_id": item, "material": "other" }),
+        ),
+        (
+            Method::POST,
+            "/mfg-setups".into(),
+            json!({ "item_id": item, "name": "other" }),
+        ),
+        (
+            Method::POST,
+            "/cam-projects".into(),
+            json!({ "mfg_setup_id": other_setup, "name": "x", "tool_ids": [tool] }),
+        ),
+        (
+            Method::POST,
+            "/nc-programs".into(),
+            json!({ "item_id": other_item, "machine_id": machine }),
+        ),
+        (
+            Method::POST,
+            "/print-jobs".into(),
+            json!({ "item_id": other_item, "file_version_id": version }),
+        ),
+        (
+            Method::POST,
+            "/inspections".into(),
+            json!({ "item_id": item, "passed": true }),
+        ),
+    ] {
+        let (s, _) = send(&c, method.clone(), &path, &other, Some(body)).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "other org {method} {path}");
+    }
+    let r = c
+        .put(format!("{}/versions/{version}/thumbnail", base()))
+        .bearer_auth(&other)
+        .body(b"\x89PNG\r\n\x1a\nother".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND, "other org thumbnail");
+
+    // Nothing changed on the owner's side.
+    let (_, props) = send(
+        &c,
+        Method::GET,
+        &format!("/items/{item}/properties"),
+        &editor,
+        None,
+    )
+    .await;
+    assert_eq!(props["properties"].as_array().map(Vec::len), Some(0));
+    let (_, revs) = send(
+        &c,
+        Method::GET,
+        &format!("/items/{item}/revisions"),
+        &editor,
+        None,
+    )
+    .await;
+    assert_eq!(revs["revisions"].as_array().map(Vec::len), Some(0));
+    let (_, comments) = send(
+        &c,
+        Method::GET,
+        &format!("/items/{item}/comments"),
+        &editor,
+        None,
+    )
+    .await;
+    assert_eq!(comments["comments"].as_array().map(Vec::len), Some(0));
+    let (_, detail) = send(&c, Method::GET, &format!("/items/{item}"), &editor, None).await;
+    assert_ne!(
+        detail["item"]["sheet_metal"],
+        json!(true),
+        "no sheet-metal spec"
+    );
+    let r = c
+        .get(format!("{}/versions/{version}/thumbnail", base()))
+        .bearer_auth(&editor)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.bytes().await.unwrap().to_vec(),
+        owner_png,
+        "the owner's thumbnail is unchanged"
+    );
+
+    // The same writes on its own records still work for the other organization.
+    for (path, body) in [
+        (
+            format!("/items/{other_item}/comments"),
+            json!({ "body": "own" }),
+        ),
+        (
+            "/sheet-metal".to_string(),
+            json!({ "item_id": other_item, "material": "own" }),
+        ),
+        (
+            "/nc-programs".to_string(),
+            json!({ "item_id": other_item, "mfg_setup_id": other_setup }),
+        ),
+    ] {
+        let (s, _) = send(&c, Method::POST, &path, &other, Some(body)).await;
+        assert!(s.is_success(), "other org on its own records: {path}: {s}");
+    }
+    eprintln!("PASS: another organization's ids are refused on every write checked");
 }

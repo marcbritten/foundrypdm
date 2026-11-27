@@ -874,7 +874,7 @@ pub async fn send_to_pdm(
             json!(req.part_name.clone().unwrap_or_default()),
         ),
     ] {
-        let _ = pdm_db::upsert_property(&state.pool, item_id, k, "string", &v).await;
+        let _ = pdm_db::upsert_property(&state.pool, org, item_id, k, "string", &v).await;
     }
 
     Ok(json!({
