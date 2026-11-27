@@ -1654,38 +1654,198 @@ async function downloadLatest(it){
     await saveVersionBlob(head, head.filename || it.filename || it.part_number);
   } catch(e){ toast("Download failed: " + e.message, "err"); }
 }
-async function checkinItem(itemId, file, msg, filename){
+// A local clock time ("17:05"), with the date when it is not today. For a lock's end (fmtTime
+// only knows the past) and for messages that stay on screen (a relative time goes stale).
+function clockTime(iso){
+  const t = Date.parse(iso);
+  if (isNaN(t)) return "—";
+  const d = new Date(t), p = n => String(n).padStart(2, "0");
+  const hm = p(d.getHours()) + ":" + p(d.getMinutes());
+  return d.toDateString() === new Date().toDateString() ? hm
+    : d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + hm;
+}
+// "checked out by Ana on WS-12 3h ago · lock ends at 17:05" (item header, release dialog).
+// Checkouts made in this portal record the server's host name as the workstation.
+function lockSummary(lock){
+  const ws = !lock.workstation ? "" : lock.workstation === location.hostname ? " in the web portal" : " on " + lock.workstation;
+  return "checked out by " + (lock.user_id === myId() ? "you" : lockName(lock)) + ws + " " +
+    fmtTime(lock.acquired_at) + " · lock ends at " + clockTime(lock.lease_expires_at);
+}
+function lockHeldError(lock){
+  const e = new Error(lockName(lock) + " has this item checked out (lock ends at " + clockTime(lock.lease_expires_at) +
+    "). Ask them to check in or undo their checkout, then try again.");
+  e.lockHeld = true;
+  return e;
+}
+// The head moved on from the version the user worked from: say who checked in what, and
+// what to do. err.conflict.seq is the newer version, for the banner's Download button.
+function newerVersionError(head, base){
+  const what = "v" + head.seq + " was checked in by " + (head.author_name || "someone") + " at " +
+    clockTime(head.committed_at) + (base != null ? " after you opened v" + base : "");
+  const e = new Error(what + ". Your file was not checked in. Download v" + head.seq +
+    ", merge your changes, then check in again.");
+  e.conflict = { seq: head.seq, what };
+  return e;
+}
+// Refuse early, before a lock or an upload, when the item moved on from `base` or someone
+// else holds it. `base` is the seq of the version the user was looking at, null for an item
+// with no versions yet, or "head" for a file that goes on top of whatever is current (an
+// import not started from a version on screen). Returns the item as read.
+async function checkinPrecheck(itemId, base){
+  if (base === undefined) throw new Error("The check-in did not say which version it builds on.");
   const cur = await api("GET", "/items/" + itemId);
-  if (cur.lock){
-    if (cur.lock.user_id !== myId())
-      throw new Error("checked out by " + lockName(cur.lock) + " — undo their checkout or wait for the lease to expire");
-  } else {
-    await api("POST", "/items/" + itemId + "/checkout", { workstation: location.hostname });
-  }
-  const buf = await file.arrayBuffer();
-  const up = await api("PUT", "/blobs", null, new Uint8Array(buf));
   const head = cur.head_version;
-  const body = {
-    sha256: up.blob.sha256, size: up.blob.size_bytes,
-    base_version: head ? head.seq : null,
-    commit_message: msg || "", filename: filename || file.name,
-    mime_type: file.type || null,
-  };
+  if (head && base !== "head" && head.seq !== base) throw newerVersionError(head, base);
+  if (cur.lock && cur.lock.user_id !== myId()) throw lockHeldError(cur.lock);
+  return cur;
+}
+// Turn the server's check-in refusals (409) into what happened and what to do next.
+async function checkinRefusal(itemId, e, base){
+  if (e.status !== 409) return e;
+  const msg = String(e.message || "");
   try {
-    const d = await api("POST", "/items/" + itemId + "/checkin", body);
-    ALLITEMS = [];
+    if (/stale base|no base version/.test(msg)){
+      const h = (await api("GET", "/items/" + itemId)).head_version;
+      if (h) return newerVersionError(h, base);
+    } else if (/lock held by another user/.test(msg)){
+      const l = (await api("GET", "/items/" + itemId)).lock;
+      if (l) return lockHeldError(l);
+    } else if (/no active checkout/.test(msg)){
+      return new Error("Your checkout ended before the check-in finished. Check out again, then retry.");
+    }
+  } catch(_){ /* keep the server's own words below */ }
+  return e;
+}
+// Check an uploaded blob in as the next version on top of `base` (see checkinPrecheck), sending
+// that base so the server refuses a stale one too. Checks the item out when it is free and lets
+// go of that checkout again if the check-in fails: a refused check-in never leaves a lock behind.
+async function commitVersion(itemId, base, blob, fields){
+  const cur = await checkinPrecheck(itemId, base);
+  const took = !cur.lock;
+  if (took) await api("POST", "/items/" + itemId + "/checkout", { workstation: location.hostname });
+  try {
+    const d = await api("POST", "/items/" + itemId + "/checkin",
+      Object.assign({ sha256: blob.sha256, size: blob.size_bytes, base_version: base }, fields));
+    ALLITEMS = []; ALLITEMS_AT = 0;
     return { version: d.version, cur };
   } catch(e){
-    if (e.status === 409){
-      const h2 = (await api("GET", "/items/" + itemId)).head_version;
-      const err = new Error("v" + (h2 ? h2.seq : "?") + " was committed by " +
-        (h2 ? (h2.author_name || "someone") : "another session") +
-        " while you were checking in. Refresh to pick up the new base, then retry.");
-      err.conflict = true;
-      throw err;
-    }
-    throw e;
+    if (took) await api("DELETE", "/items/" + itemId + "/checkout").catch(() => {});
+    throw await checkinRefusal(itemId, e, base);
   }
+}
+// PUT /blobs with upload progress (fetch reports none). Sends the File itself rather than a
+// copy read into memory. onProgress(loaded, total) in bytes.
+function uploadBlob(data, onProgress){
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open("PUT", "/blobs");
+    if (TOKEN) x.setRequestHeader("Authorization", "Bearer " + TOKEN);
+    if (onProgress) x.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded, e.total); };
+    x.onload = () => {
+      let d = null;
+      try { d = JSON.parse(x.responseText); } catch(_){}
+      if (x.status >= 200 && x.status < 300 && d && d.blob) return resolve(d);
+      let msg = d && d.error ? (typeof d.error === "string" ? d.error : d.error.message) : "";
+      if (x.status === 413) msg = "The file is larger than this server accepts.";
+      else if (x.status === 401) msg = "Your session has ended. Sign in again, then retry.";
+      const e = new Error(msg || "The server did not accept the file.");
+      e.status = x.status;
+      reject(e);
+    };
+    x.onerror = () => reject(new Error("The connection dropped during the upload. Check the network, then retry."));
+    x.send(data);
+  });
+}
+// Upload a file and check it in on top of `base` (see checkinPrecheck). With "head", the head
+// as read before the upload is the base: a version checked in during the upload still wins.
+async function checkinItem(itemId, file, msg, filename, base, onProgress){
+  const cur = await checkinPrecheck(itemId, base);
+  if (base === "head") base = cur.head_version ? cur.head_version.seq : null;
+  const up = await uploadBlob(file, onProgress);
+  return commitVersion(itemId, base, up.blob, {
+    commit_message: msg || "", filename: filename || file.name, mime_type: file.type || null,
+  });
+}
+// A floating panel listing uploads with their progress, outcome and a Retry for failures.
+// It stays until closed so failures are not missed; leaving the page while one runs asks first.
+let UPLOAD_PANEL = null;
+function uploadPanel(){
+  if (UPLOAD_PANEL && UPLOAD_PANEL.el.isConnected) return UPLOAD_PANEL;
+  const el = document.createElement("div");
+  el.className = "card";
+  el.setAttribute("role", "region");
+  el.setAttribute("aria-label", "Uploads");
+  // Below dialogs (their backdrop is z-index 120) and above the page; a toast keeps its own
+  // corner below the panel.
+  el.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:110;width:min(420px,calc(100vw - 36px));" +
+    "max-height:min(40vh,16rem);overflow:auto;box-shadow:var(--shadow)";
+  el.innerHTML = "<div class='row' style='margin-top:0'><b class='grow'>Uploads</b>" +
+    "<button class='small' data-upclose>Close</button></div><div data-uprows></div>";
+  document.body.appendChild(el);
+  // Leave room for a toast, and for the phone layout's bottom navigation bar when it shows.
+  const place = () => {
+    const bar = $("bottombar");
+    el.style.bottom = (18 + 64 + (bar && bar.offsetHeight ? bar.offsetHeight : 0)) + "px";
+  };
+  place();
+  window.addEventListener("resize", place);
+  let running = 0;
+  const guard = e => { if (running){ e.preventDefault(); e.returnValue = ""; } };
+  window.addEventListener("beforeunload", guard);
+  const close = el.querySelector("[data-upclose]");
+  const sync = () => { close.disabled = running > 0; close.title = running ? "Uploads are still running" : ""; };
+  close.onclick = () => {
+    if (running) return;
+    window.removeEventListener("beforeunload", guard); window.removeEventListener("resize", place);
+    el.remove(); UPLOAD_PANEL = null;
+  };
+  const add = name => {
+    const r = document.createElement("div");
+    r.style.cssText = "border-top:1px solid var(--line);padding:6px 0";
+    // Steps and outcomes are announced (role=status / alert); the running percentage is not,
+    // so a screen reader is not flooded by every progress event.
+    r.innerHTML = "<div class='row' style='margin:0'><span class='grow' style='overflow-wrap:anywhere'></span>" +
+      "<span class='dim' data-uppct></span></div>" +
+      "<progress max='100' value='0' style='width:100%'></progress><div class='dim' role='status'></div>";
+    r.querySelector(".grow").textContent = name;
+    el.querySelector("[data-uprows]").appendChild(r);
+    el.scrollTop = el.scrollHeight;
+    const bar = r.querySelector("progress"), line = r.querySelector("[role=status]"), pct = r.querySelector("[data-uppct]");
+    const actions = r.querySelector(".row");
+    const clearActions = () => actions.querySelectorAll("button").forEach(b => b.remove());
+    running++; sync();
+    let open = true;
+    const finish = () => { if (open){ open = false; running--; sync(); } };
+    const reopen = () => { if (!open){ open = true; running++; sync(); } };
+    return {
+      progress(loaded, total){
+        bar.value = total ? Math.round(100 * loaded / total) : 0;
+        pct.textContent = bar.value + "% of " + bytes(total);
+      },
+      step(text){
+        reopen(); clearActions(); bar.hidden = false;
+        line.setAttribute("role", "status"); line.style.color = ""; line.textContent = text;
+      },
+      done(text, buttons){
+        finish(); bar.value = 100; pct.textContent = ""; line.textContent = text;
+        for (const [label, fn] of buttons || []){
+          const b = document.createElement("button"); b.className = "small"; b.textContent = label; b.onclick = fn;
+          actions.appendChild(b);
+        }
+      },
+      fail(text, retry){
+        finish(); bar.hidden = true; pct.textContent = "";
+        line.setAttribute("role", "alert"); line.style.color = "var(--err)"; line.textContent = text;
+        if (retry){
+          const b = document.createElement("button"); b.className = "small"; b.textContent = retry[0];
+          b.onclick = retry[1];
+          actions.appendChild(b);
+        }
+      },
+    };
+  };
+  UPLOAD_PANEL = { el, add };
+  return UPLOAD_PANEL;
 }
 
 // Open immutable vault bytes in a same-origin Craft editor. Keep the base pinned
@@ -1707,18 +1867,11 @@ async function openWebEditor(itemId, versionId){
         return r.arrayBuffer();
       },
       checkin: isRole("editor") ? async (buffer, message) => {
-        const cur = await api("GET", "/items/" + itemId);
-        if (!cur.head_version || cur.head_version.id !== version.id)
-          throw new Error("The vault head has changed since this file was opened. Download your edits and compare with the latest version.");
-        if (cur.lock && cur.lock.user_id !== myId()) throw new Error("The item is checked out by " + lockName(cur.lock));
-        if (!cur.lock) await api("POST", "/items/" + itemId + "/checkout", { workstation:location.hostname });
-        const up = await api("PUT", "/blobs", null, new Uint8Array(buffer));
-        const result = await api("POST", "/items/" + itemId + "/checkin", {
-          sha256:up.blob.sha256, base_version:version.seq, commit_message:message,
-          filename:name, mime_type:app.mime,
-        });
+        await checkinPrecheck(itemId, version.seq);
+        const up = await uploadBlob(new Blob([buffer]));
+        const result = await commitVersion(itemId, version.seq, up.blob,
+          { commit_message:message, filename:name, mime_type:app.mime });
         version = result.version;
-        ALLITEMS = []; ALLITEMS_AT = 0;
         return version;
       } : null,
       onSaved: () => { if (CUR_RELOAD) CUR_RELOAD(); },
@@ -1762,52 +1915,100 @@ async function checkoutBulk(ids){
     CUR_RELOAD && CUR_RELOAD();
   } catch(e){ toast("Checkout: " + e.message, "err"); }
 }
+// Category choices for a new item: the org's configured categories (Settings ▸ Part-number
+// prefixes) first, then the legacy classes that aren't configured yet. The part-number
+// prefix is resolved server-side from the chosen category.
+async function categoryOptions(){
+  const configured = (await api("GET", "/settings/part-number-prefixes")
+    .catch(() => ({ prefixes: [] }))).prefixes || [];
+  const opts = configured.map(p => ({ value:p.category, label:p.category + " (" + p.prefix + ")" }));
+  for (const legacy of ["BE","ASM","MFG","SC"])
+    if (!configured.some(p => String(p.category).toLowerCase() === legacy.toLowerCase()))
+      opts.push({ value:legacy, label:legacy + " (no prefix configured)" });
+  return opts;
+}
+// Folder choices labelled with their path ("Housings / Rev B"), so folders that share a
+// name can be told apart; the project root first.
+function folderPathOptions(folders){
+  const byId = {};
+  for (const f of folders) byId[f.id] = f;
+  const pathOf = f => {
+    const names = [];
+    for (let x = f, n = 0; x && n < 64; x = byId[x.parent_id], n++) names.unshift(x.name);
+    return names.join(" / ");
+  };
+  return [{ value:"", label:"(project root)" }].concat(
+    folders.map(f => ({ value:f.id, label:pathOf(f) })).sort((a, b) => a.label.localeCompare(b.label)));
+}
 async function uploadModal(pid, files){
   const folders = ROUTE._folders || [];
   const extra = files && files.length
     ? "<div class='modal-note' style='margin-bottom:10px'>" +
       [...files].map(f => "• " + esc(f.name) + " (" + bytes(f.size) + ")").join("<br>") + "</div>"
     : null;
-  // Classification options: the org's configured categories (Settings ▸ Part-number
-  // prefixes) first, then the legacy classes that aren't configured yet. The part-number
-  // prefix is resolved server-side from the chosen category.
-  const configured = (await api("GET", "/settings/part-number-prefixes")
-    .catch(() => ({ prefixes: [] }))).prefixes || [];
-  const clsOpts = configured.map(p => ({ value:p.category, label:p.category + " (" + p.prefix + ")" }));
-  for (const legacy of ["BE","ASM","MFG","SC"])
-    if (!configured.some(p => p.category.toLowerCase() === legacy))
-      clsOpts.push({ value:legacy, label:legacy + " (no prefix configured)" });
+  const clsOpts = await categoryOptions();
+  // Upload into the folder the explorer is showing, so the new items stay in view.
+  const here = ROUTE.pid === pid && folders.some(x => x.id === ROUTE._folder) ? ROUTE._folder : "";
   return openModal("Upload " + (files ? files.length + " file(s)" : "file(s)"), [
     { id:"desc", label:"Item description (one item per file; blank = filename)", placeholder:"e.g. Drain tray" },
     { id:"pn", label:"Part number (blank = auto-assign from the category prefix)" },
-    { id:"cls", label:"Category", type:"select", options: clsOpts.length ? clsOpts : ["BE"], value: clsOpts[0] ? clsOpts[0].value : "BE" },
-    { id:"folder", label:"Folder", type:"select",
-      options:[{value:"",label:"(project root)"}].concat(folders.map(x=>({value:x.id,label:x.name}))) },
+    { id:"cls", label:"Category", type:"select", options: clsOpts, value: clsOpts[0].value },
+    { id:"folder", label:"Folder", type:"select", options: folderPathOptions(folders), value: here },
     { id:"msg", label:"Commit message", placeholder:"e.g. initial upload" },
   ], "Upload", extra);
 }
+// Each file: upload the bytes first (with progress), then create the item and check the
+// file in as v1. A file that fails before the item exists leaves nothing behind; a check-in
+// that fails after it keeps the uploaded bytes and offers "Retry into <part number>".
 async function doUpload(pid, f, files){
   if (!files.length){ toast("No files to upload", "err"); return; }
-  const proj = PMAP[pid];
+  const panel = uploadPanel();
+  const target = f.folder || null;
+  const folderLabel = target
+    ? (folderPathOptions(ROUTE._folders || []).find(o => o.value === target) || {}).label || "the chosen folder"
+    : "the project root";
+  // Offer "Show" when the items landed outside the folder on screen.
+  const inView = () => ROUTE.name === "explorer" && ROUTE.pid === pid && (ROUTE._folder || null) === target;
+  const showFolder = () => {
+    if (ROUTE.name === "explorer" && ROUTE.pid === pid){ ROUTE._folder = target; render(false); }
+    else go("explorer", { pid, _folder: target });
+  };
+  const refresh = () => {
+    ALLITEMS = []; ALLITEMS_AT = 0;
+    if ((ROUTE.name === "explorer" && ROUTE.pid === pid) ||
+        (ROUTE.name === "detail" && DETAIL.data)) render(false);
+    else CUR_RELOAD && CUR_RELOAD();
+  };
   let n = 0;
-  try {
-    for (const file of files){
-      const desc = f.desc || file.name.replace(/\.[^.]+$/, "");
-      const pn = f.pn ? (files.length > 1 ? f.pn + "-" + (n + 1) : f.pn) : null;
-      const d = await api("POST", "/projects/" + pid + "/items", {
-        description: desc, part_number: pn, classification: f.cls,
-        folder_id: f.folder || null });
-      const r = await checkinItem(d.item.id, file, f.msg || "upload");
-      n++;
-      toast("Uploaded " + n + "/" + files.length + " — " + d.item.part_number + " v" + r.version.seq, "ok", 5000);
-    }
-  } catch(e){
-    toast("Upload stopped at file " + (n + 1) + " (" + (proj ? proj.name : pid) + "): " + e.message, "err", 7000);
+  for (const file of files){
+    const i = n++;
+    const row = panel.add(file.name);
+    const desc = f.desc || file.name.replace(/\.[^.]+$/, "");
+    const pn = f.pn ? (files.length > 1 ? f.pn + "-" + (i + 1) : f.pn) : null;
+    const fields = { commit_message: f.msg || "upload", filename: file.name, mime_type: file.type || null };
+    let blob = null, item = null;
+    const attempt = async () => {
+      try {
+        if (!blob){ row.step("Uploading…"); blob = (await uploadBlob(file, (a, b) => row.progress(a, b))).blob; }
+        if (!item){
+          row.step("Creating the item…");
+          item = (await api("POST", "/projects/" + pid + "/items", {
+            description: desc, part_number: pn, classification: f.cls, folder_id: f.folder || null })).item;
+        }
+        row.step("Checking in " + item.part_number + "…");
+        const r = await commitVersion(item.id, null, blob, fields);
+        row.done(item.part_number + " v" + r.version.seq + " · in " + folderLabel,
+          inView() ? [] : [["Show", showFolder]]);
+        refresh();
+      } catch(e){
+        row.fail(item ? item.part_number + " was created but the file was not checked in: " + e.message
+                      : (blob ? "Not added: " : "Not uploaded: ") + e.message,
+          [item ? "Retry into " + item.part_number : "Retry", attempt]);
+        if (item) refresh();
+      }
+    };
+    await attempt();
   }
-  ALLITEMS = [];
-  if ((ROUTE.name === "explorer" && ROUTE.pid === pid) ||
-      (ROUTE.name === "detail" && DETAIL.data)) render(false);
-  else CUR_RELOAD && CUR_RELOAD();
 }
 function pickFiles(pid){
   const inp = document.createElement("input");
@@ -4198,7 +4399,7 @@ async function importOnshapeStep(pid, file, options){
     for (const [key, value] of [["onshape.document_id", source.document], ["onshape.element_id", source.element], ["onshape.url", options.url]])
       await api("PUT", "/items/" + item.id + "/properties/" + encodeURIComponent(key), { value, value_type:"string" });
   }
-  const result = await checkinItem(item.id, file, "Manual Onshape STEP export" + (options.url ? " from " + options.url : ""));
+  const result = await checkinItem(item.id, file, "Manual Onshape STEP export" + (options.url ? " from " + options.url : ""), undefined, "head");
   ALLITEMS = []; ALLITEMS_AT = 0;
   if (options.convert) {
     try {
@@ -4309,13 +4510,21 @@ async function scCheckin(itemId, base, versionId, designName, buffer, message){
   const cur = await api("GET", "/items/" + itemId);
   if (base !== null && (!cur.head_version || cur.head_version.id !== versionId))
     throw new Error("The vault head has changed since this design was opened. Download your edits and compare with the latest version.");
-  if (cur.lock && cur.lock.user_id !== myId()) throw new Error("The item is checked out by " + lockName(cur.lock));
-  if (!cur.lock) await api("POST", "/items/" + itemId + "/checkout", { workstation:location.hostname });
-  const up = await api("PUT", "/blobs", null, new Uint8Array(buffer));
-  const result = await api("POST", "/items/" + itemId + "/checkin", {
-    sha256:up.blob.sha256, base_version:base, commit_message:message,
-    filename:designName, mime_type:"application/octet-stream",
-  });
+  if (cur.lock && cur.lock.user_id !== myId()) throw lockHeldError(cur.lock);
+  // A checkout taken here is let go again if the check-in fails, so no lock is left behind.
+  const took = !cur.lock;
+  if (took) await api("POST", "/items/" + itemId + "/checkout", { workstation:location.hostname });
+  let result;
+  try {
+    const up = await api("PUT", "/blobs", null, new Uint8Array(buffer));
+    result = await api("POST", "/items/" + itemId + "/checkin", {
+      sha256:up.blob.sha256, base_version:base, commit_message:message,
+      filename:designName, mime_type:"application/octet-stream",
+    });
+  } catch(e){
+    if (took) await api("DELETE", "/items/" + itemId + "/checkout").catch(() => {});
+    throw e;
+  }
   ALLITEMS = []; ALLITEMS_AT = 0;
   return result.version;
 }
@@ -4338,13 +4547,12 @@ async function newPartInSolidcraftWeb(pid){
     const folders = fd.folders || [];
     await PdmEditors.openSolidcraft({
       createNew: isRole("editor") ? async (buffer, into) => {
+        const cls = await categoryOptions();
         const f = await openModal("New part", [
           { id:"desc", label:"Description", required:true, placeholder:"what is this part?" },
-          { id:"pn", label:"Part number (blank = auto-assign)" },
-          { id:"cls", label:"Classification", type:"select", options:["BE","ASM","MFG","SC"], value:"BE" },
-          { id:"folder", label:"Folder", type:"select",
-            options:[{value:"",label:"(project root)"}]
-              .concat(folders.map(x => ({ value:x.id, label:x.name }))) },
+          { id:"pn", label:"Part number (blank = auto-assign from the category prefix)" },
+          { id:"cls", label:"Category", type:"select", options:cls, value:cls[0].value },
+          { id:"folder", label:"Folder", type:"select", options:folderPathOptions(folders) },
           { id:"msg", label:"Version message", value:"Created in SolidCraft web" },
         ], "Create part", null, into);
         if (!f) return null;
@@ -4364,7 +4572,7 @@ function wireNativeActions(root){
   root.querySelectorAll("[data-native]").forEach(b => { b.onclick = () => nativeVersionAction(b.dataset.native,b); });
 }
 // Dutchman feature-tree conversions can run for many minutes, so the poll is
-// generous (15 min); the Tasks view shows live progress meanwhile.
+// generous (15 min); the Dashboard's Active jobs list shows progress meanwhile.
 async function waitForVersionJob(id,button){
   for (let i=0;i<900;i++) {
     if (!button.isConnected) return false;
@@ -4373,7 +4581,7 @@ async function waitForVersionJob(id,button){
     if (["dead","failed"].includes(job.status)) throw new Error(job.last_error || "Processing failed");
     await new Promise(resolve=>setTimeout(resolve,1000));
   }
-  throw new Error("Still processing — check Tasks or click the action again to check progress");
+  throw new Error("Still processing. Progress shows on the Dashboard under Active jobs; click the action again later to pick up the result.");
 }
 async function refreshVersionInfo(itemId,vid){
   const data = await api("GET","/items/"+itemId);
@@ -4491,7 +4699,7 @@ async function viewDetail(v){
         "<div class='nm'>" + esc(itemName(it)) + " " + revBadge(it.latest_revision) + archBadge(it.archived_at) + "</div>" +
         "<div class='dim'>" + esc(it.part_number) + " · " + esc(proj.name || "") + " · " +
         esc(it.classification || "") + " " + stateBadge(it.lifecycle_state) +
-        (lock ? " · <span style='color:var(--warn)'>" + kindSvg("ic-lock") + " " + esc(mine ? "checked out by you" : "checked out by " + lockName(lock)) + "</span>" : "") +
+        (lock ? " · <span style='color:var(--warn)'>" + kindSvg("ic-lock") + " " + esc(lockSummary(lock)) + "</span>" : "") +
         "</div>" +
       "</div>" +
       "<div class='grow'></div>" +
@@ -4504,11 +4712,13 @@ async function viewDetail(v){
       "<button id='dco' class='small'" + (lock && !mine ? " disabled" : "") + ">" +
         (lock ? (mine ? "Undo checkout" : "Checked out") : "Check out") + "</button>" +
       "<input type='file' id='dfile' class='hidden'>" +
-      "<button id='dnew' class='small primary'>⬆ New version</button>" +
+      "<button id='dnew' class='small primary'" + (lock && !mine ? " disabled title='" +
+        esc(lockName(lock) + " has this item checked out. A new version can be checked in after they check in or undo their checkout.") + "'" : "") +
+        ">⬆ New version</button>" +
       "<button id='drel' class='small'" + (head ? "" : " disabled") + ">Release revision</button>" +
       "<button id='dkebab' class='kebab-btn vis' title='Item actions'>⋮</button>" +
     "</div>" +
-    (DETAIL.conflict ? conflictBannerHtml() : "<div id='dbanner'></div>") +
+    (DETAIL.conflict && DETAIL.conflict.itemId === id ? conflictBannerHtml() : "<div id='dbanner'></div>") +
     "<div class='tabs'>" +
       detailTabs().map(t =>
         "<div class='tab" + (DETAIL.tab === t[0] ? " on" : "") + "' data-t='" + t[0] + "'>" +
@@ -4540,32 +4750,51 @@ async function viewDetail(v){
     const file = e.target.files[0];
     e.target.value = "";
     if (!file) return;
+    // The new version goes on top of the version this page shows; if someone checked in a
+    // newer one meanwhile, the check-in is refused instead of silently replacing theirs.
+    const base = head ? head.seq : null;
     const f = await openModal("Check in new version", [
       { id:"msg", label:"Commit message", placeholder:"describe the change" }
-    ], "Check in v" + ((head ? head.seq : 0) + 1));
+    ], "Check in v" + ((base || 0) + 1),
+      "<div class='modal-note' style='margin-bottom:10px'>" + esc(file.name) + " (" + bytes(file.size) + ")" +
+      (head ? " · goes on top of v" + base + ", the version shown on this page" : "") + "</div>");
     if (!f) return;
+    const row = uploadPanel().add(it.part_number + ": " + file.name);
     try {
-      const r = await checkinItem(id, file, f.msg || "", file.name);
-      toast("Checked in v" + r.version.seq + " (" + bytes(r.version.size_bytes) + ")", "ok");
+      const r = await checkinItem(id, file, f.msg || "", file.name, base, (a, b) => row.progress(a, b));
+      row.done("Checked in as v" + r.version.seq);
       DETAIL.conflict = null;
       CUR_RELOAD && CUR_RELOAD();
     } catch(err){
-      if (err.conflict){ DETAIL.conflict = err.message; CUR_RELOAD && CUR_RELOAD(); }
-      else toast("Check in: " + err.message, "err");
+      row.fail(err.conflict ? "Not checked in: v" + err.conflict.seq + " is newer. See the item page." : "Not checked in: " + err.message);
+      if (err.conflict){ DETAIL.conflict = { itemId: id, text: err.message, seq: err.conflict.seq }; CUR_RELOAD && CUR_RELOAD(); }
     }
   };
   $("drel").onclick = releaseItem;
   $("dkebab").addEventListener("click", e => openKebabMenu(e, id, "item"));
   const dr = $("drefresh");
   if (dr) dr.onclick = () => { DETAIL.conflict = null; CUR_RELOAD && CUR_RELOAD(); };
+  const dn = $("ddlnewer");
+  if (dn) dn.onclick = async () => {
+    const vv = (d.versions || []).find(x => x.seq === DETAIL.conflict.seq);
+    if (!vv){ toast("v" + DETAIL.conflict.seq + " is not on this page yet. Reload, then download it.", "err"); return; }
+    dn.disabled = true; dn.textContent = "Downloading…";
+    try { await saveVersionBlob(vv, versionDownloadName(vv, d)); }
+    catch(e){ toast("Download failed: " + e.message, "err"); }
+    finally { dn.disabled = false; dn.textContent = "Download v" + vv.seq; }
+  };
   const dd = $("ddismiss");
   if (dd) dd.onclick = () => { DETAIL.conflict = null; render(false); };
   renderDetailTab();
 }
+// A check-in or restore the server refused because a newer version exists. It stays (and is
+// announced) until dismissed; the newer version can be downloaded to merge with.
 function conflictBannerHtml(){
-  return "<div class='banner'>⚠ " + esc(DETAIL.conflict) +
-    " <button class='small' id='drefresh'>Reload &amp; retry</button>" +
-    " <button class='small' id='ddismiss'>Dismiss</button></div>";
+  const c = DETAIL.conflict;
+  return "<div class='banner' role='alert'><span style='flex:1 1 16rem'>" + esc(c.text) + "</span>" +
+    (c.seq ? "<button class='small' id='ddlnewer'>Download v" + c.seq + "</button>" : "") +
+    "<button class='small' id='drefresh'>Reload</button>" +
+    "<button class='small' id='ddismiss'>Dismiss</button></div>";
 }
 async function renderDetailTab(){
   const box = $("dtab");
@@ -5110,27 +5339,23 @@ async function restoreVersion(vv){
       value: "Restore of v" + vv.seq + (vv.commit_message ? " (" + vv.commit_message + ")" : "") }
   ], "Restore");
   if (!f) return;
+  // Restore on top of the head this page shows, never a newer one checked in meanwhile.
+  const shown = DETAIL.data.head_version;
   try {
-    const cur = await api("GET", "/items/" + id);
-    if (cur.lock && cur.lock.user_id !== myId()){
-      toast("Restore: " + lockName(cur.lock) + " has the item checked out", "err");
-      return;
-    }
-    if (!cur.lock)
-      await api("POST", "/items/" + id + "/checkout", { workstation: location.hostname });
-    const d2 = await api("POST", "/items/" + id + "/checkin", {
-      sha256: vv.sha256, size: vv.size_bytes,
-      base_version: cur.head_version ? cur.head_version.seq : null,
+    const d2 = await commitVersion(id, shown ? shown.seq : null, vv, {
       commit_message: f.msg || "",
-      filename: (cur.file && cur.file.filename) || null,
+      filename: (DETAIL.data.file && DETAIL.data.file.filename) || null,
       mime_type: vv.mime_type || null,
     });
     toast("Restored v" + vv.seq + " as v" + d2.version.seq, "ok");
     DETAIL.cmp.clear();
     CUR_RELOAD && CUR_RELOAD();
   } catch(e){
-    if (e.status === 409){ DETAIL.conflict = "v" + vv.seq + " could not be restored — " + e.message + " Reload to rebase, then try again."; CUR_RELOAD && CUR_RELOAD(); }
-    else toast("Restore: " + e.message, "err");
+    if (e.conflict){
+      DETAIL.conflict = { itemId: id, seq: e.conflict.seq, text: "v" + vv.seq + " was not restored: " +
+        e.conflict.what + ". Look at v" + e.conflict.seq + " first, then restore again if you still need to." };
+      CUR_RELOAD && CUR_RELOAD();
+    } else toast("Restore: " + e.message, "err");
   }
 }
 
@@ -5145,16 +5370,32 @@ async function releaseItem(){
   const id = DETAIL.id;
   const head = DETAIL.data.head_version;
   if (!head){ toast("Check in a version first", "err"); return; }
+  // Say exactly which version is released; the server releases the head at that moment.
+  const lock = DETAIL.data.lock;
+  const note = "<div class='modal-note' style='margin-bottom:10px'>Releases v" + head.seq + ", checked in by " +
+    esc(head.author_name || "someone") + " at " + clockTime(head.committed_at) + "." +
+    (lock ? "<br><span style='color:var(--warn)'>This item is " + esc(lockSummary(lock)) +
+      ". If a newer version is checked in first, this release stops so you can look at it.</span>" : "") +
+    "<br>Where releases need approval, the version that is current when it is approved is released, " +
+    "with the next revision label; the label and note entered here are not kept.</div>";
   const f = await openModal("Release revision", [
     { id:"label", label:"Revision label", value: autoLabel(DETAIL.revs.length) },
     { id:"note", label:"Release note", placeholder:"optional" }
-  ], "Release v" + head.seq);
+  ], "Release v" + head.seq, note);
   if (!f) return;
   try {
+    const now = (await api("GET", "/items/" + id)).head_version;
+    if (now && now.id !== head.id){
+      DETAIL.conflict = { itemId: id, seq: now.seq, text: "Not released: v" + now.seq + " was checked in by " +
+        (now.author_name || "someone") + " at " + clockTime(now.committed_at) + " after this page loaded. " +
+        "Look at v" + now.seq + ", then release again." };
+      CUR_RELOAD && CUR_RELOAD();
+      return;
+    }
     const r = await api("POST", "/items/" + id + "/release",
       { label: f.label || null, note: f.note || null });
     if (r.status === "pending_approval"){
-      toast("Release requested — routed for approval", "ok");
+      toast("Sent for approval. When it is approved, the version that is current then is released with the next revision label.", "ok", 8000);
       DETAIL.tab = "overview";
     } else {
       toast("Released as revision " + (r.revision ? r.revision.label : ""), "ok");
