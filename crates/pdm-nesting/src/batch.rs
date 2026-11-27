@@ -286,7 +286,11 @@ pub fn run_batch<F: Fn(&SolverInstance) -> Result<SolverSolution, solver::Solver
         let inst = build_instance(lines, parts, copies, cfg, &mapping, &name);
         let sol = oracle(&inst).map_err(|_| ())?;
         let ids = sheet::assign_item_ids(copies);
-        sheet::build_sheet(&sol, &ids, parts, cfg, &mapping)
+        // Fill from the corner on both axes (see `snap_down`). Should the moved layout not
+        // validate, the solver's own is used.
+        let snapped = snap_down(&sol, &inst, mapping.separation);
+        sheet::build_sheet(&snapped, &ids, parts, cfg, &mapping)
+            .or_else(|_| sheet::build_sheet(&sol, &ids, parts, cfg, &mapping))
             .map(|l| (l, sol.strip_width))
             .map_err(|_| ())
     };
@@ -355,6 +359,41 @@ pub fn run_batch<F: Fn(&SolverInstance) -> Result<SolverSolution, solver::Solver
             placed: sheets,
         })
     }
+}
+
+/// Move a solved layout down the strip until its lowest item sits `floor` above the strip's
+/// bottom edge.
+///
+/// Sparrow shortens the strip along x but leaves the layout's height in the strip open: the parts
+/// sit a steady distance from the fill-side edge, but can sit anywhere between the strip's bottom
+/// and top edges. So a nest starts from the chosen corner's side (left or right) but floats
+/// between its top and bottom, leaving the off-cut in two pieces. The corner flip in
+/// `sheet::build_sheet` turns the strip's bottom edge into the chosen corner's horizontal edge, so
+/// pressing the layout down here puts it into that corner. The shift is uniform, so every distance
+/// between parts is kept; a layout already at or below `floor` is left as it is. `floor` is the
+/// solver's own clearance (`StockMapping::separation`), the gap it leaves at the fill-side edge.
+pub fn snap_down(sol: &SolverSolution, inst: &SolverInstance, floor: f64) -> SolverSolution {
+    let lowest = sol
+        .placed
+        .iter()
+        .filter_map(|p| {
+            let item = inst.items.iter().find(|i| i.id == p.item_id)?;
+            let t = crate::geom::Transform {
+                reflected: p.reflected,
+                rotation_deg: p.rotation_deg,
+                tx: p.translation[0],
+                ty: p.translation[1],
+            };
+            item.polygon.iter().map(|q| t.apply(*q).y).reduce(f64::min)
+        })
+        .reduce(f64::min);
+    let mut out = sol.clone();
+    if let Some(drop) = lowest.map(|low| low - floor).filter(|d| *d > 0.0) {
+        for p in &mut out.placed {
+            p.translation[1] -= drop;
+        }
+    }
+    out
 }
 
 /// A trivial in-memory oracle for tests: greedily axis-aligned packs the copies
@@ -654,10 +693,12 @@ mod tests {
     }
 
     /// A test oracle: turns every item by its first allowed rotation, flips the ones that allow it
-    /// when `flip`, and lines the items up along the strip `sep` apart.
+    /// when `flip`, and lines the items up along the strip `sep` apart, `lift` above the strip's
+    /// bottom clearance (a layout floating in the strip, as Sparrow can leave it).
     fn row_oracle(
         sep: f64,
         flip: bool,
+        lift: f64,
     ) -> impl Fn(&SolverInstance) -> Result<SolverSolution, solver::SolverError> {
         move |inst: &SolverInstance| {
             let mut x = sep;
@@ -680,7 +721,7 @@ mod tests {
                     item_id: it.id,
                     reflected,
                     rotation_deg: rot,
-                    translation: [x - min_x, sep - min_y],
+                    translation: [x - min_x, sep + lift - min_y],
                 });
                 x += max_x - min_x + sep;
             }
@@ -716,7 +757,7 @@ mod tests {
                 ..Default::default()
             };
             let mapping = sheet::StockMapping::from_config(&cfg).unwrap();
-            let oracle = row_oracle(mapping.separation, false);
+            let oracle = row_oracle(mapping.separation, false, 0.0);
             let sheets =
                 run_batch(&lines, &parts, &cfg, oracle).unwrap_or_else(|e| panic!("{corner:?}: {e}"));
             let placements = &sheets[0].layout.placements;
@@ -762,8 +803,59 @@ mod tests {
             ..Default::default()
         };
         let mapping = sheet::StockMapping::from_config(&cfg).unwrap();
-        let oracle = row_oracle(mapping.separation, true);
+        let oracle = row_oracle(mapping.separation, true, 0.0);
         let sheets = run_batch(&[l], &parts, &cfg, oracle).unwrap();
         assert!(sheets[0].layout.placements[0].transform.reflected);
+    }
+
+    #[test]
+    fn a_floating_layout_is_pressed_into_the_corner() {
+        // The solver leaves the layout 100 mm up the strip. At every corner the parts must end up
+        // as close to that corner's horizontal edge as to its fill-side edge (both are the
+        // solver's own clearance from the strip edge), not 100 mm off it.
+        use crate::NestingCorner::{LowerLeft, LowerRight, UpperLeft, UpperRight};
+        let parts = vec![l_part()];
+        let lines = vec![line(0, 3)];
+        let (w, h) = (400.0, 300.0);
+        for corner in [LowerLeft, LowerRight, UpperLeft, UpperRight] {
+            let cfg = NestConfig {
+                stock_width: w,
+                stock_height: h,
+                edge_margin: 10.0,
+                gap_x: 5.0,
+                gap_y: 5.0,
+                chord_tol: 0.05,
+                join_tol: 0.01,
+                max_sheets: 1,
+                nesting_corner: corner,
+                ..Default::default()
+            };
+            let mapping = sheet::StockMapping::from_config(&cfg).unwrap();
+            let oracle = row_oracle(mapping.separation, false, 100.0);
+            let sheets =
+                run_batch(&lines, &parts, &cfg, oracle).unwrap_or_else(|e| panic!("{corner:?}: {e}"));
+            let pts: Vec<Point> = sheets[0]
+                .layout
+                .placements
+                .iter()
+                .flat_map(|pl| parts[0].outer.points.iter().map(move |p| pl.transform.apply(*p)))
+                .collect();
+            let (min_x, max_x) = pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| {
+                (a.min(p.x), b.max(p.x))
+            });
+            let (min_y, max_y) = pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| {
+                (a.min(p.y), b.max(p.y))
+            });
+            let (side_gap, edge_gap) = match corner {
+                LowerLeft => (min_x, min_y),
+                LowerRight => (w - max_x, min_y),
+                UpperLeft => (min_x, h - max_y),
+                UpperRight => (w - max_x, h - max_y),
+            };
+            assert!(
+                (side_gap - edge_gap).abs() < 1e-6,
+                "{corner:?}: {side_gap:.3} mm from the fill side, {edge_gap:.3} mm from the edge"
+            );
+        }
     }
 }

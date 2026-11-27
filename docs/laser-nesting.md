@@ -177,6 +177,16 @@ back into the line's allowed ones, so a corner never turns a part to an angle
 its line (or `allowed_rotations`) doesn't allow: an upper-right fill with
 `allowed_rotations: [0]` still cuts every part at 0°, not 180°.
 
+**The layout sits in the corner on both axes.** Sparrow shortens the strip
+lengthwise only and leaves the layout's height in the strip open, so a layout
+can start at the chosen corner's side but float between its top and bottom
+edges, leaving the off-cut in two pieces. After each solve the whole layout is
+moved down the strip until its lowest part has the solver's own edge
+clearance, the same gap it leaves at the fill side, so the parts sit in the
+chosen corner (`batch::snap_down`). The move is the same for every part, so
+the spacing between them is unchanged. The sheet is validated afterwards; if
+the moved layout failed, the solver's own would be kept.
+
 ### Units (inches → millimetres)
 
 Everything is stored and nested internally in millimetres; the exported sheet
