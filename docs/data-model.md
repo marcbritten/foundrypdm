@@ -9,9 +9,18 @@ UUID PKs; `org_id` on every tenant-scoped table. Postgres 13+.
 - `0002_thumbnails.sql` — `file_versions.thumbnail_sha256`, `.thumbnail_size_bytes`.
 - `0003_client_settings.sql` — `client_settings` (per-user jsonb Prefs payload).
 - `0004_comments.sql` — `item_comments` + index.
+- `0027_org_branding.sql` — `org_branding_assets` (an organization's branding images).
 
 ## Tenancy & identity
-- **organizations** — top-level tenant.
+- **organizations** — top-level tenant. `settings` (JSONB) holds org-wide settings, one top-level
+  key each; `settings->'branding'` = `{ display_name, show_name_with_logo, favicon_from_logo,
+  colors: { theme: { token: "#rrggbb" } } }` (validated against the allow-lists in
+  `crates/pdm-core/src/branding.rs`).
+- **org_branding_assets** — branding images, one per `(org_id, kind)`; `kind` `logo` (`icon` is
+  reserved), `mime` `image/png` or `image/webp`, `bytes` (≤ 256 KiB), `sha256`, `width`/`height`
+  (16–2048), `updated_at`, `updated_by`. Kept in the database rather than the blob store because
+  the unauthenticated sign-in page reads them and blob keys have no organization scope; deleted
+  with the organization.
 - **users** — `org_id`, `email` (unique per org), `display_name`, `password_hash` (Argon2id, optional),
   `role` (`viewer`|`editor`|`admin`), `active`.
 - **api_tokens** — bearer tokens, stored SHA-256; scoped to user/service-account. `kind`: `web` for

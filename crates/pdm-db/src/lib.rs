@@ -195,6 +195,214 @@ pub async fn set_preview_style(
     Ok(style.to_string())
 }
 
+// ── Organization branding ──────────────────────────────────────────────
+
+/// Stored branding as read back: an absent or unreadable object gives the default; entries that
+/// no longer pass validation are dropped one by one (see `BrandingSettings::sanitized`).
+fn parse_branding(v: Option<serde_json::Value>) -> pdm_core::branding::BrandingSettings {
+    v.and_then(|v| serde_json::from_value::<pdm_core::branding::BrandingSettings>(v).ok())
+        .map(pdm_core::branding::BrandingSettings::sanitized)
+        .unwrap_or_default()
+}
+
+/// The org's branding (`settings->'branding'`).
+pub async fn get_branding(
+    pool: &PgPool,
+    org_id: Uuid,
+) -> Result<pdm_core::branding::BrandingSettings, PdmError> {
+    let v: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT settings->'branding' FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(PdmError::Db)?
+            .flatten();
+    Ok(parse_branding(v))
+}
+
+/// Apply a partial update to the org's branding (`BrandingSettings::apply_patch`) and store it,
+/// holding the organization row locked from read to write so two admins' saves, or a save and
+/// a reset, cannot overwrite each other. Returns the stored settings and what changed.
+pub async fn update_branding(
+    pool: &PgPool,
+    org_id: Uuid,
+    patch: &serde_json::Value,
+) -> Result<
+    (
+        pdm_core::branding::BrandingSettings,
+        pdm_core::branding::BrandingChange,
+    ),
+    PdmError,
+> {
+    let mut tx = pool.begin().await.map_err(PdmError::Db)?;
+    let row: Option<Option<serde_json::Value>> = sqlx::query_scalar(
+        "SELECT settings->'branding' FROM organizations WHERE id = $1 FOR UPDATE",
+    )
+    .bind(org_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?;
+    let Some(current) = row else {
+        return Err(PdmError::NotFound("organization".into()));
+    };
+    let mut settings = parse_branding(current);
+    let change = settings.apply_patch(patch)?;
+    let json = serde_json::to_value(&settings).map_err(|e| PdmError::Internal(e.to_string()))?;
+    sqlx::query(
+        "UPDATE organizations SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{branding}', $1, true) WHERE id = $2",
+    )
+    .bind(json)
+    .bind(org_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?;
+    tx.commit().await.map_err(PdmError::Db)?;
+    Ok((settings, change))
+}
+
+/// Store the org's branding (validated first; replaces the whole object). Returns what was
+/// stored.
+pub async fn set_branding(
+    pool: &PgPool,
+    org_id: Uuid,
+    settings: &pdm_core::branding::BrandingSettings,
+) -> Result<pdm_core::branding::BrandingSettings, PdmError> {
+    let mut settings = settings.clone();
+    settings.validate()?;
+    let json = serde_json::to_value(&settings).map_err(|e| PdmError::Internal(e.to_string()))?;
+    sqlx::query(
+        "UPDATE organizations SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{branding}', $1, true) WHERE id = $2",
+    )
+    .bind(json)
+    .bind(org_id)
+    .execute(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    Ok(settings)
+}
+
+/// Remove the org's branding: the settings and every branding image.
+pub async fn clear_branding(pool: &PgPool, org_id: Uuid) -> Result<(), PdmError> {
+    let mut tx = pool.begin().await.map_err(PdmError::Db)?;
+    sqlx::query("UPDATE organizations SET settings = settings - 'branding' WHERE id = $1")
+        .bind(org_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(PdmError::Db)?;
+    sqlx::query("DELETE FROM org_branding_assets WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(PdmError::Db)?;
+    tx.commit().await.map_err(PdmError::Db)
+}
+
+/// A branding image's details without its bytes (`kind` is `logo` or `icon`).
+pub async fn get_branding_asset_meta(
+    pool: &PgPool,
+    org_id: Uuid,
+    kind: &str,
+) -> Result<Option<pdm_core::branding::BrandingAssetMeta>, PdmError> {
+    sqlx::query_as(
+        "SELECT mime, sha256, width, height, octet_length(bytes) AS size_bytes, updated_at
+         FROM org_branding_assets WHERE org_id = $1 AND kind = $2",
+    )
+    .bind(org_id)
+    .bind(kind)
+    .fetch_optional(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+/// A branding image with its bytes.
+pub async fn get_branding_asset(
+    pool: &PgPool,
+    org_id: Uuid,
+    kind: &str,
+) -> Result<Option<pdm_core::branding::BrandingAsset>, PdmError> {
+    sqlx::query_as(
+        "SELECT mime, sha256, width, height, octet_length(bytes) AS size_bytes, updated_at, bytes
+         FROM org_branding_assets WHERE org_id = $1 AND kind = $2",
+    )
+    .bind(org_id)
+    .bind(kind)
+    .fetch_optional(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+/// Store (or replace) a branding image. `info` comes from `pdm_core::branding::sniff_logo`.
+pub async fn put_branding_asset(
+    pool: &PgPool,
+    org_id: Uuid,
+    kind: &str,
+    info: &pdm_core::branding::LogoInfo,
+    bytes: &[u8],
+    sha256: &str,
+    updated_by: Option<Uuid>,
+) -> Result<pdm_core::branding::BrandingAssetMeta, PdmError> {
+    let width = i32::try_from(info.width).map_err(|e| PdmError::Validation(e.to_string()))?;
+    let height = i32::try_from(info.height).map_err(|e| PdmError::Validation(e.to_string()))?;
+    sqlx::query_as(
+        "INSERT INTO org_branding_assets (org_id, kind, mime, bytes, sha256, width, height, updated_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (org_id, kind) DO UPDATE SET
+             mime = EXCLUDED.mime, bytes = EXCLUDED.bytes, sha256 = EXCLUDED.sha256,
+             width = EXCLUDED.width, height = EXCLUDED.height,
+             updated_at = now(), updated_by = EXCLUDED.updated_by
+         RETURNING mime, sha256, width, height, octet_length(bytes) AS size_bytes, updated_at",
+    )
+    .bind(org_id)
+    .bind(kind)
+    .bind(info.mime)
+    .bind(bytes)
+    .bind(sha256)
+    .bind(width)
+    .bind(height)
+    .bind(updated_by)
+    .fetch_one(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+/// Delete a branding image; `true` when there was one.
+pub async fn delete_branding_asset(
+    pool: &PgPool,
+    org_id: Uuid,
+    kind: &str,
+) -> Result<bool, PdmError> {
+    let done = sqlx::query("DELETE FROM org_branding_assets WHERE org_id = $1 AND kind = $2")
+        .bind(org_id)
+        .bind(kind)
+        .execute(pool)
+        .await
+        .map_err(PdmError::Db)?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// The organization whose branding the sign-in page shows, before anyone has signed in:
+/// - `name` given (the server's `PDM_SIGNIN_ORG`): the organization with that name, or none;
+/// - otherwise the only organization, when the server hosts exactly one;
+/// - otherwise none, so one tenant's name and logo are never shown to another's users.
+pub async fn signin_org(pool: &PgPool, name: Option<&str>) -> Result<Option<Uuid>, PdmError> {
+    if let Some(name) = name {
+        return sqlx::query_scalar("SELECT id FROM organizations WHERE name = $1")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .map_err(PdmError::Db);
+    }
+    let ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM organizations ORDER BY created_at LIMIT 2")
+            .fetch_all(pool)
+            .await
+            .map_err(PdmError::Db)?;
+    Ok(match ids.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    })
+}
+
 /// The org's Dutchman settings (release channel + conversion options), stored in
 /// `organizations.settings`; absent or malformed values fall back to the defaults.
 pub async fn get_dutchman_settings(
@@ -5319,6 +5527,140 @@ mod tests {
             .bind(vec![a.id, b.id])
             .execute(&pool)
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PDM_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+    async fn branding_is_kept_per_organization() -> Result<(), Box<dyn std::error::Error>> {
+        use pdm_core::branding::{BrandingSettings, LOGO, LogoInfo};
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&std::env::var("PDM_TEST_DATABASE_URL")?)
+            .await?;
+        migrate(&pool).await?;
+        let a_name = format!("branding-a-{}", Uuid::new_v4());
+        let a = create_org(&pool, &a_name).await?;
+        let b = create_org(&pool, &format!("branding-b-{}", Uuid::new_v4())).await?;
+
+        // Settings round-trip, validated and normalised on the way in.
+        let none = BrandingSettings::default();
+        assert_eq!(get_branding(&pool, a.id).await?, none);
+        let mut wanted = BrandingSettings::default();
+        wanted.apply_patch(&serde_json::json!({
+            "display_name": "Example Works",
+            "show_name_with_logo": false,
+            "colors": { "dark": { "acc": "#3B82F6" } }
+        }))?;
+        set_branding(&pool, a.id, &wanted).await?;
+        let got = get_branding(&pool, a.id).await?;
+        assert_eq!(got, wanted);
+        assert_eq!(got.colors["dark"]["acc"], "#3b82f6");
+        let mut invalid = BrandingSettings::default();
+        invalid
+            .colors
+            .entry("dark".into())
+            .or_default()
+            .insert("acc".into(), "red".into());
+        assert!(matches!(
+            set_branding(&pool, a.id, &invalid).await,
+            Err(PdmError::BadRequest(_))
+        ));
+        // Other settings keys are untouched, and the other organization sees nothing.
+        set_preview_style(&pool, a.id, "viewport").await?;
+        assert_eq!(get_branding(&pool, a.id).await?, wanted);
+        assert_eq!(get_branding(&pool, b.id).await?, none);
+
+        // A partial update merges into what is stored; a refused one stores nothing.
+        let (stored, change) = update_branding(
+            &pool,
+            a.id,
+            &serde_json::json!({ "colors": { "light": { "acc": "#1D4ED8" } } }),
+        )
+        .await?;
+        assert_eq!(change.themes, vec!["light"]);
+        assert_eq!(stored.display_name.as_deref(), Some("Example Works"));
+        assert_eq!(get_branding(&pool, a.id).await?, stored);
+        let refused = update_branding(
+            &pool,
+            a.id,
+            &serde_json::json!({ "colors": { "dark": { "acc": "red" } } }),
+        )
+        .await;
+        assert!(matches!(refused, Err(PdmError::BadRequest(_))));
+        assert_eq!(get_branding(&pool, a.id).await?, stored);
+        set_branding(&pool, a.id, &wanted).await?;
+
+        // A stored entry that no longer passes (e.g. a token since dropped from the allow-list)
+        // is dropped on its own; the rest of the branding is kept.
+        sqlx::query(
+            "UPDATE organizations SET settings = jsonb_set(settings, '{branding,colors,dark,retired-token}', '\"#000000\"') WHERE id = $1",
+        )
+        .bind(a.id)
+        .execute(&pool)
+        .await?;
+        assert_eq!(get_branding(&pool, a.id).await?, wanted);
+
+        // One row per (org, kind): a second upload replaces the first.
+        let info = LogoInfo {
+            mime: "image/png",
+            width: 480,
+            height: 120,
+        };
+        put_branding_asset(&pool, a.id, LOGO, &info, b"first", "1111", None).await?;
+        let webp = LogoInfo {
+            mime: "image/webp",
+            ..info
+        };
+        let meta = put_branding_asset(&pool, a.id, LOGO, &webp, b"second!", "2222", None).await?;
+        assert_eq!((meta.mime.as_str(), meta.size_bytes), ("image/webp", 7));
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM org_branding_assets WHERE org_id = $1")
+                .bind(a.id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(rows, 1);
+        let asset = get_branding_asset(&pool, a.id, LOGO).await?;
+        assert!(asset.is_some_and(|x| x.bytes == b"second!" && x.sha256 == "2222"));
+        assert!(get_branding_asset_meta(&pool, b.id, LOGO).await?.is_none());
+        // The database refuses formats and sizes the API would never send.
+        let svg = LogoInfo {
+            mime: "image/svg+xml",
+            ..info
+        };
+        let refused = put_branding_asset(&pool, b.id, LOGO, &svg, b"x", "3", None).await;
+        assert!(refused.is_err());
+        let big = vec![0u8; 262_145];
+        let refused = put_branding_asset(&pool, b.id, LOGO, &info, &big, "4", None).await;
+        assert!(refused.is_err());
+
+        assert!(delete_branding_asset(&pool, a.id, LOGO).await?);
+        assert!(!delete_branding_asset(&pool, a.id, LOGO).await?);
+        put_branding_asset(&pool, a.id, LOGO, &info, b"third", "5555", None).await?;
+        clear_branding(&pool, a.id).await?;
+        assert_eq!(get_branding(&pool, a.id).await?, none);
+        assert!(get_branding_asset_meta(&pool, a.id, LOGO).await?.is_none());
+        assert_eq!(get_preview_style(&pool, a.id).await?, "viewport");
+
+        // Sign-in organization: a name picks that organization; an unknown name or (with at
+        // least two organizations here) no name picks none. The single-organization case
+        // depends on the whole database and is covered by the live end-to-end test.
+        assert_eq!(signin_org(&pool, Some(&a_name)).await?, Some(a.id));
+        assert_eq!(signin_org(&pool, Some("no-such-organization")).await?, None);
+        assert_eq!(signin_org(&pool, None).await?, None);
+
+        // Deleting an organization deletes its images.
+        put_branding_asset(&pool, b.id, LOGO, &info, b"b-logo", "6666", None).await?;
+        sqlx::query("DELETE FROM organizations WHERE id = ANY($1)")
+            .bind(vec![a.id, b.id])
+            .execute(&pool)
+            .await?;
+        let left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM org_branding_assets WHERE org_id = ANY($1)")
+                .bind(vec![a.id, b.id])
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(left, 0);
         Ok(())
     }
 

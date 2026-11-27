@@ -47,6 +47,10 @@ fn is_public(path: &str) -> bool {
         // The bundled SolidCraft web editor's design-link fetch sends no token; the link
         // carries an expiry and a signature instead (see public_design_download).
         || path.starts_with("/public/design/")
+        // The sign-in page's branding (see branding.rs): exact paths only.
+        || path == "/public/branding"
+        || path == "/public/branding.css"
+        || path == "/public/branding/logo"
 }
 
 /// Axum middleware: validate the Bearer token, inject `Authed`.
@@ -138,4 +142,40 @@ pub fn require_user(authed: &Authed) -> Result<&User, AppError> {
             "a user identity is required".into(),
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_public;
+
+    #[test]
+    fn public_paths_are_exact() {
+        for path in [
+            "/healthz",
+            "/readyz",
+            "/version",
+            "/",
+            "/auth/login",
+            "/static/app.js",
+            "/public/design/v/f.solvecraft",
+            "/public/branding",
+            "/public/branding.css",
+            "/public/branding/logo",
+        ] {
+            assert!(is_public(path), "{path} should be public");
+        }
+        for path in [
+            "/settings/branding",
+            "/settings/branding/logo",
+            "/public/brandingx",
+            "/public/branding/logo/x",
+            "/public/branding.css/x",
+            "/public/",
+            "/public",
+            "/me",
+            "/auth/logout",
+        ] {
+            assert!(!is_public(path), "{path} should need a token");
+        }
+    }
 }
