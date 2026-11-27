@@ -199,28 +199,83 @@
       "<button data-edited disabled>Download edited file</button>" +
       "<button data-checkin disabled>Save to PDM</button>" +
       "<button data-close>Close editor</button></div>" +
+      "<div class='banner' data-ask role='alertdialog' aria-label='Close SolidCraft?' style='display:none'>" +
+      "<span style='flex:1 1 16rem'><b>Close SolidCraft?</b> Changes not saved to PDM will be lost.</span>" +
+      "<button data-ask-save>Save to PDM</button><button data-ask-download>Download design</button>" +
+      "<button class='danger' data-ask-discard>Discard changes</button><button data-ask-keep>Keep editing</button></div>" +
       "<div class='web-editor-status' role='status'></div><iframe></iframe></div>";
     const find = s => dialog.querySelector(s);
     const frame = find("iframe"), status = find("[role=status]");
     const edited = find("[data-edited]"), save = find("[data-checkin]");
+    const ask = find("[data-ask]");
     const downloadName = name || "new-part.sc";
     let displayName = name;
     find("strong").textContent = isNew ? "SolidCraft — new design" : "SolidCraft — " + displayName + " · v" + version.seq;
     frame.title = isNew ? "SolidCraft — new design" : "SolidCraft — " + displayName;
     find("[data-original]").hidden = isNew;
     let original = null, pending = null, busy = false, closed = false;
+    // touched: any key or click in SolidCraft since it opened or since the last successful
+    // Save to PDM. It is the portal's own record of possible edits; the app's dirty flag
+    // (asked on close) only adds to it, since a Download or the app's own Save clears that
+    // flag without anything reaching PDM.
+    let touched = false;
+    const markTouched = () => { touched = true; };
+    frame.addEventListener("load", () => {
+      try {
+        frame.contentWindow.addEventListener("pointerdown", markTouched, true);
+        frame.contentWindow.addEventListener("keydown", markTouched, true);
+      } catch(e){ touched = true; } // cannot watch the frame: assume edits
+    });
     const update = () => {
       edited.disabled = busy;
+      if (busy) ask.style.display = "none"; // a save or download started: the question is answered
       save.disabled = busy || !(checkin || createNew);
     };
-    const close = () => {
-      if (busy) return;
-      if (pending && !confirm("Close the editor and discard the design not checked in? Download a copy first to keep it.")) return;
+    const guard = e => { if (!closed && (touched || pending || busy)){ e.preventDefault(); e.returnValue = ""; } };
+    const shut = () => {
       closed = true;
+      window.removeEventListener("beforeunload", guard);
       dialog.close(); dialog.remove(); active = false;
     };
+    // Whether SolidCraft reports an open design with unsaved changes (best effort, 1 s).
+    const appDirty = async () => {
+      const win = frame.contentWindow;
+      if (!win || !win.solidcraft || typeof win.solidcraft.request !== "function") return false;
+      try {
+        const r = await Promise.race([win.solidcraft.request("ui.documents", {}),
+          new Promise(resolve => setTimeout(() => resolve(null), 1000))]);
+        return !!(r && Array.isArray(r.documents) && r.documents.some(t => t && t.dirty));
+      } catch(e){ return false; }
+    };
+    const asking = () => ask.style.display !== "none";
+    const hideAsk = () => { ask.style.display = "none"; };
+    const close = async () => {
+      if (busy || closed) return;
+      if (asking()){ hideAsk(); return; } // Escape again while asking: keep editing
+      if (touched || pending || await appDirty()){
+        ask.style.display = "";
+        find("[data-ask-save]").hidden = !(checkin || createNew);
+        find("[data-ask-keep]").focus();
+        return;
+      }
+      shut();
+    };
     find("[data-close]").onclick = close;
-    dialog.addEventListener("cancel", e => { e.preventDefault(); close(); });
+    dialog.addEventListener("cancel", e => { e.preventDefault(); if (e.cancelable !== false) close(); });
+    // The browser closes the dialog by itself on a repeated Escape (that cancel cannot be
+    // prevented). Bring it back, as if Escape was handled: the frame keeps its state.
+    dialog.addEventListener("close", () => {
+      if (closed) return;
+      if (!dialog.isConnected){ active = false; window.removeEventListener("beforeunload", guard); return; }
+      dialog.showModal();
+      if (asking()) hideAsk(); else close();
+    });
+    // While a save or download runs, the question's buttons do nothing (the toolbar's own
+    // Save to PDM hides the question when it starts).
+    find("[data-ask-keep]").onclick = () => { hideAsk(); frame.focus(); };
+    find("[data-ask-discard]").onclick = () => { if (!busy) shut(); };
+    find("[data-ask-download]").onclick = async () => { if (busy) return; hideAsk(); if (await grab()) shut(); };
+    find("[data-ask-save]").onclick = async () => { if (busy) return; hideAsk(); if (await save.onclick()) shut(); };
     find("[data-original]").onclick = async () => {
       // Design links expire, so ask for a fresh one when the host can make it.
       try { download(original || await fetch(designLink ? await designLink() : designUrl).then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.arrayBuffer(); }), name); }
@@ -233,26 +288,32 @@
         const snapshot = await scEditedBytes(frame, "pdm-checkin-" + Date.now() + ".sc");
         download(snapshot, downloadName);
         status.textContent = "Edited file downloaded." + (checkin ? " Use Save to PDM to check in the current design." : "");
+        return true;
       } catch(e){
         if (pending){
           download(pending, downloadName);
           status.textContent = "Downloaded the last collected design. Could not collect the latest edits: " + e.message;
         } else status.textContent = "Download failed: " + e.message;
+        return false;
       } finally { busy = false; update(); }
     };
     edited.onclick = grab;
     save.hidden = !(checkin || createNew);
+    // Resolves true once the design is in PDM. Edits made while it saves keep `touched` set.
     save.onclick = async () => {
-      if (busy) return;
+      if (busy) return false;
+      const wasTouched = touched;
+      const unsaved = () => { touched = touched || wasTouched; return false; };
       if (isNew && createNew){
         busy = true; update();
+        touched = false;
         status.textContent = "Collecting the edited design…";
         let snapshot;
         try { snapshot = await scEditedBytes(frame, "pdm-checkin-" + Date.now() + ".sc"); }
         catch(e){
           busy = false; update();
           status.textContent = "Could not collect the design: " + e.message;
-          return;
+          return unsaved();
         }
         pending = snapshot;
         status.textContent = "Saving to PDM…";
@@ -261,7 +322,7 @@
           if (result === null){
             busy = false; update();
             status.textContent = "Save cancelled. Use Download edited file to keep a copy, or Save to PDM again.";
-            return;
+            return unsaved();
           }
           if (pending === snapshot) pending = null;
           // First save made the item: later saves check in new versions of it.
@@ -275,15 +336,16 @@
         } catch(e){
           busy = false; update();
           status.textContent = "Save failed: " + e.message + "\nYour edited file is still available to download or retry.";
-          return;
+          return unsaved();
         }
         busy = false; update();
-        return;
+        return true;
       }
-      if (!checkin) return;
+      if (!checkin) return false;
       const message = prompt("Commit message", "Edited in SolidCraft web");
-      if (message === null) return;
+      if (message === null) return false;
       busy = true; update();
+      touched = false;
       status.textContent = "Collecting the edited design…";
       try {
         const snapshot = await scEditedBytes(frame, "pdm-checkin-" + Date.now() + ".sc");
@@ -297,11 +359,13 @@
       } catch(e){
         busy = false; update();
         status.textContent = "Check-in failed: " + e.message + "\nYour edited file is still available to download or retry.";
-        return;
+        return unsaved();
       }
       busy = false; update();
+      return true;
     };
     document.body.appendChild(dialog); dialog.showModal(); update();
+    window.addEventListener("beforeunload", guard);
     status.textContent = "Loading SolidCraft…";
     // A blank session (no ?open=) starts on the app's home screen, where the
     // user creates the new design before saving it to PDM.
@@ -315,7 +379,6 @@
       frame.src = url;
       if (isNew) status.textContent = "Create a design in SolidCraft, then use Save to PDM to store it as a new item (auto part number when left blank).";
     } catch(e){ status.textContent = "Cannot load SolidCraft: " + e.message + (isNew ? "" : " — Download original is still available."); }
-    dialog.addEventListener("close", () => { active = false; });
   }
 
   // Use the same DXF renderer as the editor, inside the Preview tab. The host

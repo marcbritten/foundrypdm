@@ -378,10 +378,11 @@ test("SolidCraft new-design save can be cancelled and retried", async () => {
 
 test("new part in SolidCraft web creates the item and checks in its first version", async () => {
   const reqs = [];
-  const context = loadFunctions(["newPartInSolidcraftWeb", "scCheckin", "makeScCheckin"], {
+  const context = loadFunctions(["newPartInSolidcraftWeb", "scCheckin", "makeScCheckin", "categoryOptions", "folderPathOptions"], {
     api: async (method, url, body) => {
       reqs.push([method, url, body]);
       if (method === "GET" && url === "/projects/p1/folders") return { folders:[{ id:"f1", name:"Housings" }] };
+      if (method === "GET" && url === "/settings/part-number-prefixes") return { prefixes:[] };
       if (method === "POST" && url === "/projects/p1/items") return { item:{ id:"i1", part_number:"BE-000116" } };
       if (method === "PUT" && url === "/blobs") return { blob:{ sha256:"sc-bytes", size_bytes:6 } };
       if (method === "POST" && url === "/items/i1/checkout") return {};
@@ -418,7 +419,7 @@ test("new part in SolidCraft web creates the item and checks in its first versio
 
 test("new part in SolidCraft web creates nothing when the modal is cancelled", async () => {
   const reqs = [];
-  const context = loadFunctions(["newPartInSolidcraftWeb", "scCheckin", "makeScCheckin"], {
+  const context = loadFunctions(["newPartInSolidcraftWeb", "scCheckin", "makeScCheckin", "categoryOptions", "folderPathOptions"], {
     api: async (method, url) => { reqs.push([method, url]); return { folders:[] }; },
     openModal: async () => null,
     PdmEditors:{ openSolidcraft: async config => {
@@ -429,7 +430,7 @@ test("new part in SolidCraft web creates nothing when the modal is cancelled", a
     ALLITEMS:[], ALLITEMS_AT:0, render(){},
   });
    await context.newPartInSolidcraftWeb("p1");
-   assert.deepEqual(reqs, [["GET", "/projects/p1/folders"]]);
+   assert.deepEqual(reqs, [["GET", "/projects/p1/folders"], ["GET", "/settings/part-number-prefixes"]]);
 });
 
 test("items bulk action opens the nest create panel with the parts preselected", async () => {
