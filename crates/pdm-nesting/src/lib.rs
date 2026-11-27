@@ -11,6 +11,7 @@
 //! overall integration plan.
 
 pub mod batch;
+pub mod cnc_layers;
 pub mod dxf;
 pub mod geom;
 pub mod part;

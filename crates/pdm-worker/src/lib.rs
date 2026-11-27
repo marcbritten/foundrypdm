@@ -72,6 +72,11 @@ pub struct WorkerConfig {
     /// Path to the pinned `sparrow` nesting binary; unset → laser.nest jobs
     /// fail explicitly (an absent engine must not fake a layout).
     pub sparrow_cli: Option<String>,
+    /// Router layers (`PDM_ROUTER_LAYERS=1`; off by default): generated flat
+    /// patterns are put on `OUTLINE` / `THROUGH` / `DEPTH_<mm>`
+    /// (`pdm_nesting::cnc_layers`), nests keep each contour's own layer through
+    /// to the sheet DXF, and a part with blind features is never mirrored.
+    pub router_layers: bool,
 }
 
 impl WorkerConfig {
@@ -96,6 +101,8 @@ impl WorkerConfig {
             sparrow_cli: std::env::var("PDM_SPARROW_CLI")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            router_layers: std::env::var("PDM_ROUTER_LAYERS")
+                .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on")),
         }
     }
 }
@@ -561,6 +568,17 @@ async fn generate_flat_pattern(
     if dxf.is_empty() {
         return Err(PdmError::Internal("flat pattern DXF is empty".into()));
     }
+    // Router layers from the model: OUTLINE, THROUGH (cut-outs) and DEPTH_<mm>
+    // (pockets open on the top face, as deep as the model has them).
+    let dxf = if cfg.router_layers {
+        let text = String::from_utf8(dxf)
+            .map_err(|e| PdmError::Internal(format!("flat pattern DXF is not UTF-8: {e}")))?;
+        pdm_nesting::cnc_layers::relayer_solidcraft_flat(&text)
+            .map_err(|e| PdmError::Validation(format!("flat pattern: {e}")))?
+            .into_bytes()
+    } else {
+        dxf
+    };
     let (sha, size) = store
         .put_content_addressed(&dxf)
         .await
@@ -578,7 +596,11 @@ async fn generate_flat_pattern(
         &sha,
         size_i64,
         "generated",
-        "solidcraft-cli sheet.export_dxf",
+        if cfg.router_layers {
+            "solidcraft-cli sheet.export_dxf, router layers"
+        } else {
+            "solidcraft-cli sheet.export_dxf"
+        },
         "mm",
         "generated flat pattern",
     )
@@ -655,7 +677,12 @@ async fn run_laser_nest(
             cut_layers.clone(),
             mark_layers.clone(),
         ));
-        let mut assembled = pdm_nesting::part::assemble(
+        let assemble = if cfg.router_layers {
+            pdm_nesting::part::assemble_keeping_layers
+        } else {
+            pdm_nesting::part::assemble
+        };
+        let mut assembled = assemble(
             &prims,
             &cut_layers,
             &mark_layers,
@@ -670,6 +697,16 @@ async fn run_laser_nest(
                 assembled.parts.len()
             )));
         }
+        // With router layers, a part with blind features (DEPTH_<mm>) is machined
+        // from its top face: a mirrored copy would put its pockets in the bottom face.
+        let blind = cfg.router_layers && assembled.parts[0].has_blind_features();
+        if blind && row.mirror {
+            return Err(PdmError::Validation(format!(
+                "{}: has blind features (pockets) machined from the top face, so it cannot be \
+                 nested as a mirror image",
+                row.part_number
+            )));
+        }
         item_by_index.push((row.item_id, row.file_version_id));
         let grain = match row.part_grain.as_str() {
             "along_length" => pdm_nesting::GrainDir::AlongLength,
@@ -679,7 +716,7 @@ async fn run_laser_nest(
         lines.push(pdm_nesting::batch::NestLine {
             part: geom_parts.len(),
             quantity: row.quantity.max(1) as u64,
-            allow_mirror: row.allow_mirror,
+            allow_mirror: row.allow_mirror && !blind,
             grain,
             step_angle: row.step_angle,
             priority: row.priority,
@@ -1966,6 +2003,7 @@ exit 4
             dutchman_cli: None,
             dutchman_timeout: Duration::from_secs(120),
             sparrow_cli: None,
+            router_layers: false,
         }
     }
 
