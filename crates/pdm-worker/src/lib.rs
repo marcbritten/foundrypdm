@@ -890,7 +890,9 @@ async fn run_laser_nest(
     );
     let manifest_bytes =
         serde_json::to_vec_pretty(&manifest).map_err(|e| PdmError::Internal(e.to_string()))?;
-    let _ = put_bytes(store, pool, org, &manifest_bytes).await?;
+    let (manifest_sha, _) = put_bytes(store, pool, org, &manifest_bytes).await?;
+    // Kept on the nest, so the package can carry it.
+    pdm_db::set_laser_nest_manifest(pool, org, nest_id, &manifest_sha).await?;
 
     // Recheck staleness: a source version that is no longer the head invalidates
     // the result (without rewriting it).
@@ -1018,7 +1020,9 @@ fn nest_manifest(
         "nest": {
             "id": nest.id,
             "name": nest.name,
-            "status": nest.status,
+            // Written only when the run has solved every sheet. `nest` is the row as read at
+            // the start of the run, so its own status would still say "queued".
+            "status": "completed",
             "material": nest.material,
             "thickness_mm": nest.thickness_mm,
             "stock_mm": { "width": nest.stock_width_mm, "length": nest.stock_height_mm },
