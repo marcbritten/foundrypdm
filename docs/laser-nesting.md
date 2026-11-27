@@ -129,10 +129,13 @@ the picker thumbnails.
   on either side lifts the restriction. An explicit `allowed_rotations` array
   always wins.
 - **Mirrors.** The portal presents a three-way **Mirror** control per part:
-  *Original Only*, *Both*, *Mirror Only*. Under the hood *Mirror Only* sets
-  `mirror: true` (nest a mirror image of the original geometry — useful when
-  cutting the opposite face of a part) and *Both* sets `allow_mirror: true`
-  (let the solver place flipped copies). The same part can be cut in its
+  *Original Only* (the default), *Both*, *Mirror Only*. Under the hood *Mirror
+  Only* sets `mirror: true` (nest a mirror image of the original geometry —
+  useful when cutting the opposite face of a part) and *Both* sets
+  `allow_mirror: true` (let the solver place flipped copies). `allow_mirror`
+  defaults to false in the API too: a flipped copy is cut with the sheet's
+  bottom face up, which is wrong for sheet with one good face (brushed,
+  coated, film-protected). The same part can be cut in its
   original and mirrored orientations on the same sheet.
 
 ### Sheet & part options

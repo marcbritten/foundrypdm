@@ -425,7 +425,50 @@ test("items bulk action opens the nest create panel with the parts preselected",
   assert.equal(lines.length, 2, "each selected item becomes a part line");
   assert.equal(lines[0].item_id, "a");
   assert.equal(lines[1].item_id, "b");
-  assert.equal(lines[0].mirror_mode, "both", "default mirror mode is 'both'");
+  assert.equal(lines[0].mirror_mode, "original", "default mirror mode is 'original' (no flipping)");
+});
+
+test("a part line flips only when its mirror mode asks for it", async () => {
+  const calls = [];
+  const input = v => ({ value: v, trim(){ return this.value; }, checked: false });
+  const doc = {
+    getElementById(id){
+      return ({ nc_name: input("Nest F"), ncQueue: { disabled: false, textContent: "" } })[id]
+        || input("");
+    },
+  };
+  const context = loadFunctions(["queueLaserNest", "num"], {
+    NC: {
+      cands: [],
+      lines: [
+        // No mirror mode at all (e.g. a line built before the panel set one).
+        { item_id: "a", quantity: 2, grain: "any" },
+        { item_id: "b", quantity: 2, mirror_mode: "both", grain: "any" },
+      ],
+      units: "mm",
+      sheets: [{ width: 1000, length: 2000, asNeeded: true, quantity: 1 }],
+      margin: 10, grain: "any", corner: "lower_left", fill: "auto",
+      guillotine: false, autoOrigins: true, ssd: 0, originX: 0, originY: 0,
+      spacingX: 5, spacingY: 5, addLabels: false, optPairs: false, fillAll: false,
+      partUnit: "auto",
+    },
+    document: doc,
+    $: id => doc.getElementById(id),
+    api: async (method, url, body) => {
+      calls.push([method, url, body]);
+      if (url === "/laser-nests/validate") return { ok: true, problems: [] };
+      if (url === "/laser-nests") return { nest: { status: "queued" } };
+      return {};
+    },
+    toast(){}, go(){}, ncDefaultState(){ return context.NC; },
+  });
+  await context.queueLaserNest();
+  const create = calls.find(c => c[0] === "POST" && c[1] === "/laser-nests");
+  assert.ok(create, "create was called");
+  const [none, both] = create[2].parts;
+  assert.equal(none.mirror, false);
+  assert.equal(none.allow_mirror, false, "no mirror mode means no flipping");
+  assert.equal(both.allow_mirror, true, "'Both' allows flipping");
 });
 
 test("nest create panel carries per-line + sheet options into the body", async () => {
