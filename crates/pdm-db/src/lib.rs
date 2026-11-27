@@ -1591,15 +1591,31 @@ pub async fn upload_blob(
         return Ok(b);
     }
 
-    sqlx::query_as::<_, Blob>(
+    // Two uploads of the same bytes at once can both miss the look-up above; the second insert
+    // then failed the (org_id, sha256) unique constraint (a 500). It now inserts nothing and takes
+    // the row the first one stored.
+    let inserted = sqlx::query_as::<_, Blob>(
         "INSERT INTO file_blobs (org_id, sha256, size_bytes, storage_key)
          VALUES ($1, $2, $3, $4)
+         ON CONFLICT (org_id, sha256) DO NOTHING
          RETURNING id, org_id, sha256, size_bytes, storage_key, created_at",
     )
     .bind(org_id)
     .bind(sha256)
     .bind(size_bytes)
     .bind(storage_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    if let Some(b) = inserted {
+        return Ok(b);
+    }
+    sqlx::query_as::<_, Blob>(
+        "SELECT id, org_id, sha256, size_bytes, storage_key, created_at
+         FROM file_blobs WHERE org_id = $1 AND sha256 = $2",
+    )
+    .bind(org_id)
+    .bind(sha256)
     .fetch_one(pool)
     .await
     .map_err(PdmError::Db)
