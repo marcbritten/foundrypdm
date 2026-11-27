@@ -71,32 +71,33 @@
 </div>
 
 <div id="ws" class="hidden">
-  <nav id="sidebar">
+  <nav id="sidebar" aria-label="Sections">
     <div class="sb-brand"><span class="mark">⬢</span> Foundry PDM</div>
     <div class="sb-section"><span class="sb-label">Workspace</span>
-      <a class="sb-link" data-nav="dashboard"><span class="sb-ic"><svg class="icon"><use href="#ic-home"/></svg></span><span class="sb-tx">Dashboard</span></a>
-      <a class="sb-link" data-nav="projects"><span class="sb-ic"><svg class="icon"><use href="#ic-project"/></svg></span><span class="sb-tx">Projects</span></a>
+      <a class="sb-link" href="#/dashboard" data-nav="dashboard"><span class="sb-ic"><svg class="icon"><use href="#ic-home"/></svg></span><span class="sb-tx">Dashboard</span></a>
+      <a class="sb-link" href="#/projects" data-nav="projects"><span class="sb-ic"><svg class="icon"><use href="#ic-project"/></svg></span><span class="sb-tx">Projects</span></a>
     </div>
     <div class="sb-section"><span class="sb-label">Data</span>
-      <a class="sb-link" data-nav="items"><span class="sb-ic"><svg class="icon"><use href="#ic-items"/></svg></span><span class="sb-tx">Items</span></a>
-      <a class="sb-link" data-nav="search"><span class="sb-ic"><svg class="icon"><use href="#ic-search"/></svg></span><span class="sb-tx">Search</span></a>
+      <a class="sb-link" href="#/items" data-nav="items"><span class="sb-ic"><svg class="icon"><use href="#ic-items"/></svg></span><span class="sb-tx">Items</span></a>
+      <a class="sb-link" href="#/search" data-nav="search"><span class="sb-ic"><svg class="icon"><use href="#ic-search"/></svg></span><span class="sb-tx">Search</span></a>
     </div>
     <div class="sb-section"><span class="sb-label">Manufacturing</span>
-      <a class="sb-link" data-nav="mfg"><span class="sb-ic"><svg class="icon"><use href="#ic-manufacturing"/></svg></span><span class="sb-tx">Manufacturing hub</span></a>
-      <a class="sb-link" data-nav="machines"><span class="sb-ic"><svg class="icon"><use href="#ic-machine"/></svg></span><span class="sb-tx">Machines &amp; Tools</span></a>
-      <a class="sb-link" data-nav="tools"><span class="sb-ic"><svg class="icon"><use href="#ic-tool"/></svg></span><span class="sb-tx">Tool library</span></a>
-      <a class="sb-link" data-nav="post-processors"><span class="sb-ic"><svg class="icon"><use href="#ic-tool"/></svg></span><span class="sb-tx">Post-processors</span></a>
-      <a class="sb-link" data-nav="sheet-metal"><span class="sb-ic"><svg class="icon"><use href="#ic-sheet-metal"/></svg></span><span class="sb-tx">Sheet Metal Standards</span></a>
-      <a class="sb-link" data-nav="laser-nests"><span class="sb-ic"><svg class="icon"><use href="#ic-sheet-metal"/></svg></span><span class="sb-tx">Laser Nests</span></a>
+      <a class="sb-link" href="#/mfg" data-nav="mfg"><span class="sb-ic"><svg class="icon"><use href="#ic-manufacturing"/></svg></span><span class="sb-tx">Manufacturing hub</span></a>
+      <a class="sb-link" href="#/machines" data-nav="machines"><span class="sb-ic"><svg class="icon"><use href="#ic-machine"/></svg></span><span class="sb-tx">Machines &amp; Tools</span></a>
+      <a class="sb-link" href="#/tools" data-nav="tools"><span class="sb-ic"><svg class="icon"><use href="#ic-tool"/></svg></span><span class="sb-tx">Tool library</span></a>
+      <a class="sb-link" href="#/post-processors" data-nav="post-processors"><span class="sb-ic"><svg class="icon"><use href="#ic-tool"/></svg></span><span class="sb-tx">Post-processors</span></a>
+      <a class="sb-link" href="#/sheet-metal" data-nav="sheet-metal"><span class="sb-ic"><svg class="icon"><use href="#ic-sheet-metal"/></svg></span><span class="sb-tx">Sheet Metal Standards</span></a>
+      <a class="sb-link" href="#/laser-nests" data-nav="laser-nests"><span class="sb-ic"><svg class="icon"><use href="#ic-sheet-metal"/></svg></span><span class="sb-tx">Laser Nests</span></a>
     </div>
     <div class="sb-section"><span class="sb-label">Action</span>
-      <a class="sb-link" data-nav="approvals"><span class="sb-ic"><svg class="icon"><use href="#ic-approval"/></svg></span><span class="sb-tx">Approvals</span><span class="sb-count" id="nb-approvals">0</span></a>
-      <a class="sb-link" data-nav="activity"><span class="sb-ic"><svg class="icon"><use href="#ic-activity"/></svg></span><span class="sb-tx">Activity</span></a>
+      <a class="sb-link" href="#/approvals" data-nav="approvals"><span class="sb-ic"><svg class="icon"><use href="#ic-approval"/></svg></span><span class="sb-tx">Approvals</span><span class="sb-count" id="nb-approvals">0</span></a>
+      <a class="sb-link" href="#/activity" data-nav="activity"><span class="sb-ic"><svg class="icon"><use href="#ic-activity"/></svg></span><span class="sb-tx">Activity</span></a>
+      <a class="sb-link" href="#/jobs" data-nav="jobs"><span class="sb-ic"><svg class="icon"><use href="#ic-gcode"/></svg></span><span class="sb-tx">Jobs</span></a>
     </div>
     <div class="sb-section"><span class="sb-label">Admin</span>
-      <a class="sb-link" data-nav="system"><span class="sb-ic"><svg class="icon"><use href="#ic-system"/></svg></span><span class="sb-tx">System</span></a>
-      <a class="sb-link sb-admin" data-nav="admin" hidden><span class="sb-ic"><svg class="icon"><use href="#ic-settings"/></svg></span><span class="sb-tx">Administration</span></a>
-      <a class="sb-link" data-nav="settings"><span class="sb-ic"><svg class="icon"><use href="#ic-settings"/></svg></span><span class="sb-tx">Settings</span></a>
+      <a class="sb-link" href="#/system" data-nav="system"><span class="sb-ic"><svg class="icon"><use href="#ic-system"/></svg></span><span class="sb-tx">System</span></a>
+      <a class="sb-link sb-admin" href="#/admin" data-nav="admin" hidden><span class="sb-ic"><svg class="icon"><use href="#ic-settings"/></svg></span><span class="sb-tx">Administration</span></a>
+      <a class="sb-link" href="#/settings" data-nav="settings"><span class="sb-ic"><svg class="icon"><use href="#ic-settings"/></svg></span><span class="sb-tx">Settings</span></a>
     </div>
     <div class="sb-gap"></div>
     <div class="sb-foot">
@@ -123,11 +124,11 @@
   </div>
 
   <nav id="bottombar" class="bottomBar" aria-label="Primary">
-    <a class="bb-link" data-nav="dashboard"><svg class="icon"><use href="#ic-home"/></svg><span>Home</span></a>
-    <a class="bb-link" data-nav="projects"><svg class="icon"><use href="#ic-project"/></svg><span>Projects</span></a>
-    <a class="bb-link" data-nav="items"><svg class="icon"><use href="#ic-items"/></svg><span>Items</span></a>
-    <a class="bb-link" data-nav="mfg"><svg class="icon"><use href="#ic-manufacturing"/></svg><span>Mfg</span></a>
-    <a class="bb-link" data-nav="approvals"><svg class="icon"><use href="#ic-approval"/></svg><span>Approvals</span></a>
+    <a class="bb-link" href="#/dashboard" data-nav="dashboard"><svg class="icon"><use href="#ic-home"/></svg><span>Home</span></a>
+    <a class="bb-link" href="#/projects" data-nav="projects"><svg class="icon"><use href="#ic-project"/></svg><span>Projects</span></a>
+    <a class="bb-link" href="#/items" data-nav="items"><svg class="icon"><use href="#ic-items"/></svg><span>Items</span></a>
+    <a class="bb-link" href="#/mfg" data-nav="mfg"><svg class="icon"><use href="#ic-manufacturing"/></svg><span>Mfg</span></a>
+    <a class="bb-link" href="#/approvals" data-nav="approvals"><svg class="icon"><use href="#ic-approval"/></svg><span>Approvals</span></a>
   </nav>
 </div>
 

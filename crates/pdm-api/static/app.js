@@ -276,7 +276,7 @@ async function enterWorkspace(){
 // tree nodes) is dropped on navigation and refetched.
 const LEGACY_NAME = { files:"items", parts:"items", tasks:"approvals" };
 const NAV_NAMES = ["dashboard","projects","explorer","items","search","mfg","machines","tools",
-  "post-processors","sheet-metal","approvals","activity","bom","system","settings","admin"];
+  "post-processors","sheet-metal","laser-nests","jobs","approvals","activity","bom","system","settings","admin"];
 function go(name, extra){
   name = LEGACY_NAME[name] || name;
   ROUTE = { name, origin: name };
@@ -298,38 +298,42 @@ function pushHash(){
   const h = routeToHash();
   if (h && location.hash !== h) history.pushState(null, "", h);
 }
-function routeToHash(){
-  const n = ROUTE.name;
-  if (n === "explorer"){
-    let h = "#/projects/" + ROUTE.pid;
-    const q = [];
-    if (ROUTE._ptab && ROUTE._ptab !== "items") q.push("tab=" + ROUTE._ptab);
-    if (ROUTE._folder) q.push("folder=" + ROUTE._folder);
-    if (q.length) h += "?" + q.join("&");
-    return h;
-  }
-  if (n === "detail"){
-    let h = "#/items/" + ROUTE.id;
-    if (DETAIL.tab && DETAIL.tab !== "overview") h += "?tab=" + DETAIL.tab;
-    return h;
-  }
-  if (n === "tool"){
-    let h = "#/tools/" + ROUTE.toolid;
-    if (TOOL.tab && TOOL.tab !== "general") h += "?tab=" + TOOL.tab;
-    return h;
-  }
-  const q = [];
-  if (n === "items"){
-    if (ROUTE._kind && ROUTE._kind !== "all") q.push("kind=" + ROUTE._kind);
-    if (ROUTE._cls && ROUTE._cls !== "all") q.push("cls=" + ROUTE._cls);
-  }
-  if (n === "search" && ROUTE.q) q.push("q=" + encodeURIComponent(ROUTE.q));
-  if (n === "approvals" && ROUTE._atab && ROUTE._atab !== "mine") q.push("tab=" + ROUTE._atab);
-  if (q.length) return "#/" + n + "?" + q.join("&");
-  return "#/" + n;
+// While typing in a filter: keep the address current without a history step per key.
+function replaceHash(){
+  const h = routeToHash();
+  if (h && location.hash !== h) history.replaceState(null, "", h);
 }
-function routeFromHash(){
-  const h = (location.hash || "").replace(/^#\/?/, "");
+// List state lives in the address so Back, reload and shared links keep it.
+// Defaults are left out to keep plain links short.
+const ITEMS_SORTS = ["modified_at","part_number","created_at","classification"];
+const EXPLORER_SORTS = ["modified_at","_name","part_number","owner_name"];
+function hashQuery(pairs){
+  const q = pairs.filter(p => p[1] != null && p[1] !== "")
+    .map(p => p[0] + "=" + encodeURIComponent(p[1]));
+  return q.length ? "?" + q.join("&") : "";
+}
+function routeToHash(r){
+  r = r || ROUTE;
+  const n = r.name;
+  const nd = (v, d) => (v && v !== d) ? v : null;
+  if (n === "explorer")
+    return "#/projects/" + r.pid + hashQuery([["tab", nd(r._ptab, "items")], ["folder", r._folder],
+      ["q", r._q], ["sort", nd(r._sort, "modified_at")], ["dir", nd(r._dir, "desc")]]);
+  if (n === "detail")
+    return "#/items/" + r.id + hashQuery([["tab", nd(r._tab || (r === ROUTE ? DETAIL.tab : ""), "overview")]]);
+  if (n === "tool")
+    return "#/tools/" + r.toolid + hashQuery([["tab", nd(r._tab || (r === ROUTE ? TOOL.tab : ""), "general")]]);
+  if (n === "laser-nests" && r.nest) return "#/laser-nests/" + encodeURIComponent(r.nest);
+  let q = [];
+  if (n === "items")
+    q = [["kind", nd(r._kind, "all")], ["cls", nd(r._cls, "all")], ["sm", nd(r._sm, "all")], ["q", r._q],
+      ["sort", nd(r._sort, "modified_at")], ["dir", nd(r._dir, "desc")], ["page", r._page > 1 ? String(r._page) : null]];
+  if (n === "search") q = [["q", r.q]];
+  if (n === "approvals") q = [["tab", nd(r._atab, "mine")]];
+  return "#/" + n + hashQuery(q);
+}
+function routeFromHash(hash){
+  const h = (hash != null ? hash : location.hash || "").replace(/^#\/?/, "");
   if (!h) return null;
   const qi = h.indexOf("?");
   const path = qi >= 0 ? h.slice(0, qi) : h;
@@ -341,39 +345,39 @@ function routeFromHash(){
     catch(e){}
   }
   const seg = path.split("/").filter(Boolean);
+  const pick = (v, allowed, d) => allowed.includes(v) ? v : d;
+  const dir = v => pick(v, ["asc","desc"], "desc");
   if (seg.length === 1){
     const n = seg[0];
     if (!NAV_NAMES.includes(n)) return null;
     const r = { name:n, origin:n };
     if (n === "search" && q.q) r.q = q.q;
-    if (n === "items"){ r._kind = q.kind || "all"; r._cls = q.cls || "all"; }
+    if (n === "items"){
+      r._kind = q.kind || "all"; r._cls = q.cls || "all"; r._sm = pick(q.sm, ["all","on","off"], "all");
+      r._q = q.q || ""; r._sort = pick(q.sort, ITEMS_SORTS, "modified_at"); r._dir = dir(q.dir);
+      r._page = Math.max(1, parseInt(q.page, 10) || 1);
+    }
     if (n === "approvals") r._atab = q.tab || "mine";
     return r;
   }
   if (seg[0] === "projects" && seg.length === 2){
     const r = { name:"explorer", origin:"projects", pid:seg[1] };
-    if (q.tab && ["items","activity","bom","manufacturing","settings"].includes(q.tab)) r._ptab = q.tab;
+    if (q.tab && ["items","activity","manufacturing","settings"].includes(q.tab)) r._ptab = q.tab;
     if (q.folder) r._folder = q.folder;
+    r._q = q.q || ""; r._sort = pick(q.sort, EXPLORER_SORTS, "modified_at"); r._dir = dir(q.dir);
     return r;
   }
-  if (seg[0] === "items" && seg.length === 2)
-    return { name:"detail", origin:"items", id:seg[1], _tab: q.tab || undefined };
+  if (seg[0] === "items" && seg.length === 2){
+    const tabs = detailTabs().map(t => t[0]);
+    return { name:"detail", origin:"items", id:seg[1], _tab: tabs.includes(q.tab) ? q.tab : "overview" };
+  }
   if (seg[0] === "tools" && seg.length === 2)
-    return { name:"tool", origin:"tools", toolid:seg[1], _tab: q.tab || undefined };
+    return { name:"tool", origin:"tools", toolid:seg[1], _tab: q.tab || "general" };
+  if (seg[0] === "laser-nests" && seg.length === 2)
+    return { name:"laser-nests", origin:"laser-nests", nest:seg[1] };
   return null;
 }
-function sameRoute(r){
-  if (r.name !== ROUTE.name || r.pid !== ROUTE.pid || r.id !== ROUTE.id ||
-      r.toolid !== ROUTE.toolid) return false;
-  if (r.name === "detail") return (r._tab || "overview") === DETAIL.tab;
-  if (r.name === "tool") return (r._tab || "general") === TOOL.tab;
-  return (r._ptab || "items") === (ROUTE._ptab || "items") &&
-    (r._kind || "all") === (ROUTE._kind || "all") &&
-    (r._cls || "all") === (ROUTE._cls || "all") &&
-    (r.q || "") === (ROUTE.q || "") &&
-    (r._atab || "mine") === (ROUTE._atab || "mine") &&
-    (r._folder || "") === (ROUTE._folder || "");
-}
+function sameRoute(r){ return routeToHash(r) === routeToHash(ROUTE); }
 function onHashNav(){
   const r = routeFromHash();
   if (!r || sameRoute(r)) return;
@@ -385,7 +389,7 @@ function navTarget(){
     items:"items", files:"items", parts:"items", bom:"items", search:"search",
     mfg:"mfg", machines:"machines", tools:"tools", tool:"tools",
     "post-processors":"post-processors",
-    "sheet-metal":"sheet-metal", "laser-nests":"laser-nests",
+    "sheet-metal":"sheet-metal", "laser-nests":"laser-nests", jobs:"jobs",
     approvals:"approvals", tasks:"approvals",
     activity:"activity", system:"system", settings:"settings", admin:"admin",
     detail: ROUTE.origin === "explorer" ? "projects" : "items" };
@@ -393,12 +397,15 @@ function navTarget(){
 }
 function syncNav(){
   const target = navTarget();
-  document.querySelectorAll(".sb-link, .bb-link").forEach(a =>
-    a.classList.toggle("on", a.dataset.nav === target));
+  document.querySelectorAll(".sb-link, .bb-link").forEach(a => {
+    const on = a.dataset.nav === target;
+    a.classList.toggle("on", on);
+    if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+  });
   const names = { dashboard:"Dashboard", projects:"Projects", explorer:"Project",
     items:"Items", search:"Search", mfg:"Manufacturing", machines:"Machines & Tools",
     tools:"Tool library", "post-processors":"Post-processors", "sheet-metal":"Sheet Metal Standards",
-    "laser-nests":"Laser Nests",
+    "laser-nests":"Laser Nests", jobs:"Jobs",
     approvals:"Approvals", activity:"Activity", bom:"Bills of Material",
     system:"System", settings:"Settings", admin:"Administration", detail:"Item" };
   let c = names[ROUTE.name] || "";
@@ -406,6 +413,7 @@ function syncNav(){
   if (ROUTE.name === "detail" && DETAIL.id && DETAIL.data) c = itemName(DETAIL.data.item);
   if (ROUTE.name === "tool" && TOOL.data) c = TOOL.data.name;
   $("crumb").textContent = c;
+  $("crumb").title = c;
 }
 const DETAIL = { id:null, tab:"overview", data:null, revs:[], comments:[], props:[], cmp:new Set(),
   pvSeq:null, folderCache:null };
@@ -413,7 +421,11 @@ const TOOL = { id:null, tab:"general", data:null, cutting:[], docs:[] };
 
 async function render(skeleton){
   const v = $("view");
-  if (skeleton){ v.innerHTML = "<div class='skel'><span class='spinner'></span> loading…</div>"; CUR_RELOAD = null; }
+  // A re-render replaces the view; put keyboard focus back where it was.
+  return keepFocus(v, () => renderView(v, skeleton));
+}
+async function renderView(v, skeleton){
+  if (skeleton){ v.innerHTML = "<div class='skel'><span class='spinner'></span> loading…</div>"; CUR_RELOAD = null; ITEM_ROWS.clear(); }
   try {
     switch (ROUTE.name){
       case "dashboard": await viewDashboard(v); break;
@@ -426,7 +438,8 @@ async function render(skeleton){
       case "tool": await viewToolDetail(v); break;
       case "post-processors": await viewPostProcessors(v); break;
       case "sheet-metal": await viewSheetMetal(v); break;
-      case "laser-nests": await viewLaserNests(v); break;
+      case "laser-nests": await viewLaserNests(v); if (skeleton) openNestFromRoute(v); break;
+      case "jobs": await viewJobs(v); break;
       case "approvals": await viewApprovals(v); break;
       case "activity": await viewActivity(v); break;
       case "bom": viewSoon(v, bigIcon("ic-bom"), "Bills of Material",
@@ -445,6 +458,115 @@ async function render(skeleton){
     $("retry").onclick = () => render(true);
   }
   CUR_RELOAD = () => render(false);
+}
+// #/laser-nests/{id} opens the list with that nest expanded.
+function openNestFromRoute(v){
+  if (!ROUTE.nest || NC.active) return;
+  const row = [...v.querySelectorAll(".ln-row")].find(r => r.dataset.id === ROUTE.nest);
+  if (!row){ toast("That nest is not among the latest 50 shown here."); return; }
+  const box = document.getElementById("ln-" + ROUTE.nest);
+  if (!box || box.dataset.loaded !== "1") toggleNestDetail(row);
+  row.scrollIntoView({ block:"nearest" });
+}
+// Background jobs (conversions, previews, imports, nests): the API keeps the latest 100.
+async function viewJobs(v){
+  const d = await api("GET", "/jobs?limit=100");
+  const jobs = d.jobs || [];
+  v.innerHTML = "<div class='head'><h2>Jobs</h2><span class='dim'>" +
+    (jobs.length >= 100 ? "The latest 100 background jobs" :
+      jobs.length + " recent background job" + (jobs.length === 1 ? "" : "s")) +
+    ": file conversions, previews, imports and nests.</span></div>" + jobsTable(jobs);
+}
+
+// ── keyboard and focus ──────────────────────────────────────────────────
+// Where focus sits, as a selector that still finds it after a re-render.
+function focusSelector(el){
+  if (!el || !el.getAttribute) return null;
+  const q = v => "\"" + String(v).replace(/["\\]/g, "\\$&") + "\"";
+  if (el.id) return "#" + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id);
+  for (const a of ["data-fk", "data-sel"])
+    if (el.hasAttribute(a)) return "[" + a + "=" + q(el.getAttribute(a)) + "]";
+  return null;
+}
+// Run fn (which may rebuild `root`); if that drops focus, put it back on the
+// matching control and keep any text typed meanwhile. When the control is gone
+// (a new view opened from inside the old one), focus the new view's heading so
+// keyboard users carry on from there instead of the top of the page.
+async function keepFocus(root, fn){
+  const ae = document.activeElement;
+  const inRoot = !!(ae && root && ae !== root && root.contains(ae));
+  const sel = inRoot ? focusSelector(ae) : null;
+  const caret = sel && typeof ae.selectionStart === "number" ? [ae.selectionStart, ae.selectionEnd] : null;
+  try { return await fn(); }
+  finally {
+    const now = document.activeElement;
+    if (inRoot && (!now || now === document.body || !now.isConnected)){
+      const el = sel ? root.querySelector(sel) : null;
+      if (el){
+        el.focus({ preventScroll:true });
+        if (caret && el.value !== ae.value){
+          el.value = ae.value;
+          el.dispatchEvent(new Event("input", { bubbles:true }));
+        }
+        if (caret && el.setSelectionRange) try { el.setSelectionRange(caret[0], caret[1]); } catch(e){}
+      } else if (root.id === "view"){
+        const h = root.querySelector("h2, h3") || root;
+        if (!h.hasAttribute("tabindex")) h.tabIndex = -1;
+        h.focus({ preventScroll:true });
+      }
+    }
+  }
+}
+// Click-only blocks in views (cards, tree nodes, tiles, nest rows, chips) get a
+// tab stop and open with Enter or Space; div tab strips get tab roles.
+const KBD_CLICK = ".pcard[data-pid], .dcard[data-id], .kpi.clickable, .ln-row, span.chip";
+const KBD_INNER = "button, a[href], input, select, textarea";
+function kbdUpgrade(root){
+  root.querySelectorAll(".tabs").forEach(list => {
+    list.setAttribute("role", "tablist");
+    const tabs = [...list.querySelectorAll(".tab")];
+    const cur = tabs.find(t => t.classList.contains("on")) || tabs[0];
+    for (const t of tabs){
+      t.setAttribute("role", "tab");
+      t.setAttribute("aria-selected", String(t === cur && t.classList.contains("on")));
+      t.tabIndex = t === cur ? 0 : -1;
+    }
+  });
+  // role=button only while the block holds no controls of its own (an
+  // expanded nest row gains buttons; they must stay reachable).
+  root.querySelectorAll(KBD_CLICK).forEach(el => {
+    if (!el.hasAttribute("tabindex")) el.tabIndex = 0;
+    const inner = el.querySelector(KBD_INNER);
+    if (!inner && !el.hasAttribute("role")){ el.setAttribute("role", "button"); el.dataset.kbdRole = "1"; }
+    else if (inner && el.dataset.kbdRole){ el.removeAttribute("role"); delete el.dataset.kbdRole; }
+  });
+}
+function kbdKeys(e){
+  const t = e.target;
+  if (!t || !t.matches) return;
+  if (t.matches("[role=tab]")){
+    const list = t.closest("[role=tablist]");
+    const tabs = list ? [...list.querySelectorAll("[role=tab]")] : [t];
+    const i = tabs.indexOf(t);
+    // Manual activation: arrows move focus, Enter or Space opens the tab. Panels
+    // load from the server, so selecting on every arrow press would race.
+    const j = { ArrowRight:i + 1, ArrowLeft:i - 1, Home:0, End:tabs.length - 1 }[e.key];
+    if (j !== undefined){
+      e.preventDefault();
+      tabs[(j + tabs.length) % tabs.length].focus();
+      return;
+    }
+  }
+  if ((e.key === "Enter" || e.key === " ") && t.tagName !== "BUTTON" && t.tagName !== "A" &&
+      t.matches(KBD_CLICK + ", [role=tab]")){
+    e.preventDefault(); t.click();
+  }
+}
+// Item page "Back": return to the exact list (filters, sort, page) it was opened from.
+function leaveDetail(){
+  const r = ROUTE._back ? routeFromHash(ROUTE._back) : null;
+  if (r){ ROUTE = r; syncNav(); render(true); pushHash(); return; }
+  go(ROUTE.origin || "dashboard", { pid: ROUTE._epid || undefined });
 }
 function viewSoon(v, ic, title, text){
   v.innerHTML = "<div class='soon'><span class='ic'>" + ic + "</span><h3>" + esc(title) +
@@ -476,7 +598,7 @@ function kpiStrip(k){
       (k.pending_approvals_mine ?? 0) === (k.pending_approvals ?? 0) ? "pending, yours" : "org has " + (k.pending_approvals ?? 0), "approvals"),
     kpiTile("ic-revision", "Released", k.released_items ?? 0, null, "items"),
     kpiTile("ic-activity", "Jobs", (k.running_jobs ?? 0) + " running · " + (k.queued_jobs ?? 0) + " queued",
-      (k.failed_jobs ? k.failed_jobs + " failed" : "no failures"), "activity"),
+      (k.failed_jobs ? k.failed_jobs + " failed" : "no failures"), "jobs"),
     kpiTile("ic-download", "Storage", bytes(k.storage_bytes ?? 0), null, null),
   ];
   return "<div class='kpiStrip' style='margin-bottom:14px'>" + tiles.join("") + "</div>";
@@ -592,6 +714,36 @@ async function allItems(force){
   ALLITEMS = out.flat(); ALLITEMS_AT = Date.now();
   return ALLITEMS;
 }
+// Item lists come from the server a page at a time (at most 200 rows). Follow
+// has_more so counts, the folder tree and client-side filters see every item.
+// `isCurrent` stops early when the user has moved on; `maxPages` bounds a huge
+// project. Returns { items, total, complete }.
+async function fetchAllItems(path, isCurrent, maxPages){
+  const sep = path.includes("?") ? "&" : "?";
+  const byId = new Map();
+  let total = 0, complete = true;
+  for (let page = 1; ; page++){
+    const d = await api("GET", path + sep + "limit=200&page=" + page);
+    const rows = d.items || [];
+    for (const it of rows) byId.set(it.id, it);
+    total = d.total != null ? d.total : byId.size;
+    if (!d.has_more || !rows.length) break;
+    if ((isCurrent && !isCurrent()) || page >= (maxPages || 50)){ complete = false; break; }
+  }
+  return { items: [...byId.values()], total: Math.max(total, byId.size), complete };
+}
+// Item count per project from the server's total (one small request each), so
+// a count is never capped at the page size.
+async function projectItemCounts(projects){
+  const out = {};
+  await Promise.all(projects.map(async p => {
+    try {
+      const d = await api("GET", "/projects/" + p.id + "/items?limit=1&include_archived=true");
+      out[p.id] = d.total != null ? d.total : (d.items || []).length;
+    } catch(e){}
+  }));
+  return out;
+}
 function sortItems(list, key, dir){
   const m = dir === "asc" ? 1 : -1;
   const val = x => key === "_name" ? itemName(x).toLowerCase()
@@ -625,34 +777,42 @@ function itemType(it){
 }
 
 // ── shared item table ───────────────────────────────────────────────────
-function itemsTable(list, showProject, selSet){
+// Rows drawn by itemsTable, by id, so a row's menu can find its item in any list.
+const ITEM_ROWS = new Map();
+// sort = { key, dir } marks the sorted column (aria-sort) when given.
+function itemsTable(list, showProject, selSet, sort){
   if (!list.length) return "<div class='empty'>No items match — upload a file or create an item.</div>";
-  const selall = showProject === true ? "" : "";
+  for (const it of list) ITEM_ROWS.set(it.id, it);
+  // Sort buttons only where the caller sorts (sort given); elsewhere plain headings.
+  const sortTh = (key, label) => !sort ? "<th>" + label + "</th>" : "<th class='sortable' data-s='" + key + "'" +
+    (sort && sort.key === key ? " aria-sort='" + (sort.dir === "asc" ? "ascending" : "descending") + "'" : "") +
+    "><button type='button' class='thsort' data-fk='sort:" + key + "'>" + label + "</button></th>";
   const head = "<thead><tr>" +
     (selSet ? "<th style='width:28px'></th>" : "") +
-    "<th class='sortable' data-s='_name'>Name</th>" +
-    "<th class='sortable' data-s='part_number'>Part no</th>" +
+    sortTh("_name", "Name") + sortTh("part_number", "Part no") +
     "<th>Type</th>" +
     (showProject ? "<th>Project</th>" : "") +
     "<th>State</th><th>Ver</th>" +
-    "<th class='sortable' data-s='modified_at'>Modified</th>" +
-    "<th class='sortable' data-s='owner_name'>Owner</th><th>Lock</th>" +
+    sortTh("modified_at", "Modified") + sortTh("owner_name", "Owner") + "<th>Lock</th>" +
     "<th style='width:32px'></th></tr></thead>";
-  const cols = 10 + ((selSet || showProject) ? 1 : 0);
   const rows = list.map(it => {
     const k = kindInfo(it.mime_type, it.filename);
+    const nm = itemName(it);
+    const type = itemType(it);
     return "<tr class='clickable" + (it.archived_at ? " archived" : "") + "' data-id='" + it.id + "'>" +
-      (selSet ? "<td><input type='checkbox' data-sel='" + it.id + "'" +
+      (selSet ? "<td><input type='checkbox' data-sel='" + it.id + "' aria-label='Select " + esc(nm) + "'" +
         (selSet.has(it.id) ? " checked" : "") + " onclick='event.stopPropagation()'></td>" : "") +
       "<td><span class='namecell'><span class='thumb-sm' data-thumb='/items/" + it.id + "/thumbnail'></span>" +
         "<span class='fileicon' title='" + esc(k.label) + "'>" + k.icon + "</span>" +
-        "<span class='nm'>" + esc(itemName(it)) + "</span>" +
-        revBadge(it.latest_revision) + kindBadge(it.mime_type, it.filename) + smBadge(it) + archBadge(it.archived_at) + "</span></td>" +
-       "<td class='mono muted'>" + esc(it.part_number) + "</td>" +
-       "<td class='muted'>" + itemType(it) + "</td>" +
+        "<a class='nm' href='#/items/" + it.id + "' data-fk='item:" + it.id + "' title='" + esc(nm) + "'>" +
+        esc(nm) + "</a>" + archBadge(it.archived_at) + "</span></td>" +
+       "<td class='mono pn'>" + esc(it.part_number) + "</td>" +
+       "<td class='muted'>" + [kindBadge(it.mime_type, it.filename), type === "—" ? "" : type, smBadge(it)]
+         .filter(Boolean).join(" ") + "</td>" +
        (showProject ? "<td class='muted'>" + esc(it._project || PMAP[it.project_id]?.name || "—") + "</td>" : "") +
       "<td>" + stateBadge(it.lifecycle_state) + "</td>" +
-      "<td>" + (it.head_version_seq ?? "—") + "</td>" +
+      "<td style='white-space:nowrap'>" + (it.head_version_seq != null ? "v" + it.head_version_seq : "—") +
+        (it.latest_revision ? " " + revBadge(it.latest_revision) : "") + "</td>" +
       "<td class='muted'>" + fmtTime(it.modified_at) + "</td>" +
       "<td class='muted'>" + esc(it.owner_name || "—") + "</td>" +
       "<td>" + (it.locked_by ? "<span style='color:var(--warn)' title='checked out'>" + kindSvg("ic-lock") + " " + esc(it.locked_by) + "</span>" : "") + "</td>" +
@@ -660,16 +820,21 @@ function itemsTable(list, showProject, selSet){
         "' title='Item actions'>⋮</button></td>" +
       "</tr>";
   }).join("");
-  return "<table>" + head + "<tbody>" + rows + "</tbody></table>" +
-    (list.length ? "" : "<div class='empty' colspan='" + cols + "'></div>");
+  return "<table>" + head + "<tbody>" + rows + "</tbody></table>";
 }
 function wireItemTable(container, opts){
   container.querySelectorAll("tr.clickable").forEach(tr => {
-    tr.addEventListener("click", () => openDetail(tr.dataset.id));
+    tr.addEventListener("click", e => {
+      // The name is a real link: Ctrl/Cmd/Shift-click opens it in a new tab or window.
+      const a = e.target.closest && e.target.closest("a[href]");
+      if (a && (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey)) return;
+      if (a) e.preventDefault();
+      openDetail(tr.dataset.id);
+    });
     tr.addEventListener("contextmenu", e => {
       e.preventDefault();
       const it = (opts.findItem ? opts.findItem(tr.dataset.id) : null) ||
-        (ROUTE._items || ALLITEMS).find(x => x.id === tr.dataset.id);
+        (ROUTE._items || ALLITEMS).find(x => x.id === tr.dataset.id) || ITEM_ROWS.get(tr.dataset.id);
       if (it) showCtxMenu(e.clientX, e.clientY, it);
     });
   });
@@ -683,7 +848,7 @@ function wireItemTable(container, opts){
   wireKebabs(container);
 }
 function openDetail(id){ go("detail", { id, origin: ROUTE.name === "explorer" ? "explorer" : ROUTE.name,
-  _epid: ROUTE.pid || null }); }
+  _epid: ROUTE.pid || null, _back: routeToHash() }); }
 
 // ── context menu ────────────────────────────────────────────────────────
 function showCtxMenu(x, y, it){
@@ -925,8 +1090,8 @@ async function chooseMainAssembly(pid){
   let items = (ROUTE._items || []).filter(i => !i.archived_at);
   if (!items.length){
     try {
-      const d = await api("GET", "/projects/" + pid + "/items");
-      items = (d.items || []).filter(i => !i.archived_at);
+      const d = await fetchAllItems("/projects/" + pid + "/items");
+      items = d.items.filter(i => !i.archived_at);
     } catch(e){ toast("Load items: " + e.message, "err"); return; }
   }
   if (!items.length){ toast("No items in this project yet", "err"); return; }
@@ -1826,7 +1991,7 @@ function docCards(items){
     const k = kindInfo(it.mime_type, it.filename);
     return "<div class='dcard' data-id='" + it.id + "'>" +
       "<span class='thumb-lg' data-thumb='/items/" + it.id + "/thumbnail'></span>" +
-      "<div class='nm'>" + esc(itemName(it)) + " " + revBadge(it.latest_revision) + "</div>" +
+      "<div class='nm' title='" + esc(itemName(it)) + "'>" + esc(itemName(it)) + " " + revBadge(it.latest_revision) + "</div>" +
       "<div class='mt'>" + esc(it._project || "") + " · " + k.icon + " " + esc(k.label) +
       " · " + fmtTime(it.modified_at) + "</div></div>";
   }).join("");
@@ -1838,7 +2003,7 @@ function projCards(list){
       "<div><button class='cta' data-go='projects'>Create your first project</button></div>");
   return list.map(p => "<div class='pcard" + (p.archived_at ? " archived" : "") + "' data-pid='" + p.id + "'>" +
     projectCover(p, "pcard-cover") +
-    "<div class='t'>" + kindSvg("ic-project") + " " + esc(p.name) + archBadge(p.archived_at) + "</div>" +
+    "<div class='t' title='" + esc(p.name) + "'>" + kindSvg("ic-project") + " " + esc(p.name) + archBadge(p.archived_at) + "</div>" +
     "<div class='m'>" + esc(p.description || "") + "</div>" +
     "<div class='m'>created " + fmtTime(p.created_at) + "</div>" +
     "<button class='kebab-btn' data-kb='proj' data-kid='" + p.id + "' title='Project actions'>⋮</button>" +
@@ -1958,11 +2123,7 @@ async function viewDashboard(v){
 // ── projects ────────────────────────────────────────────────────────────
 async function viewProjects(v){
   if (!PROJECTS.length) await loadCommon();
-  const counts = {};
-  try {
-    const d = await api("GET", "/items?limit=1000&include_archived=true");
-    for (const it of d.items || []) counts[it.project_id] = (counts[it.project_id] || 0) + 1;
-  } catch(e){}
+  const counts = await projectItemCounts(PROJECTS);
   const sorted = [...PROJECTS].sort((a, b) => (Date.parse(b.created_at) || 0) - (Date.parse(a.created_at) || 0));
   v.innerHTML =
     "<div class='head'><h2>Projects</h2><div class='grow'></div>" +
@@ -1970,9 +2131,9 @@ async function viewProjects(v){
     (sorted.length ? "<div class='cards'>" +
     sorted.map(p => "<div class='pcard" + (p.archived_at ? " archived" : "") + "' data-pid='" + p.id + "'>" +
        projectCover(p, "pcard-cover") +
-       "<div class='t'>" + kindSvg("ic-project") + " " + esc(p.name) + archBadge(p.archived_at) + "</div>" +
+       "<div class='t' title='" + esc(p.name) + "'>" + kindSvg("ic-project") + " " + esc(p.name) + archBadge(p.archived_at) + "</div>" +
       "<div class='m'>" + esc(p.description || "no description") + "</div>" +
-      "<div class='m'>" + (counts[p.id] || 0) + " items · created " + fmtTime(p.created_at) + "</div>" +
+      "<div class='m'>" + (counts[p.id] != null ? counts[p.id] + " items · " : "") + "created " + fmtTime(p.created_at) + "</div>" +
       "<button class='kebab-btn' data-kb='proj' data-kid='" + p.id + "' title='Project actions'>⋮</button>" +
       "</div>").join("") +
     "</div>" :
@@ -2019,14 +2180,18 @@ async function viewItems(v){
   if (ROUTE._sm === "on") params.set("sheet_metal", "true");
   if (ROUTE._sm === "off") params.set("sheet_metal", "false");
   if (ROUTE._q) params.set("q", ROUTE._q);
+  const asked = routeToHash();
   const d = await api("GET", "/items?" + params.toString());
+  // The filter runs as you type: a slower, older answer must not replace a newer one.
+  if (ROUTE.name !== "items" || routeToHash() !== asked) return;
   const loaded = (d.items || []).map(it => Object.assign({}, it, {
     _project_id: it.project_id,
     _project: PMAP[it.project_id] ? PMAP[it.project_id].name : "—" }));
   const total = d.total != null ? d.total : loaded.length;
   const pages = Math.max(1, Math.ceil(total / (d.limit || 100)));
   const chip = (key, attr, val, label) =>
-    "<span class='chip" + (ROUTE[key] === val ? " on" : "") + "' data-" + attr + "='" + val + "'>" + label + "</span>";
+    "<button type='button' class='chip" + (ROUTE[key] === val ? " on" : "") + "' aria-pressed='" +
+    (ROUTE[key] === val) + "' data-fk='" + attr + ":" + val + "' data-" + attr + "='" + val + "'>" + label + "</button>";
   v.innerHTML =
     "<div class='head'><h2>Items</h2>" +
     "<span class='dim muted'>" + total + " item(s) across all projects · filters run on the server</span></div>" +
@@ -2041,17 +2206,14 @@ async function viewItems(v){
       chip("_sm","sm","on","SHEET METAL") +
       chip("_sm","sm","off","Not sheet metal") + "</div>" +
     "<div class='row' style='margin-bottom:8px'>" +
-      "<input id='iq' placeholder='filter: name, part no, description…' value='" + esc(ROUTE._q) + "' style='width:280px'>" +
-      "<select id='isort'>" +
+      "<input id='iq' aria-label='Filter items' placeholder='filter: name, part no, description…' value='" + esc(ROUTE._q) + "' style='width:280px'>" +
+      "<select id='isort' aria-label='Sort by'>" +
         "<option value='modified_at'>Last modified</option>" +
         "<option value='part_number'>Part number</option>" +
         "<option value='created_at'>Created</option>" +
         "<option value='classification'>Classification</option>" +
       "</select>" +
-      "<select id='idir'>" +
-        "<option value='desc'>newest first</option>" +
-        "<option value='asc'>oldest first</option>" +
-      "</select>" +
+      "<select id='idir' aria-label='Sort direction'>" + dirOptions(ROUTE._sort) + "</select>" +
       "<div class='grow'></div>" +
       (pages > 1 ?
         "<button id='iprev' class='small'" + (ROUTE._page <= 1 ? " disabled" : "") + ">← Prev</button> " +
@@ -2070,8 +2232,13 @@ async function viewItems(v){
       "<div class='grow'></div>" +
       "<button class='small' id='bsmclear'>Clear</button></div>";
   };
-  const fill = async (list) => {
-    wrap.innerHTML = bulkBar() + (list.length ? itemsTable(list, true, ROUTE._sel) :
+  const fill = async (list) => { await keepFocus(wrap, async () => {
+    // Name and owner have no server sort, so they order the rows on this page.
+    const note = ROUTE._lsort && pages > 1 ? "<div class='dim' style='margin:4px 0'>Sorted by " +
+      (ROUTE._lsort === "_name" ? "name" : "owner") + " within this page only (page " + ROUTE._page +
+      " of " + pages + ").</div>" : "";
+    const sort = ROUTE._lsort ? { key:ROUTE._lsort, dir:ROUTE._ldir } : { key:ROUTE._sort, dir:ROUTE._dir };
+    wrap.innerHTML = bulkBar() + note + (list.length ? itemsTable(list, true, ROUTE._sel, sort) :
       emptyState("ic-items", "No items match",
         "Upload a file into a project, or widen the kind / class / text filters.",
         "<div><button class='cta' id='iproj'>Open projects</button></div>"));
@@ -2079,26 +2246,25 @@ async function viewItems(v){
     const bf = $("bsmflat"); if (bf) bf.onclick = () => exportFlatPatterns([...ROUTE._sel]);
     const bl = $("blast"); if (bl) bl.onclick = () => openLaserNestDialog([...ROUTE._sel]);
     const bc = $("bsmclear"); if (bc) bc.onclick = () => { ROUTE._sel.clear(); fill(shown()); };
-    await attachThumbs(wrap);
     wireItemTable(wrap, {
       onSort: k => {
         if (k === "_name" || k === "owner_name"){
-          ROUTE._lsort = ROUTE._lsort === k ? null : k;
-          ROUTE._ldir = ROUTE._ldir === "asc" ? "desc" : "asc";
-        } else {
-          ROUTE._lsort = null;
-          if (ROUTE._sort === k) ROUTE._dir = ROUTE._dir === "asc" ? "desc" : "asc";
-          else { ROUTE._sort = k; ROUTE._dir = "desc"; }
-          ROUTE._page = 1;
-          render(false);
+          if (ROUTE._lsort === k) ROUTE._ldir = ROUTE._ldir === "asc" ? "desc" : "asc";
+          else { ROUTE._lsort = k; ROUTE._ldir = "asc"; }
+          fill(shown());
           return;
         }
-        fill();
+        ROUTE._lsort = null;
+        if (ROUTE._sort === k) ROUTE._dir = ROUTE._dir === "asc" ? "desc" : "asc";
+        else { ROUTE._sort = k; ROUTE._dir = defaultDir(k); }
+        ROUTE._page = 1;
+        pushHash();
+        render(false);
       },
       onSel: () => fill(shown()),
       selSet: ROUTE._sel,
     });
-  };
+  }); await attachThumbs(wrap); };
   const shown = () => {
     let list = loaded;
     if (ROUTE._lsort) list = sortItems(list, ROUTE._lsort, ROUTE._ldir || "asc");
@@ -2107,23 +2273,44 @@ async function viewItems(v){
   await fill(shown());
   $("isort").value = ROUTE._sort;
   $("idir").value = ROUTE._dir;
-  $("iq").addEventListener("keydown", e => {
-    if (e.key === "Enter"){ ROUTE._q = e.target.value.trim(); ROUTE._page = 1; render(false); }
-  });
-  $("isort").onchange = e => { ROUTE._sort = e.target.value; ROUTE._page = 1; render(false); };
-  $("idir").onchange = e => { ROUTE._dir = e.target.value; ROUTE._page = 1; render(false); };
+  // Every change is kept in the address (Back and reload return to it); the
+  // text filter applies as you type, without a history step per key.
+  const apply = (commit) => { commit ? pushHash() : replaceHash(); render(false); };
+  const applyQ = (commit) => {
+    const el = $("iq");
+    if (!el || ROUTE.name !== "items") return;
+    const q = el.value.trim();
+    if (q === ROUTE._q){ if (commit) pushHash(); return; }
+    ROUTE._q = q; ROUTE._page = 1; apply(commit);
+  };
+  let qTimer = null;
+  $("iq").addEventListener("input", () => { clearTimeout(qTimer); qTimer = setTimeout(() => applyQ(false), 300); });
+  $("iq").addEventListener("keydown", e => { if (e.key === "Enter"){ clearTimeout(qTimer); applyQ(true); } });
+  $("isort").onchange = e => {
+    ROUTE._sort = e.target.value; ROUTE._dir = defaultDir(ROUTE._sort);
+    ROUTE._lsort = null; ROUTE._page = 1; apply(true);
+  };
+  $("idir").onchange = e => { ROUTE._dir = e.target.value; ROUTE._page = 1; apply(true); };
   v.querySelectorAll(".chip[data-k]").forEach(c => c.addEventListener("click", () => {
-    ROUTE._kind = c.dataset.k; ROUTE._page = 1; render(false);
+    ROUTE._kind = c.dataset.k; ROUTE._page = 1; apply(true);
   }));
   v.querySelectorAll(".chip[data-c]").forEach(c => c.addEventListener("click", () => {
-    ROUTE._cls = c.dataset.c; ROUTE._page = 1; render(false);
+    ROUTE._cls = c.dataset.c; ROUTE._page = 1; apply(true);
   }));
   v.querySelectorAll(".chip[data-sm]").forEach(c => c.addEventListener("click", () => {
-    ROUTE._sm = c.dataset.sm; ROUTE._page = 1; render(false);
+    ROUTE._sm = c.dataset.sm; ROUTE._page = 1; apply(true);
   }));
   const ip = $("iprev"), inx = $("inext");
-  if (ip) ip.onclick = () => { ROUTE._page = Math.max(1, ROUTE._page - 1); render(false); };
-  if (inx) inx.onclick = () => { ROUTE._page = Math.min(pages, ROUTE._page + 1); render(false); };
+  if (ip) ip.onclick = () => { ROUTE._page = Math.max(1, ROUTE._page - 1); apply(true); };
+  if (inx) inx.onclick = () => { ROUTE._page = Math.min(pages, ROUTE._page + 1); apply(true); };
+}
+// Sort direction words that fit the key: dates newest/oldest, text A to Z.
+function defaultDir(key){ return key === "modified_at" || key === "created_at" ? "desc" : "asc"; }
+function dirOptions(key){
+  const dated = key === "modified_at" || key === "created_at";
+  return dated
+    ? "<option value='desc'>Newest first</option><option value='asc'>Oldest first</option>"
+    : "<option value='asc'>A to Z</option><option value='desc'>Z to A</option>";
 }
 
 // ── machines & tools registry (MFG master data) ─────────────────────────
@@ -3763,18 +3950,48 @@ async function refreshExpTable(){
     (it.filename || "").toLowerCase().includes(q));
   if (ROUTE._folder) list = list.filter(it => it.folder_id === ROUTE._folder);
   list = sortItems(list, ROUTE._sort, ROUTE._dir);
-  wrap.innerHTML = bulkBarHTML() + itemsTable(list, false, ROUTE._sel);
-  await attachThumbs(wrap);
-  wireItemTable(wrap, {
-    onSort: k => {
-      if (ROUTE._sort === k) ROUTE._dir = ROUTE._dir === "asc" ? "desc" : "asc";
-      else { ROUTE._sort = k; ROUTE._dir = "desc"; }
-      render(false);
-    },
-    onSel: () => refreshExpTable(),
-    selSet: ROUTE._sel,
+  // Draw 200 rows at a time; the counts, filter and sort still cover every item.
+  const key = [ROUTE.pid, ROUTE._q, ROUTE._folder, ROUTE._sort, ROUTE._dir].join("|");
+  if (ROUTE._shownKey !== key){ ROUTE._shownKey = key; ROUTE._shown = 200; }
+  const shown = list.slice(0, ROUTE._shown), rest = list.length - shown.length;
+  await keepFocus(wrap, async () => {
+    wrap.innerHTML = bulkBarHTML() + itemsTable(shown, false, ROUTE._sel, { key:ROUTE._sort, dir:ROUTE._dir }) +
+      (rest > 0 ? "<div class='row'><button class='small' id='exmore'>Show " + Math.min(200, rest) +
+        " more</button><span class='dim'>" + shown.length + " of " + list.length + " shown</span></div>" : "");
+    wireItemTable(wrap, {
+      onSort: k => {
+        if (ROUTE._sort === k) ROUTE._dir = ROUTE._dir === "asc" ? "desc" : "asc";
+        else { ROUTE._sort = k; ROUTE._dir = defaultDir(k); }
+        pushHash();
+        syncExpSort();
+        refreshExpTable();
+      },
+      onSel: () => refreshExpTable(),
+      selSet: ROUTE._sel,
+    });
+    wireBulk();
+    const more = $("exmore");
+    if (more) more.onclick = async () => {
+      const first = ROUTE._shown;
+      ROUTE._shown += 200;
+      await refreshExpTable();
+      const links = wrap.querySelectorAll("a.nm");
+      if (links[first]) links[first].focus();
+    };
   });
-  wireBulk();
+  await attachThumbs(wrap);
+}
+// Sort controls follow a header click; direction words follow the key.
+function syncExpSort(){
+  const s = $("exsort"), d = $("exdir");
+  if (s) s.value = ROUTE._sort;
+  if (d){ d.innerHTML = dirOptions(ROUTE._sort); d.value = ROUTE._dir; }
+}
+// Folder, expand and sort changes redraw from the loaded items, without refetching.
+async function refreshExplorer(){
+  const tree = $("exptree");
+  if (tree) await keepFocus(tree, async () => { tree.innerHTML = treeHTML(); wireExpTree(); });
+  await refreshExpTable();
 }
 function treeHTML(){
   const folders = ROUTE._folders || [], items = ROUTE._items || [];
@@ -3787,21 +4004,27 @@ function treeHTML(){
   const count = fid => items.filter(it => it.folder_id === fid).length;
   let h = "";
   const rootItems = items.filter(i => !i.folder_id);
-  h += "<div class='tnode" + (!ROUTE._folder ? " on" : "") + "' data-f='' style='padding-left:8px'>" +
+  // One tab stop for the whole tree (the selected folder); arrows move inside it.
+  const sel = on => " role='treeitem' aria-selected='" + on + "' tabindex='" + (on ? 0 : -1) + "'";
+  h += "<div class='tnode" + (!ROUTE._folder ? " on" : "") + "' data-f='' data-fk='f:'" + sel(!ROUTE._folder) +
+    " style='padding-left:8px'>" +
     "<span class='caret'></span><span class='ficon'>" + kindSvg("ic-project") + "</span><span>Project root</span>" +
     "<span class='cnt'>" + rootItems.length + "</span></div>";
   const node = (f, depth) => {
     const open = ROUTE._expanded.has(f.id);
     const kids = byPar[f.id] || [];
     h += "<div class='tnode" + (ROUTE._folder === f.id ? " on" : "") + "' data-f='" + f.id +
-      "' style='padding-left:" + (10 + depth * 14) + "px'>" +
+      "' data-fk='f:" + f.id + "'" + sel(ROUTE._folder === f.id) +
+      (kids.length ? " aria-expanded='" + (open && kids.length > 0) + "'" : "") +
+      " style='padding-left:" + (10 + depth * 14) + "px'>" +
       "<span class='caret" + (kids.length ? " tog" : "") + "' data-c='" + f.id + "'>" +
       (open && kids.length ? "▾" : "▸") + "</span>" +
-      "<span class='ficon'>" + kindSvg("ic-folder") + "</span><span>" + esc(f.name) + "</span>" +
+      "<span class='ficon'>" + kindSvg("ic-folder") + "</span><span title='" + esc(f.name) + "'>" + esc(f.name) + "</span>" +
       "<span class='cnt'>" + count(f.id) + "</span></div>";
     if (open){
       for (const it of items.filter(i => i.folder_id === f.id))
-        h += "<div class='tnode' data-i='" + it.id + "' style='padding-left:" + (10 + (depth + 1) * 14) + "px'>" +
+        h += "<div class='tnode' data-i='" + it.id + "' data-fk='i:" + it.id + "' role='treeitem' tabindex='-1'" +
+          " style='padding-left:" + (10 + (depth + 1) * 14) + "px'>" +
           "<span class='caret'></span><span class='ficon'>" +
           kindInfo(it.mime_type, it.filename).icon + "</span>" +
           "<span title='" + esc(itemName(it)) + "'>" + esc(itemName(it)) + "</span></div>";
@@ -3818,7 +4041,8 @@ function wireExpTree(){
     n.addEventListener("click", () => {
       const f = n.dataset.f || null;
       ROUTE._folder = ROUTE._folder === f ? null : f;
-      render(false);
+      pushHash();
+      refreshExplorer();
     }));
   tree.querySelectorAll(".caret.tog").forEach(c =>
     c.addEventListener("click", e => {
@@ -3826,10 +4050,37 @@ function wireExpTree(){
       const id = c.dataset.c;
       if (ROUTE._expanded.has(id)) ROUTE._expanded.delete(id);
       else ROUTE._expanded.add(id);
-      render(false);
+      refreshExplorer();
     }));
   tree.querySelectorAll(".tnode[data-i]").forEach(n =>
     n.addEventListener("click", () => openDetail(n.dataset.i)));
+  tree.onkeydown = e => treeKeys(tree, e);
+}
+// Tree keys: Up/Down/Home/End move, Enter/Space open, Right/Left open and
+// close a folder that has subfolders.
+function treeKeys(tree, e){
+  const nodes = [...tree.querySelectorAll(".tnode")];
+  const i = nodes.indexOf(document.activeElement);
+  if (i < 0) return;
+  const n = nodes[i];
+  const j = { ArrowDown:Math.min(nodes.length - 1, i + 1), ArrowUp:Math.max(0, i - 1),
+    Home:0, End:nodes.length - 1 }[e.key];
+  if (j !== undefined){
+    e.preventDefault();
+    nodes.forEach(x => x.tabIndex = -1);
+    nodes[j].tabIndex = 0;
+    nodes[j].focus();
+    return;
+  }
+  if (e.key === "Enter" || e.key === " "){ e.preventDefault(); n.click(); return; }
+  const id = n.dataset.f;
+  if (!id || !n.hasAttribute("aria-expanded")) return;
+  const open = ROUTE._expanded.has(id);
+  if ((e.key === "ArrowRight" && !open) || (e.key === "ArrowLeft" && open)){
+    e.preventDefault();
+    if (open) ROUTE._expanded.delete(id); else ROUTE._expanded.add(id);
+    refreshExplorer();
+  }
 }
 // Project home (§4.1.2): one header + tabbed body. The explorer is the
 // Items tab; Activity/BOM/Manufacturing/Settings round it out.
@@ -3839,16 +4090,21 @@ async function viewExplorer(v){
   if (!PMAP[pid]) await loadCommon();
   const proj = PMAP[pid];
   if (!ROUTE._ptab) ROUTE._ptab = "items";
-  const d = await api("GET", "/projects/" + pid + "/items");
-  const fd = await api("GET", "/projects/" + pid + "/folders").catch(() => ({ folders: [] }));
-  ROUTE._items = d.items || [];
+  const r0 = ROUTE;
+  const [d, fd] = await Promise.all([
+    fetchAllItems("/projects/" + pid + "/items", () => ROUTE === r0),
+    api("GET", "/projects/" + pid + "/folders").catch(() => ({ folders: [] }))]);
+  if (ROUTE !== r0) return;
+  ROUTE._items = d.items;
   ROUTE._folders = fd.folders || [];
+  const countText = d.complete ? d.total + " items"
+    : "showing " + d.items.length + " of " + d.total + " items (use Search for the rest)";
   if (!ROUTE._q) ROUTE._q = "";
   if (!ROUTE._sort) ROUTE._sort = "modified_at";
   if (!ROUTE._dir) ROUTE._dir = "desc";
   if (!(ROUTE._sel instanceof Set)) ROUTE._sel = new Set();
   if (!(ROUTE._expanded instanceof Set)) ROUTE._expanded = new Set(ROUTE._folders.map(f => f.id));
-  const ptabs = [["items","Items"],["activity","Activity"],["bom","Bills of material"],
+  const ptabs = [["items","Items"],["activity","Activity"],
     ["manufacturing","Manufacturing"],["settings","Settings"]];
   v.innerHTML =
      "<div class='head'>" +
@@ -3856,7 +4112,7 @@ async function viewExplorer(v){
      projectCover(proj, "explorer-cover") +
     "<h2>" + esc(proj ? proj.name : "Project") + archBadge(proj && proj.archived_at) + "</h2>" +
     "<span class='dim'>" + esc(proj ? (proj.description || "") : "") + "</span>" +
-    "<span class='dim muted'>" + ROUTE._items.length + " items · created " +
+    "<span class='dim muted'>" + countText + " · created " +
     fmtTime(proj ? proj.created_at : null) + "</span>" +
     "<div class='grow'></div>" +
      "<button id='newfolder' class='small'>＋ Folder</button>" +
@@ -3865,14 +4121,11 @@ async function viewExplorer(v){
      "<button id='uploadbtn' class='primary small'>⬆ Upload</button>" +
     "<button id='projkebab' class='kebab-btn vis' title='Project actions'>⋮</button>" +
     "</div>" +
-    "<div class='tabs'>" + ptabs.map(t =>
-      "<div class='tab" + (ROUTE._ptab === t[0] ? " on" : "") + "' data-ptab='" + t[0] + "'>" +
-      t[1] + "</div>").join("") +
-    "</div>" +
+    tabStripHtml(ptabs, ROUTE._ptab, "ptab") +
     "<div id='ptab'></div>";
   v.querySelectorAll(".tab[data-ptab]").forEach(t => t.addEventListener("click", () => {
     ROUTE._ptab = t.dataset.ptab;
-    v.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === t));
+    markTab(t);
     pushHash();
     renderProjectTab(v);
   }));
@@ -3919,52 +4172,41 @@ async function viewExplorer(v){
 async function renderProjectTab(v){
   const box = $("ptab");
   if (!box) return;
-  if (ROUTE._ptab === "items") await projectItemsTab(box);
-  else if (ROUTE._ptab === "activity") await projectActivityTab(box);
-  else if (ROUTE._ptab === "bom"){
-    const p = PMAP[ROUTE.pid] || {};
-    const mainItem = p.main_assembly_id ? (ROUTE._items || []).find(i => i.id === p.main_assembly_id) : null;
-    const rootHtml = mainItem
-      ? "<div class='card' style='max-width:640px;margin-bottom:14px'>" +
-        "<h2 class='sec'>BOM root</h2>" +
-        "<div class='row' style='align-items:center'>" +
-          "<span class='thumb-sm pcov' data-thumb='/items/" + mainItem.id + "/thumbnail'></span>" +
-          "<div style='min-width:0'><div class='mono'>" + esc(mainItem.part_number) + "</div>" +
-          "<div class='dim'>" + esc(mainItem.description || "(no description)") + "</div></div>" +
-          "<div class='grow'></div>" +
-          "<button class='small' data-openma='" + mainItem.id + "'>Open item</button>" +
-        "</div>" +
-        "<p class='dim' style='font-size:12.5px;margin-top:10px'>The bill of materials is built from this main assembly.</p>" +
-      "</div>"
-      : "";
-    box.innerHTML = rootHtml + emptyState("ic-bom", "Bills of material — coming soon",
-      "Parent/child structure with quantities, rollups and where-used lands with the BOM backend increment. " +
-      (mainItem ? "Full structure will build from the main assembly above." :
-        "Set an item as the main assembly (right-click an item, or Settings) to build the BOM from it — and to use it as the project image."));
-    const ob = box.querySelector("[data-openma]");
-    if (ob) ob.onclick = () => openDetail(ob.dataset.openma);
-    attachThumbs(box);
-  }
+  if (ROUTE._ptab === "activity") await projectActivityTab(box);
   else if (ROUTE._ptab === "manufacturing") await projectMfgTab(box);
   else if (ROUTE._ptab === "settings") projectSettingsTab(box);
+  else await projectItemsTab(box);
+}
+// A tab strip of real buttons in a tablist; kbdKeys moves along it with the arrow keys.
+function tabStripHtml(tabs, cur, attr){
+  return "<div class='tabs' role='tablist'>" + tabs.map(t =>
+    "<button type='button' role='tab' class='tab" + (cur === t[0] ? " on" : "") +
+    "' aria-selected='" + (cur === t[0]) + "' tabindex='" + (cur === t[0] ? 0 : -1) +
+    "' data-fk='tab:" + t[0] + "' data-" + attr + "='" + t[0] + "'>" + t[1] +
+    (t[2] != null ? " <span class='count'>" + t[2] + "</span>" : "") + "</button>").join("") + "</div>";
+}
+function markTab(t){
+  t.closest(".tabs").querySelectorAll(".tab").forEach(x => {
+    const on = x === t;
+    x.classList.toggle("on", on);
+    x.setAttribute("aria-selected", String(on));
+    x.tabIndex = on ? 0 : -1;
+  });
 }
 async function projectItemsTab(box){
   box.innerHTML =
     "<div class='explorer' id='droproot'>" +
-      "<div class='tree' id='exptree'>" + treeHTML() + "</div>" +
+      "<div class='tree' id='exptree' role='tree' aria-label='Folders'>" + treeHTML() + "</div>" +
       "<div>" +
         "<div class='row' style='margin-bottom:8px'>" +
-          "<input id='exq' placeholder='Filter by part no, description, filename…' value='" + esc(ROUTE._q) + "' style='min-width:200px;flex:1'>" +
-          "<select id='exsort'>" +
+          "<input id='exq' aria-label='Filter items in this project' placeholder='Filter by part no, description, filename…' value='" + esc(ROUTE._q) + "' style='min-width:200px;flex:1'>" +
+          "<select id='exsort' aria-label='Sort by'>" +
             "<option value='modified_at'>Last modified</option>" +
             "<option value='_name'>Name</option>" +
             "<option value='part_number'>Part number</option>" +
             "<option value='owner_name'>Owner</option>" +
           "</select>" +
-          "<select id='exdir'>" +
-            "<option value='desc'>newest first</option>" +
-            "<option value='asc'>oldest first</option>" +
-          "</select>" +
+          "<select id='exdir' aria-label='Sort direction'>" + dirOptions(ROUTE._sort) + "</select>" +
         "</div>" +
         "<div id='exptablewrap'></div>" +
       "</div>" +
@@ -3973,12 +4215,11 @@ async function projectItemsTab(box){
     "</div>";
   $("exsort").value = ROUTE._sort;
   $("exdir").value = ROUTE._dir;
-  $("exsort").onchange = e => { ROUTE._sort = e.target.value; render(false); };
-  $("exdir").onchange = e => { ROUTE._dir = e.target.value; render(false); };
-  $("exq").addEventListener("input", e => { ROUTE._q = e.target.value; refreshExpTable(); });
-  await refreshExpTable();
-  await attachThumbs(box);
+  $("exsort").onchange = e => { ROUTE._sort = e.target.value; ROUTE._dir = defaultDir(ROUTE._sort); pushHash(); syncExpSort(); refreshExpTable(); };
+  $("exdir").onchange = e => { ROUTE._dir = e.target.value; pushHash(); refreshExpTable(); };
+  $("exq").addEventListener("input", e => { ROUTE._q = e.target.value; replaceHash(); refreshExpTable(); });
   wireExpTree();
+  await refreshExpTable();
   // drag & drop
   const dr = $("droproot");
   let dragN = 0;
@@ -4004,9 +4245,11 @@ async function projectActivityTab(box){
   const evs = (d.events || []).filter(ev =>
     (ev.object_type === "project" && ev.object_id === pid) ||
     (ev.object_type === "item" && itemIds.has(ev.object_id)));
+  // The audit API returns at most the organisation's latest 200 events, with no
+  // older pages, so say what was searched rather than "no activity".
   box.innerHTML = evs.length ? feed(evs) :
-    emptyState("ic-activity", "No project activity yet",
-      "Check-ins, releases and folder changes in this project will appear here.");
+    emptyState("ic-activity", "No project activity in the latest 200 events",
+      "Only the organisation's latest 200 events are searched here. Check-ins, releases and folder changes in this project appear once they happen; older events are not listed.");
 }
 async function projectMfgTab(box){
   const mfg = (ROUTE._items || []).filter(it => it.classification === "MFG");
@@ -4143,7 +4386,7 @@ async function projectSettingsTab(box){
       const r = await api("POST", "/projects/" + pid + "/onshape-import", {
         url, name
       });
-      status.textContent = "Fetching from Onshape. Job: " + r.job.id + " (see Tasks).";
+      status.textContent = "Fetching from Onshape. Job: " + r.job.id + " (see Jobs).";
       toast("Fetching the Part Studio from Onshape — this can take a while…", "ok", 10000);
       if (!await waitForVersionJob(r.job.id, { isConnected: true })) return;
       if (convert) {
@@ -4214,12 +4457,10 @@ function detailTabs(){
     ["preview", "Preview"],
     ["versions", "Versions", vs || null],
     ["revisions", "Revisions", (DETAIL.revs || []).length || null],
-    ["deps", "Dependencies"],
-    ["bom", "BOM"],
     ["mfg", "Sheet metal"],
     ["comments", "Comments", (DETAIL.comments || []).length || null],
     ["activity", "Activity"],
-    ["perm", "Permissions"],
+    ["perm", "Access"],
   ];
 }
 function sourceFilename(vv, d){ return vv.filename || (d.file && d.file.filename) || ""; }
@@ -4503,20 +4744,16 @@ async function viewDetail(v){
       "<button id='dkebab' class='kebab-btn vis' title='Item actions'>⋮</button>" +
     "</div>" +
     (DETAIL.conflict ? conflictBannerHtml() : "<div id='dbanner'></div>") +
-    "<div class='tabs'>" +
-      detailTabs().map(t =>
-        "<div class='tab" + (DETAIL.tab === t[0] ? " on" : "") + "' data-t='" + t[0] + "'>" +
-        t[1] + (t[2] != null ? " <span class='count'>" + t[2] + "</span>" : "") + "</div>").join("") +
-    "</div>" +
+    tabStripHtml(detailTabs(), DETAIL.tab, "t") +
     "<div id='dtab'></div>";
   await attachThumbs(v);
-  v.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
+  v.querySelectorAll(".tab[data-t]").forEach(t => t.addEventListener("click", () => {
     DETAIL.tab = t.dataset.t;
-    v.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === t));
+    markTab(t);
     pushHash();
     renderDetailTab();
   }));
-  $("dback").onclick = () => go(ROUTE.origin || "dashboard", { pid: ROUTE._epid || undefined });
+  $("dback").onclick = leaveDetail;
   if ($("dscweb")) $("dscweb").onclick = () => openSolidcraftWeb(id);
   if ($("ddownload")) $("ddownload").onclick = () => downloadLatest({ id, filename:d.file && d.file.filename, part_number:it.part_number });
   if ($("dwebeditor")) $("dwebeditor").onclick = () => openWebEditor(id);
@@ -4565,23 +4802,14 @@ async function renderDetailTab(){
   const box = $("dtab");
   if (!box) return;
   const t = DETAIL.tab;
-  if (t === "overview") await tabOverview(box);
+  if (t === "overview" || !detailTabs().some(x => x[0] === t)) await tabOverview(box);
   else if (t === "preview") await tabPreview(box);
   else if (t === "versions") await tabVersions(box);
   else if (t === "revisions") tabRevisions(box);
   else if (t === "comments") tabComments(box);
   else if (t === "activity") await tabActivity(box);
   else if (t === "perm") tabPermissions(box);
-  else if (t === "deps") tabSoon(box, bigIcon("ic-file"), "Dependencies",
-    "Component / used-by relationships are a PDM backend feature on the roadmap. History, comments and releases for this item are available meanwhile.");
-  else if (t === "bom") tabSoon(box, bigIcon("ic-bom"), "Bill of materials",
-    "BOM export is a PDM backend feature on the roadmap. This item's classification (" +
-    esc(DETAIL.data.item.classification || "") + ") shows under Items.");
   else if (t === "mfg") await tabSheetMetal(box);
-}
-function tabSoon(box, ic, title, text){
-  box.innerHTML = "<div class='soon'><span class='ic'>" + ic + "</span><h3>" +
-    esc(title) + "</h3><p>" + esc(text) + "</p></div>";
 }
 
 // ── sheet metal tab (MFG): spec + flat-pattern DXF attach/download ─────
@@ -4989,7 +5217,7 @@ async function loadPreview(vid){
         canvas.innerHTML = "<div class='pv-empty' style='height:100%'><span class='big'>⬢</span>" +
           "<div>No rendered preview for v" + vv.seq + " yet.</div>" +
           "<div class='pv-hint'>The server renders previews for CAD files (designs, STEP/IGES, FreeCAD, " +
-          "Rhino, Inventor, meshes; other B-rep CAD via conversion). See Tasks &amp; Approvals for job status.</div></div>";
+          "Rhino, Inventor, meshes; other B-rep CAD via conversion). See Jobs for job status.</div></div>";
       }
     }
   } catch(e){
@@ -5222,34 +5450,23 @@ async function tabActivity(box){
     "<div class='empty'>No activity recorded for this item yet.</div>";
 }
 function tabPermissions(box){
+  // Items have no permissions of their own: access follows the user's role in
+  // the organisation. Show who holds the item and what this user may do.
   const it = DETAIL.data.item, lock = DETAIL.data.lock;
+  const role = ME && ME.user ? ME.user.role : null;
+  const allows = { viewer:"browse, preview and download items",
+    editor:"browse and download items, check them out and in, comment and release",
+    admin:"do everything an editor can, and manage users, tokens and settings" };
   box.innerHTML =
-    "<div class='grid2'>" +
-      "<div class='card'>" +
-        "<h3 class='dim' style='margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.05em'>Access</h3>" +
-        "<div class='dmeta' style='margin:0'>" +
-          "<div><span class='k'>Owner</span> " + esc(it.owner_name || "—") + "</div>" +
-          "<div><span class='k'>Checkout</span> " +
-            (lock ? esc(lockName(lock)) + " on " + esc(lock.workstation || "?") : "none") + "</div>" +
-          "<div><span class='k'>Your role</span> " +
-            esc(ME && ME.user ? ME.user.role : "?") + "</div>" +
-        "</div>" +
-        "<div class='dim' style='font-size:12.5px;line-height:1.7'>" +
-          "<b>viewer</b> — browse, preview, download<br>" +
-          "<b>editor</b> — check out / check in, comment, release<br>" +
-          "<b>admin</b> — plus user, token and settings management" +
-        "</div>" +
+    "<div class='card' style='max-width:640px'>" +
+      "<div class='dmeta' style='margin:0'>" +
+        "<div><span class='k'>Owner</span> " + esc(it.owner_name || "—") + "</div>" +
+        "<div><span class='k'>Checked out</span> " +
+          (lock ? esc(lockName(lock)) + (lock.workstation ? " on " + esc(lock.workstation) : "") : "no") + "</div>" +
+        "<div><span class='k'>Your role</span> " + esc(role || "none (API token)") + "</div>" +
       "</div>" +
-      "<div class='card'>" +
-        "<h3 class='dim' style='margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.05em'>Members</h3>" +
-        "<table style='margin:0'><tbody>" +
-        USERS.map(u => "<tr>" +
-          "<td><span style='display:inline-flex;gap:8px;align-items:center'>" +
-          userAv(u, !u.active) + "<span>" + esc(u.display_name || u.email) + "</span></span></td>" +
-          "<td class='muted'>" + esc(u.role) + "</td>" +
-          "<td class='muted'>" + (u.active ? "active" : "inactive") + "</td></tr>").join("") +
-        "</tbody></table>" +
-      "</div>" +
+      (role ? "<p>As " + esc(role) + " you can " + esc(allows[role] || allows.viewer) + ".</p>" : "") +
+      "<p class='dim'>Access to items follows each user's role in the organisation; an item has no separate permissions.</p>" +
     "</div>";
 }
 
@@ -5280,13 +5497,25 @@ function startPolling(){
     const i = THEMES.findIndex(t => t.id === currentTheme());
     applyTheme(THEMES[(i + 1) % THEMES.length].id);
   };
+  // Nav entries are real links (#/name): a plain click starts the section fresh,
+  // Ctrl/Cmd/Shift-click or middle-click opens it in a new tab or window.
   document.querySelectorAll(".sb-link, .bb-link").forEach(a =>
-    a.addEventListener("click", () => {
+    a.addEventListener("click", e => {
+      if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+      e.preventDefault();
       $("sidebar").classList.remove("open");
       go(a.dataset.nav);
     }));
   window.addEventListener("popstate", onHashNav);
   window.addEventListener("hashchange", onHashNav);
+  let kbdQueued = false;
+  new MutationObserver(recs => {
+    // Thumbnails arrive one by one and change nothing focusable: skip them.
+    if (kbdQueued || recs.every(r => r.target.closest && r.target.closest("[data-thumb]"))) return;
+    kbdQueued = true;
+    requestAnimationFrame(() => { kbdQueued = false; kbdUpgrade($("view")); });
+  }).observe($("view"), { childList:true, subtree:true, attributes:true, attributeFilter:["class"] });
+  $("view").addEventListener("keydown", kbdKeys);
   const dens = localStorage.getItem("pdm_density");
   if (dens === "compact") document.documentElement.classList.add("dense");
   const densityBtn = $("densitybtn");
