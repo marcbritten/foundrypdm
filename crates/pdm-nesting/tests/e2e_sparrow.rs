@@ -320,6 +320,203 @@ fn e2e_sparrow_nests_and_exports() {
     }
 }
 
+/// One run of the pinned Sparrow on an instance.
+fn solve(
+    bin: &std::path::Path,
+    inst: &solver::SolverInstance,
+) -> Result<solver::SolverSolution, solver::SolverError> {
+    let work = tempfile::tempdir().map_err(|e| solver::SolverError::Malformed(e.to_string()))?;
+    std::fs::create_dir_all(work.path().join("output"))
+        .map_err(|e| solver::SolverError::Malformed(e.to_string()))?;
+    let input = work.path().join("inst.json");
+    std::fs::write(&input, inst.to_json())
+        .map_err(|e| solver::SolverError::Malformed(e.to_string()))?;
+    let out = std::process::Command::new(bin)
+        .arg("-i")
+        .arg(&input)
+        .args(["-t", "20", "-s", "1", "--workers", "2"])
+        .current_dir(work.path())
+        .output()
+        .map_err(|e| solver::SolverError::Malformed(e.to_string()))?;
+    if !out.status.success() {
+        return Err(solver::SolverError::Malformed(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    let text = std::fs::read_to_string(
+        work.path()
+            .join("output")
+            .join(format!("final_{}.json", inst.name)),
+    )
+    .map_err(|e| solver::SolverError::Malformed(format!("no output: {e}")))?;
+    solver::parse_solution(&text)
+}
+
+fn polyline_part(points: Vec<Point>, holes: Vec<Primitive>) -> Part {
+    let n = points.len();
+    let mut prims = vec![Primitive::Polyline {
+        layer: "cut".into(),
+        points,
+        bulges: vec![None; n],
+        closed: true,
+    }];
+    prims.extend(holes);
+    part::assemble(&prims, &["cut".to_string()], &[], 0.05, 0.01)
+        .unwrap()
+        .parts
+        .pop()
+        .unwrap()
+}
+
+fn seg_dist(p1: Point, p2: Point, q: Point) -> f64 {
+    let (dx, dy) = (p2.x - p1.x, p2.y - p1.y);
+    let l2 = dx * dx + dy * dy;
+    let t = if l2 < 1e-18 {
+        0.0
+    } else {
+        (((q.x - p1.x) * dx + (q.y - p1.y) * dy) / l2).clamp(0.0, 1.0)
+    };
+    (q.x - p1.x - t * dx).hypot(q.y - p1.y - t * dy)
+}
+
+/// The smallest distance between the nominal outlines of any two placed parts (vertex to edge
+/// both ways; the rings don't cross in a valid layout).
+fn min_part_distance(layout: &sheet::SheetLayout, parts: &[Part]) -> f64 {
+    let rings: Vec<Vec<Point>> = layout
+        .placements
+        .iter()
+        .map(|pl| {
+            parts[pl.part_index]
+                .outer
+                .points
+                .iter()
+                .map(|p| pl.transform.apply(*p))
+                .collect()
+        })
+        .collect();
+    let mut best = f64::INFINITY;
+    for i in 0..rings.len() {
+        for j in 0..rings.len() {
+            if i == j {
+                continue;
+            }
+            let (a, b) = (&rings[i], &rings[j]);
+            for k in 0..a.len() {
+                let (p1, p2) = (a[k], a[(k + 1) % a.len()]);
+                for &q in b {
+                    best = best.min(seg_dist(p1, p2, q));
+                }
+            }
+        }
+    }
+    best
+}
+
+/// The real solver free to turn every part and to flip the L (it may or may not use the flip),
+/// with a slotted part whose slot is narrower than the spacing (its solver outline comes from
+/// the convex-hull fallback): every pair of parts stays at least the spacing apart, and the
+/// sheet check accepts the solver's layout. Flipped placements are covered deterministically by
+/// `sheet::tests::build_sheet_checks_the_spacing_of_flipped_parts`.
+#[test]
+fn e2e_sparrow_keeps_the_spacing_with_turning_and_flipping_allowed() {
+    let Some(bin) = sparrow_bin() else {
+        eprintln!("SPARROW_BIN not found; skipping e2e sparrow spacing test");
+        return;
+    };
+    let rect = polyline_part(
+        vec![
+            Point::new(0.0, 0.0),
+            Point::new(60.0, 0.0),
+            Point::new(60.0, 40.0),
+            Point::new(0.0, 40.0),
+        ],
+        vec![Primitive::Circle {
+            layer: "cut".into(),
+            center: Point::new(30.0, 20.0),
+            radius: 8.0,
+        }],
+    );
+    let ell = polyline_part(
+        vec![
+            Point::new(0.0, 0.0),
+            Point::new(50.0, 0.0),
+            Point::new(50.0, 12.0),
+            Point::new(12.0, 12.0),
+            Point::new(12.0, 44.0),
+            Point::new(0.0, 44.0),
+        ],
+        vec![],
+    );
+    // A 2 mm slot: narrower than the spacing below.
+    let slotted = polyline_part(
+        vec![
+            Point::new(0.0, 0.0),
+            Point::new(40.0, 0.0),
+            Point::new(40.0, 20.0),
+            Point::new(21.0, 20.0),
+            Point::new(21.0, 8.0),
+            Point::new(19.0, 8.0),
+            Point::new(19.0, 20.0),
+            Point::new(0.0, 20.0),
+        ],
+        vec![],
+    );
+    let parts = vec![rect, ell, slotted];
+    let line = |part: usize, quantity: u64, allow_mirror: bool, step_angle: f64, use_bounding_box: bool| {
+        batch::NestLine {
+            part,
+            quantity,
+            allow_mirror,
+            grain: pdm_nesting::GrainDir::Any,
+            step_angle,
+            priority: 1,
+            use_bounding_box,
+            label: String::new(),
+        }
+    };
+    // The rectangle nests by its bounding box; the L turns in 45° steps and may flip.
+    let lines = vec![
+        line(0, 3, false, 90.0, true),
+        line(1, 4, true, 45.0, false),
+        line(2, 4, false, 90.0, false),
+    ];
+    // Test values: a 6.35 mm gap, filled from the upper-right corner with an offset origin.
+    let cfg = NestConfig {
+        stock_width: 500.0,
+        stock_height: 300.0,
+        edge_margin: 10.0,
+        gap_x: 6.35,
+        gap_y: 6.35,
+        nesting_corner: pdm_nesting::NestingCorner::UpperRight,
+        origin: Point::new(5.0, 3.0),
+        allowed_rotations: vec![],
+        time_budget_sec: 60,
+        attempt_limit_sec: 20,
+        max_sheets: 1,
+        ..Default::default()
+    };
+    cfg.validate().unwrap();
+    let mapping = sheet::StockMapping::from_config(&cfg).unwrap();
+    let copies = batch::expand_lines(&lines);
+    let inst = batch::build_instance(&lines, &parts, &copies, &cfg, &mapping, "spacing");
+    let solution = solve(&bin, &inst).expect("sparrow run");
+    assert_eq!(solution.placed.len(), copies.len(), "every copy placed");
+    let ids = sheet::assign_item_ids(&copies);
+    let layout = sheet::build_sheet(&solution, &ids, &parts, &cfg, &mapping)
+        .expect("the solver's layout keeps the spacing");
+    let d = min_part_distance(&layout, &parts);
+    eprintln!(
+        "closest parts: {d:.4} mm apart (spacing 6.35); turned {}, flipped {}",
+        layout
+            .placements
+            .iter()
+            .filter(|p| p.transform.rotation_deg.rem_euclid(360.0) > 1e-6)
+            .count(),
+        layout.placements.iter().filter(|p| p.transform.reflected).count()
+    );
+    assert!(d >= 6.35 - 1e-3, "parts {d} mm apart");
+}
+
 fn pointset_bbox(pts: &[Point]) -> (f64, f64) {
     let mut minx = f64::INFINITY;
     let mut miny = f64::INFINITY;
