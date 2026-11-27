@@ -820,6 +820,24 @@ pub async fn create_folder(
     .map_err(PdmError::Db)
 }
 
+/// Whether a folder is in the given project of the given organization.
+pub async fn folder_in_project(
+    pool: &PgPool,
+    folder_id: Uuid,
+    org_id: Uuid,
+    project_id: Uuid,
+) -> Result<bool, PdmError> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM folders WHERE id = $1 AND org_id = $2 AND project_id = $3)",
+    )
+    .bind(folder_id)
+    .bind(org_id)
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
 pub async fn list_folders(
     pool: &PgPool,
     org_id: Uuid,
