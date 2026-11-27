@@ -144,17 +144,23 @@ async function api(method, path, body){
   const t = await r.text();
   let d = {};
   try { d = t ? JSON.parse(t) : {}; } catch(err){ d = { error:{ message:t } }; }
+  if (r.status === 401 && token){
+    // The sign-in ended or was revoked: forget it and show the sign-in form.
+    const msg = "Your session expired — sign in again";
+    localStorage.removeItem(TOKEN_KEY); loginView(msg);
+    throw Object.assign(new Error(msg), { signedOut: true });
+  }
   if (!r.ok) throw new Error((d.error && d.error.message) || r.statusText || "request failed");
   return d;
 }
 
-function loginView(){
+function loginView(msg){
   $("view").innerHTML =
     "<p class='dim'>Sign in to PDM once. Then sending is one click.</p>" +
     "<div class='modal-field'><label>Email</label><input id='email' autocomplete='username'></div>" +
     "<div class='modal-field'><label>Password</label><input id='pw' type='password' autocomplete='current-password'></div>" +
     "<button class='primary' id='go' style='width:100%'>Sign in</button>" +
-    "<p class='err' id='stat'></p>";
+    "<p class='err' id='stat'>" + esc(msg || "") + "</p>";
   $("go").onclick = async () => {
     try {
       const d = await api("POST", "/auth/login", { username: $("email").value.trim(), password: $("pw").value });
@@ -170,13 +176,17 @@ async function main(){
     return;
   }
   if (!localStorage.getItem(TOKEN_KEY)) { loginView(); return; }
-  try { await api("GET", "/me"); } catch(e){ localStorage.removeItem(TOKEN_KEY); loginView(); return; }
+  try { await api("GET", "/me"); } catch(e){
+    if (!e.signedOut){ localStorage.removeItem(TOKEN_KEY); loginView(); }
+    return;
+  }
   $("view").innerHTML = "<p class='dim'>Loading…</p>";
   const [found, cfg, proj] = await Promise.all([
     api("GET", "/integrations/onshape/lookup?document_id="+encodeURIComponent(documentId)+"&element_id="+encodeURIComponent(elementId)).catch(() => ({})),
     api("GET", "/integrations/onshape/config").catch(() => ({})),
     api("GET", "/projects").catch(() => ({ projects: [] }))
   ]);
+  if (!localStorage.getItem(TOKEN_KEY)) return; // signed out meanwhile: keep the sign-in form
   ctx = { item: found.item, cfg: cfg, projects: proj.projects || [] };
   renderForm();
 }
@@ -205,7 +215,12 @@ function renderForm(){
     "<p class='dim' id='dbg'></p>" +
     "<p class='dim' style='font-size:11px'>PDM build: " + esc(cfg.build || "dev") + "</p>" +
     "<p><a class='dim' href='#' id='out'>Sign out of PDM</a></p>";
-  $("out").onclick = (e) => { e.preventDefault(); localStorage.removeItem(TOKEN_KEY); loginView(); };
+  $("out").onclick = async (e) => {
+    e.preventDefault();
+    // Revoke the sign-in on the server, not just in this browser.
+    try { await api("POST", "/auth/logout"); } catch(err){ /* already ended */ }
+    localStorage.removeItem(TOKEN_KEY); loginView();
+  };
   $("pick").onclick = loadPicker;
   $("viewport-pick").onclick = selectInOnshape;
   if (selectedPart) showPreview(selectedPart);
@@ -293,6 +308,7 @@ async function loadPicker(){
     const d = await api("GET", "/integrations/onshape/picker?document_id="+encodeURIComponent(documentId)+"&workspace_id="+encodeURIComponent(workspaceId));
     renderPicker(d);
   } catch(e){
+    if (e.signedOut) return; // the sign-in form is showing
     $("view").innerHTML = "<p class='err'>" + esc(e.message) + "</p><button id='back' style='width:100%'>← Back</button>";
     $("back").onclick = renderForm;
   }

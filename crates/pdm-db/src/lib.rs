@@ -521,6 +521,7 @@ pub async fn get_users_by_email(pool: &PgPool, email: &str) -> Result<Vec<User>,
 
 // ── API Tokens ───────────────────────────────────────────────────────────
 
+/// Create an API token (`kind = 'api'`): never ends unless `expires_at` is set or it is deleted.
 pub async fn create_token(
     pool: &PgPool,
     org_id: Uuid,
@@ -542,6 +543,52 @@ pub async fn create_token(
     .bind(scopes)
     .bind(expires_at)
     .fetch_one(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+/// Create a web sign-in token (`kind = 'web'`). Only these end on their own; see
+/// [`session_expired`]. Every other token is made by [`create_token`] as `kind = 'api'`.
+pub async fn create_session_token(
+    pool: &PgPool,
+    org_id: Uuid,
+    user_id: Uuid,
+    token_hash: &str,
+) -> Result<ApiToken, PdmError> {
+    sqlx::query_as::<_, ApiToken>(
+        "INSERT INTO api_tokens (org_id, user_id, name, token_hash, scopes, kind)
+         VALUES ($1, $2, 'web-login', $3, 'full', 'web')
+         RETURNING id, org_id, user_id, name, scopes, expires_at, created_at",
+    )
+    .bind(org_id)
+    .bind(user_id)
+    .bind(token_hash)
+    .fetch_one(pool)
+    .await
+    .map_err(PdmError::Db)
+}
+
+/// Whether a token is a web sign-in that has ended, by going `idle_minutes` without a request
+/// or by being older than `lifetime_minutes` (0 turns a limit off). Always `false` for an API
+/// token. `None` when the token no longer exists (deleted since it was looked up).
+pub async fn session_expired(
+    pool: &PgPool,
+    token_id: Uuid,
+    idle_minutes: i32,
+    lifetime_minutes: i32,
+) -> Result<Option<bool>, PdmError> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT kind = 'web'
+                AND (($2::int > 0
+                      AND COALESCE(last_used_at, created_at)
+                          < now() - make_interval(mins => $2::int))
+                  OR ($3::int > 0 AND created_at < now() - make_interval(mins => $3::int)))
+           FROM api_tokens WHERE id = $1",
+    )
+    .bind(token_id)
+    .bind(idle_minutes)
+    .bind(lifetime_minutes)
+    .fetch_optional(pool)
     .await
     .map_err(PdmError::Db)
 }

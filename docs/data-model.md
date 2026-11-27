@@ -14,7 +14,8 @@ UUID PKs; `org_id` on every tenant-scoped table. Postgres 13+.
 - **organizations** — top-level tenant.
 - **users** — `org_id`, `email` (unique per org), `display_name`, `password_hash` (Argon2id, optional),
   `role` (`viewer`|`editor`|`admin`), `active`.
-- **api_tokens** — bearer tokens, stored SHA-256; scoped to user/service-account.
+- **api_tokens** — bearer tokens, stored SHA-256; scoped to user/service-account. `kind`: `web` for
+  a password sign-in (expires), `api` for every other token.
 - **service_accounts** — non-interactive credentials.
 - **groups / roles / permissions / memberships** — full RBAC model (schema present, Phase-1 uses `users.role`).
 

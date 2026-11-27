@@ -2869,7 +2869,8 @@ pub struct LoginReq {
     pub org: Option<String>,
 }
 
-/// POST /auth/login — username/password login; issues a fresh API token.
+/// POST /auth/login — username/password login; issues a fresh web sign-in token, which ends
+/// after an idle spell or at its lifetime (see `SessionLimits`).
 pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginReq>,
@@ -2915,16 +2916,8 @@ pub async fn login(
         h.update(token_value.as_bytes());
         hex::encode(h.finalize())
     };
-    let _tok = pdm_db::create_token(
-        &state.pool,
-        user.org_id,
-        Some(user.id),
-        "web-login",
-        &token_hash,
-        "full",
-        None,
-    )
-    .await?;
+    // A web sign-in, which ends after an idle spell or at its lifetime (unlike API tokens).
+    let _tok = pdm_db::create_session_token(&state.pool, user.org_id, user.id, &token_hash).await?;
     let org = pdm_db::get_org_by_id(&state.pool, user.org_id)
         .await?
         .ok_or_else(|| AppError(PdmError::Internal("org not found".into())))?;

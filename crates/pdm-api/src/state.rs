@@ -6,6 +6,7 @@ use pdm_update::UpdateState;
 use sqlx::PgPool;
 
 use crate::design_link::DesignLinks;
+use crate::session::SessionLimits;
 
 /// Shared application state, cloned into each handler.
 #[derive(Clone)]
@@ -22,4 +23,6 @@ pub struct AppState {
     pub update: Arc<tokio::sync::RwLock<UpdateState>>,
     /// Signs and checks the short-lived `/public/design/...` links.
     pub design_links: DesignLinks,
+    /// How long a web sign-in lasts.
+    pub sessions: SessionLimits,
 }
