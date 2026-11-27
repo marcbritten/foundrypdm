@@ -3029,6 +3029,8 @@ function currentTheme(){
   return localStorage.getItem("pdm_theme") || "dark";
 }
 function applyTheme(id){
+  // index.html's <head> script applies the stored theme before first paint with the same
+  // ids and fallback; keep the two in step (tests/web-ui-tokens.test.cjs checks this).
   if (!THEMES.some(t => t.id === id)) id = "dark";
   document.documentElement.setAttribute("data-theme", id);
   localStorage.setItem("pdm_theme", id);

@@ -4,6 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Foundry PDM — Workspace</title>
+<script>
+// Apply the saved theme before the first paint (app.js applies it again with the same rules).
+(function () {
+  try { var t = localStorage.getItem("pdm_theme");
+    if (["dark", "light", "slate", "contrast"].indexOf(t) >= 0) document.documentElement.setAttribute("data-theme", t);
+  } catch (e) {}
+})();
+</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%235aa9ff' d='M8 0 14 4v8L8 16 2 12V4z'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css">
 <link rel="stylesheet" href="/static/editors.css">
