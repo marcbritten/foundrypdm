@@ -542,3 +542,95 @@ fn pointset_bbox(pts: &[Point]) -> (f64, f64) {
     }
     (maxx - minx, maxy - miny)
 }
+
+#[test]
+fn e2e_sparrow_the_layout_sits_in_the_nesting_corner() {
+    // Four L shapes that fill neither the sheet's length nor its height, nested from each corner.
+    // The layout must sit in the chosen corner on both axes: as far from that corner's horizontal
+    // edge as from its fill-side edge, not floating up the strip. Test values.
+    use pdm_nesting::NestingCorner::{LowerLeft, LowerRight, UpperLeft, UpperRight};
+    let Some(bin) = sparrow_bin() else {
+        eprintln!("SPARROW_BIN not found; skipping e2e sparrow test");
+        return;
+    };
+    let outer = Primitive::Polyline {
+        layer: "cut".into(),
+        points: vec![
+            Point::new(0.0, 0.0),
+            Point::new(240.0, 0.0),
+            Point::new(240.0, 60.0),
+            Point::new(60.0, 60.0),
+            Point::new(60.0, 160.0),
+            Point::new(0.0, 160.0),
+        ],
+        bulges: vec![None; 6],
+        closed: true,
+    };
+    let ell = part::assemble(&[outer], &["cut".to_string()], &[], 0.05, 0.01)
+        .unwrap()
+        .parts
+        .pop()
+        .unwrap();
+    let parts = vec![ell];
+    let line = |part: usize, quantity: u64| batch::NestLine {
+        part,
+        quantity,
+        allow_mirror: false,
+        grain: pdm_nesting::GrainDir::Any,
+        step_angle: 90.0,
+        priority: 1,
+        use_bounding_box: false,
+        label: String::new(),
+    };
+    let lines = vec![line(0, 4)];
+    let (w, h) = (1600.0, 1000.0);
+    let mut off = Vec::new();
+    for corner in [LowerLeft, LowerRight, UpperLeft, UpperRight] {
+        let cfg = NestConfig {
+            stock_width: w,
+            stock_height: h,
+            edge_margin: 10.0,
+            gap_x: 6.35,
+            gap_y: 6.35,
+            nesting_corner: corner,
+            time_budget_sec: 60,
+            attempt_limit_sec: 30,
+            max_sheets: 1,
+            ..Default::default()
+        };
+        let sheets = batch::run_batch(&lines, &parts, &cfg, |inst| run_sparrow(&bin, inst))
+            .unwrap_or_else(|e| panic!("{corner:?}: {e}"));
+        let layout = &sheets[0].layout;
+        assert_eq!(layout.placements.len(), 4, "{corner:?}: all copies placed");
+        let pts: Vec<Point> = layout
+            .placements
+            .iter()
+            .flat_map(|pl| {
+                parts[pl.part_index]
+                    .outer
+                    .points
+                    .iter()
+                    .map(move |p| pl.transform.apply(*p))
+            })
+            .collect();
+        let (min_x, max_x) = pts
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| (a.min(p.x), b.max(p.x)));
+        let (min_y, max_y) = pts
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| (a.min(p.y), b.max(p.y)));
+        let (side_gap, edge_gap) = match corner {
+            LowerLeft => (min_x, min_y),
+            LowerRight => (w - max_x, min_y),
+            UpperLeft => (min_x, h - max_y),
+            UpperRight => (w - max_x, h - max_y),
+        };
+        eprintln!(
+            "{corner:?}: {side_gap:.2} mm from the fill side, {edge_gap:.2} mm from the corner's edge"
+        );
+        if (side_gap - edge_gap).abs() > 0.5 {
+            off.push(format!("{corner:?}: {side_gap:.2} vs {edge_gap:.2} mm"));
+        }
+    }
+    assert!(off.is_empty(), "the layout floats off the corner's edge: {off:?}");
+}
