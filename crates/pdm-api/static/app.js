@@ -4222,6 +4222,48 @@ function wireThemePicker(root){
   });
 }
 
+// ── fonts ───────────────────────────────────────────────────────────────
+// Per-browser font choices beside the theme. index.html's <head> script applies them before
+// first paint with the same keys, ids and default; keep the two in step (tests/web-ui-fonts.test.cjs
+// checks this). style.css maps each id to a bundled face in static/fonts/.
+function fontSettings(){
+  return [
+    { key:"pdm_font_ui", attr:"data-font-ui", id:"font-ui", label:"Reading font",
+      hint:"Menus, tables, forms and messages. Default: System default, your device's own interface font.",
+      options:[{ id:"system", name:"System default" }, { id:"atkinson", name:"Atkinson Hyperlegible Next" }] },
+    { key:"pdm_font_mono", attr:"data-font-mono", id:"font-mono", label:"Code font",
+      hint:"Part numbers, revisions, file hashes and other codes. Default: System default, your device's own monospace font.",
+      options:[{ id:"system", name:"System default" }, { id:"atkinson", name:"Atkinson Hyperlegible Mono" }] }
+  ];
+}
+function currentFont(setting){
+  const id = localStorage.getItem(setting.key);
+  return setting.options.some(o => o.id === id) ? id : "system";
+}
+function applyFont(setting, id){
+  if (!setting.options.some(o => o.id === id)) id = "system";
+  if (id === "system") document.documentElement.removeAttribute(setting.attr);
+  else document.documentElement.setAttribute(setting.attr, id);
+  localStorage.setItem(setting.key, id);
+}
+function fontPickerHTML(){
+  return fontSettings().map(s => {
+    const cur = currentFont(s);
+    return "<div class='row'><label for='" + s.id + "'>" + esc(s.label) + "</label>" +
+      "<select id='" + s.id + "' data-font-key='" + s.key + "' aria-describedby='" + s.id + "-hint'>" +
+      s.options.map(o => "<option value='" + o.id + "'" + (o.id === cur ? " selected" : "") + ">" + esc(o.name) + "</option>").join("") +
+      "</select></div><p class='dim' id='" + s.id + "-hint'>" + esc(s.hint) + "</p>";
+  }).join("") +
+    "<p class='dim'>Atkinson Hyperlegible is designed so that similar characters, such as 0 and O or 1, l and I, are easy to tell apart. " +
+    "Font choices are stored in this browser. The fonts come with this server, so nothing is downloaded from the internet.</p>";
+}
+function wireFontPicker(root){
+  const settings = fontSettings();
+  root.querySelectorAll("[data-font-key]").forEach(sel => {
+    sel.onchange = () => applyFont(settings.find(s => s.key === sel.dataset.fontKey), sel.value);
+  });
+}
+
 const GPU_POLICIES = [
   { id:"auto", name:"Auto", desc:"GPU if present, else CPU" },
   { id:"hardware", name:"GPU", desc:"Require the machine GPU" },
@@ -4648,7 +4690,7 @@ async function viewSettings(v){
     "</div>" +
     "<h2 class='sec'>Appearance</h2>" +
     "<div class='card'><p class='dim'>Colour theme for this browser. Stored locally.</p>" +
-    themePickerHTML() + "</div>" +
+    themePickerHTML() + fontPickerHTML() + "</div>" +
     "<h2 class='sec'>Preview renderer</h2>" +
     "<div class='card'><p class='dim'>Transparent product renders use the CPU product-image renderer, with no grid or axes. " +
     "Viewport snapshots retain the original background and use the GPU policy below. Regenerate an existing preview to apply a new style.</p>" +
@@ -4732,6 +4774,7 @@ async function viewSettings(v){
   if (addBtn) addBtn.onclick = () => addPrefix();
   const cpBtn = $("changepw");
   if (cpBtn) cpBtn.onclick = () => changePassword();
+  wireFontPicker(v);
   wireThemePicker(v);
   wireGpuPicker(v, canEdit);
   if ($("preview-style-save")) $("preview-style-save").onclick = async () => {
