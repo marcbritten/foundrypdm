@@ -72,16 +72,17 @@ test("numbers compared down a column use tabular, right-aligned digits (Y6)", ()
 });
 
 // ── Text size, applied before first paint ───────────────────────────────
-function runHead(stored){
-  const attrs = {};
+// The text size on <html> after the head script: the markup default, then a stored choice.
+function runHead(stored, opts = {}){
+  const attrs = { "data-text-size":(indexHtml.match(/<html[^>]*\sdata-text-size="(\d+)"/) || [])[1] };
   const document = { documentElement:{ setAttribute(k, v){ attrs[k] = v; }, getAttribute(k){ return attrs[k]; } },
     createElement: () => ({}), head:{ appendChild(){} } };
-  const localStorage = { getItem: k => (k in stored ? stored[k] : null) };
+  const localStorage = { getItem: k => { if (opts.throws) throw new Error("storage blocked"); return k in stored ? stored[k] : null; } };
   const head = indexHtml.slice(0, indexHtml.indexOf("</head>"));
   const script = [...head.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]).filter(s => s.includes("pdm_text_size"));
   assert.equal(script.length, 1, "one inline <head> script reads the text size");
   const at = script[0].lastIndexOf("} catch (e) {}");
-  vm.runInContext(script[0].slice(0, at) + "} catch (e) { throw e; }" + script[0].slice(at + 14), vm.createContext({ localStorage, document }));
+  vm.runInContext(script[0].slice(0, at) + "} catch (e) { if (!" + Boolean(opts.throws) + ") throw e; }" + script[0].slice(at + 14), vm.createContext({ localStorage, document }));
   return attrs["data-text-size"];
 }
 function sizeCtx(stored = {}){
@@ -98,27 +99,35 @@ test("index.html applies the saved text size before first paint, with the same i
   const ids = [...sizeCtx().ctx.textSizeOptions().map(o => o.id)];
   assert.deepEqual(ids, ["100", "112", "125"]);
   for (const id of [...ids, "150", "", "112.5", null])
-    assert.equal(runHead(id === null ? {} : { pdm_text_size:id }), ["112", "125"].includes(id) ? id : undefined, "pdm_text_size=" + id);
-  for (const id of ids.filter(i => i !== "100")) assert(RULES.some(r => r.selector === "html[data-text-size=\"" + id + "\"]"), "a rule for " + id);
+    assert.equal(runHead(id === null ? {} : { pdm_text_size:id }), ids.includes(id) ? id : "112", "pdm_text_size=" + id);
+  assert.equal(runHead({}, { throws:true }), "112", "blocked storage keeps the default from the markup");
+  assert.equal(sizeCtx().ctx.currentTextSize(), "112", "app.js has the same default");
+  for (const id of ["112", "125"]) assert(RULES.some(r => r.selector === "html[data-text-size=\"" + id + "\"]"), "a rule for " + id);
+  assert(!RULES.some(r => r.selector === "html[data-text-size=\"100\"]"), "100 keeps the :root scale of 1");
 });
 
-test("choosing a text size applies it at once and remembers it; Default removes it", () => {
+test("choosing a text size applies it at once; Default keeps nothing stored", () => {
   const { ctx, attrs, stored } = sizeCtx();
-  assert.equal(ctx.currentTextSize(), "100");
+  assert.equal(ctx.currentTextSize(), "112", "nothing stored: Default (112.5%)");
   ctx.applyTextSize("125");
   assert.deepEqual([attrs["data-text-size"], stored.pdm_text_size], ["125", "125"]);
   ctx.applyTextSize("100");
-  assert.deepEqual([attrs["data-text-size"], stored.pdm_text_size], [undefined, undefined]);
+  assert.deepEqual([attrs["data-text-size"], stored.pdm_text_size], ["100", "100"]);
+  ctx.applyTextSize("112");
+  assert.deepEqual([attrs["data-text-size"], stored.pdm_text_size], ["112", undefined]);
   ctx.applyTextSize("150");
-  assert.deepEqual(attrs, {}, "an unknown size falls back to the default");
-  assert.equal(sizeCtx({ pdm_text_size:"nope" }).ctx.currentTextSize(), "100");
+  assert.deepEqual([attrs["data-text-size"], stored.pdm_text_size], ["112", undefined], "an unknown size falls back to the default");
+  // Values stored by the first version of this setting keep their size.
+  for (const [old, now] of [["100", "100"], ["112", "112"], ["125", "125"], ["nope", "112"]])
+    assert.equal(sizeCtx({ pdm_text_size:old }).ctx.currentTextSize(), now, "stored " + old);
 });
 
 test("the Text size setting is labeled, says what it changes and its default, and sits with the font settings", () => {
-  const html = sizeCtx({ pdm_text_size:"112" }).ctx.textSizeHTML();
+  const html = sizeCtx().ctx.textSizeHTML();
   assert.match(html, /<label for='text-size'>Text size<\/label><select id='text-size' aria-describedby='text-size-hint'>/);
-  assert.match(html, /<option value='112' selected>Larger \(112\.5%\)<\/option>/);
-  assert.match(html, /<p class='dim' id='text-size-hint'>Sets the size of all text in the workspace, and the default of 100% follows/);
+  assert.match(html, /<option value='100'>Smaller \(100%\)<\/option><option value='112' selected>Default \(112\.5%\)<\/option><option value='125'>Larger \(125%\)<\/option>/);
+  assert.match(sizeCtx({ pdm_text_size:"100" }).ctx.textSizeHTML(), /<option value='100' selected>Smaller \(100%\)/, "a stored 100 shows as Smaller");
+  assert.match(html, /<p class='dim' id='text-size-hint'>Sets the size of all text in the workspace, and the default is 112\.5% of your browser's text size\.<\/p>/);
   assert.match(app, /\}\)\.join\(""\) \+ textSizeHTML\(\) \+/, "rendered by fontPickerHTML, next to the font settings");
   assert.match(app, /if \(size\) size\.onchange = \(\) => applyTextSize\(size\.value\);/, "wired by wireFontPicker");
 });

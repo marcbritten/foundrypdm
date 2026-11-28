@@ -580,7 +580,8 @@ html[data-font-mono="atkinson"] { --font-mono:"Atkinson Hyperlegible Mono",ui-mo
 /* ── Type scale (guidelines Y3, Y4) ──
    Every font size is a --fs-* step in rem: 11 (repeated text only), 12, 14, 16, 20 and 24px. Large
    decorative glyphs use the icon size --icon-xl (32px). The root size follows the browser's own text size,
-   times the user's Text size choice (data-text-size on <html>, set before first paint by index.html).
+   times the user's Text size choice (data-text-size on <html>). index.html sets 112 (112.5%) as the default
+   and applies a stored choice before first paint. 100 has no rule, so it keeps the browser's size.
    Compact density changes padding only. */
 html { font-size:calc(100% * var(--fs-scale)); }
 html[data-text-size="112"] { --fs-scale:1.125; }
