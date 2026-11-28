@@ -140,7 +140,7 @@ test("on narrow screens the same button opens a drawer, and closing it returns f
   assert.equal(store.getItem("pdm_nav_rail"), null);
   assert.equal(d.ids["sb-backdrop"].hidden, false);
   assert.equal(d.ids.menubtn.getAttribute("aria-expanded"), "true");
-  assert.equal(d.ids.menubtn.title, "Close the menu");
+  assert.equal(d.ids.menubtn.title, "Close the sidebar");
   assert.deepEqual(d.focused, ["head:workspace"], "focus moves into the drawer");
   ctx.setNavDrawer(false, d.root, true);
   assert.ok(!d.ids.sidebar.classList.contains("open"));

@@ -1321,7 +1321,7 @@ function syncMenuBtn(root){
   const drawer = navIsDrawer();
   const open = drawer ? sb.classList.contains("open") : !sb.classList.contains("rail");
   b.setAttribute("aria-expanded", String(open));
-  b.title = drawer ? (open ? "Close the menu" : "Open the menu")
+  b.title = drawer ? (open ? "Close the sidebar" : "Open the sidebar")
     : (open ? "Show only icons in the sidebar" : "Show the full sidebar");
 }
 // The rail hides the labels: each link and the account button keep their name and get it as a tooltip.
