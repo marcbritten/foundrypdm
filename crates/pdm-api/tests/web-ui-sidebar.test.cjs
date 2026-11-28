@@ -47,18 +47,20 @@ function storage(init){
   return { getItem: k => m.has(k) ? m.get(k) : null, setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) };
 }
 function sidebarDom(drawer){
-  const focused = [];
-  const focusable = name => node({ name, focus(){ focused.push(name); } });
+  const focused = [], handlers = {}, winHandlers = {}, media = { drawer }, overlay = { on: false };
+  let active = null;
+  const focusable = (name, inside) => node({ name, inside, focus(){ focused.push(name); active = this; } });
   const sections = ["workspace", "data", "mfg", "actions", "admin"].map(g => {
-    const head = focusable("head:" + g);
+    const head = focusable("head:" + g, true);
     return node({ dataset: { group: g }, head, querySelector: sel => sel === ".sb-head" ? head : null });
   });
   const links = ["Dashboard", "Projects", "Test Admin"].map(t => node({ querySelector: () => ({ textContent: " " + t + " " }) }));
-  const sidebar = node({ querySelectorAll: () => links, querySelector: () => sections[0].head });
-  const ids = { sidebar, menubtn: focusable("menubtn"), "sb-backdrop": node({ hidden: true }) };
-  const root = { getElementById: id => ids[id], querySelectorAll: () => sections, addEventListener(){} };
-  const globals = { window: { matchMedia: () => ({ matches: drawer }), addEventListener(){} } };
-  return { root, sections, links, ids, focused, globals };
+  const sidebar = node({ querySelectorAll: () => links, querySelector: () => sections[0].head, contains: el => Boolean(el && el.inside) });
+  const ids = { sidebar, menubtn: focusable("menubtn", false), "sb-backdrop": node({ hidden: true }) };
+  const root = { getElementById: id => ids[id], querySelectorAll: () => sections, querySelector: () => (overlay.on ? {} : null),
+    addEventListener(type, fn){ handlers[type] = fn; }, get activeElement(){ return active; } };
+  const globals = { window: { matchMedia: () => ({ matches: media.drawer }), addEventListener(type, fn){ winHandlers[type] = fn; } } };
+  return { root, sections, links, ids, focused, globals, handlers, winHandlers, media, overlay };
 }
 const NAV_FNS = ["navFoldedGroups", "setNavGroupFolded", "wireNavGroups", "navIsDrawer", "syncMenuBtn", "setNavRail", "setNavDrawer", "toggleNav"];
 
@@ -130,7 +132,7 @@ test("on wide screens the menu button folds the sidebar to an icon rail, with to
   assert.match(app, /wireSidebar\(document, localStorage\);/);
 });
 
-test("on narrow screens the same button opens a drawer; Escape closes it and focus returns to the button", () => {
+test("on narrow screens the same button opens a drawer, and closing it returns focus to the button", () => {
   const store = storage(), d = sidebarDom(true), ctx = loadFunctions(NAV_FNS, d.globals);
   ctx.toggleNav(d.root, store);
   assert.ok(d.ids.sidebar.classList.contains("open"));
@@ -144,14 +146,47 @@ test("on narrow screens the same button opens a drawer; Escape closes it and foc
   assert.ok(!d.ids.sidebar.classList.contains("open"));
   assert.equal(d.ids["sb-backdrop"].hidden, true);
   assert.deepEqual(d.focused, ["head:workspace", "menubtn"]);
-  // The Escape handler leaves an open dialog or menu to close first.
-  const wire = app.slice(app.indexOf("function wireSidebar("), app.indexOf("const DETAIL ="));
-  assert.match(wire, /e\.key !== "Escape"/);
-  assert.match(wire, /\.modal-backdrop, dialog\[open\], \.ctxmenu:not\(\.hidden\), \.kebabmenu:not\(\.hidden\)/);
+  // Focus on a link in the drawer moves to the menu button when the drawer closes (a link was chosen).
+  ctx.toggleNav(d.root, store);
+  ctx.setNavDrawer(false, d.root, false);
+  assert.deepEqual(d.focused.slice(-2), ["head:workspace", "menubtn"]);
   // A closed drawer is out of the Tab order.
   const narrow = css.slice(css.indexOf("@media (max-width: 900px)"));
   assert.match(narrow, /#sidebar \{[^}]*visibility:hidden/);
   assert.match(narrow, /#sidebar\.open \{[^}]*visibility:visible/);
+});
+
+test("Escape, the backdrop, focus that leaves the drawer and a wider window each close the drawer", () => {
+  const d = sidebarDom(true), ctx = loadFunctions([...NAV_FNS, "wireSidebar"], d.globals);
+  ctx.wireSidebar(d.root, storage({ pdm_nav_rail: "1" }));
+  const isOpen = () => d.ids.sidebar.classList.contains("open");
+  d.ids.menubtn.onclick();
+  assert.ok(isOpen());
+  d.overlay.on = true;
+  d.handlers.keydown({ key: "Escape" });
+  assert.ok(isOpen(), "an open dialog or menu takes Escape first");
+  d.overlay.on = false;
+  d.handlers.keydown({ key: "Enter" });
+  assert.ok(isOpen());
+  d.handlers.keydown({ key: "Escape" });
+  assert.ok(!isOpen());
+  assert.equal(d.focused.at(-1), "menubtn");
+  d.ids.menubtn.onclick();
+  d.ids["sb-backdrop"].onclick();
+  assert.ok(!isOpen());
+  assert.equal(d.focused.at(-1), "menubtn");
+  d.ids.menubtn.onclick();
+  d.handlers.focusin({ target: { closest: sel => (sel === ".kebabmenu" ? {} : null) } });
+  assert.ok(isOpen(), "the account menu opened from the drawer keeps it open");
+  d.handlers.focusin({ target: d.sections[1].head });
+  assert.ok(isOpen());
+  d.handlers.focusin({ target: d.ids.menubtn });
+  assert.ok(!isOpen(), "Tab past the last link closes the drawer");
+  d.ids.menubtn.onclick();
+  d.media.drawer = false;
+  d.winHandlers.resize();
+  assert.ok(!isOpen(), "a wider window closes the drawer");
+  assert.equal(d.ids.menubtn.getAttribute("aria-expanded"), "false", "the stored rail is on, so the wide button reads folded");
 });
 
 test("the current page link gets aria-current, and it is accent text, bold and underlined with no fill", () => {
@@ -175,7 +210,7 @@ test("the current page link gets aria-current, and it is accent text, bold and u
   assert.equal(on.get("background"), undefined, "no filled block");
   assert.match([...RULES].find(r => r.selector.includes(".sb-link.on .sb-tx")).decls.get("text-decoration"), /underline/);
   assert.equal(rule(".sb-link").get("background"), undefined);
-  // Hover and keyboard focus underline the label; neither paints a fill.
+  // Hover and keyboard focus underline the label. Neither paints a fill.
   const under = RULES.find(r => r.selector.includes(".sb-link:hover .sb-tx")).selector;
   assert.match(under, /\.sb-link:focus-visible \.sb-tx/);
   assert.ok(!RULES.some(r => /\.sb-link:hover$/.test(r.selector) && r.decls.has("background")));
@@ -184,8 +219,8 @@ test("the current page link gets aria-current, and it is accent text, bold and u
 test("accent text sits on the sidebar's own surface, a pair the theme and branding checks cover", () => {
   assert.equal(rule("#sidebar").get("background"), "var(--panel)");
   assert.equal(rule(".sb-head, .sb-link").get("color"), "var(--acc)");
-  // Each theme's --acc on --panel is held to 4.5:1 by web-ui-tokens.test.cjs; an organization's
-  // colors are checked against the same pair as they are chosen.
+  // web-ui-tokens.test.cjs holds each theme's --acc on --panel to 4.5:1. The branding editor checks
+  // an organization's colors against the same pair as they are chosen.
   const pairs = loadFunctions([], {});
   vm.runInContext(app.slice(app.indexOf("const BRAND_PAIRS ="), app.indexOf("];", app.indexOf("const BRAND_PAIRS =")) + 2).replace("const BRAND_PAIRS", "var BRAND_PAIRS"), pairs);
   assert.ok(pairs.BRAND_PAIRS.some(([fg, bg, min]) => fg === "acc" && bg === "panel" && min === 4.5));
@@ -204,36 +239,56 @@ test("sizes are in em of the label (rows 2.13em, 44px for touch), and the fold m
   assert.equal(rule(".sb-head").get("gap"), ".67em");
   assert.equal(rule(".sb-items").get("padding-left"), ".67em");
   assert.equal(rule(".sb-items").get("border-left"), "1px solid var(--line)");
-  assert.equal(rule(".sb-nav").get("padding"), "0 1.33em .87em 1em");
+  assert.equal(rule(".sb-nav").get("padding"), ".2em 1.33em .87em 1em", "room for the focus ring of the first row");
   assert.equal(rule(".sb-head, .sb-link, .sb-userbtn").get("min-height"), "44px");
   assert.match(css, /@media \(pointer: coarse\) \{ \.sb-head, \.sb-link, \.sb-userbtn/);
+  assert.equal(rule(".menubtn").get("min-width"), "44px", "the menu button is a full touch target");
+  // A folded group keeps the current page and a link with a count. An empty count takes no room.
+  assert.equal(rule(".sb-section.folded .sb-link:not(.on):not(:has(.sb-count:not(:empty)))").get("display"), "none");
+  assert.equal(rule(".sb-count:empty").get("display"), "none");
+  assert.match(NAV, /<span class="sb-count" id="nb-approvals"><\/span>/);
+  // In the rail, keyboard focus shows the label beside the icon (a tooltip needs a mouse).
+  const focusLabel = rule("#sidebar.rail .sb-link:focus-visible .sb-tx, #sidebar.rail .sb-userbtn:focus-visible .sb-tx");
+  assert.equal(focusLabel.get("position"), "fixed");
+  assert.equal(focusLabel.get("clip-path"), "none");
   assert.equal(rule(".sb-chev").get("transition"), "transform .15s ease");
   assert.equal(rule(".sb-section.folded .sb-head .sb-chev").get("transform"), "rotate(90deg)");
   assert.match(css, /@media \(prefers-reduced-motion: reduce\) \{\s*\*, \*::before, \*::after \{ animation:none !important; transition:none !important; \}/);
-  // No colour literals in the sidebar rules.
+  // No color literals in the sidebar rules.
   for (const r of RULES.filter(x => /\.sb-|#sidebar|\.menubtn/.test(x.selector)))
     for (const v of r.decls.values()) assert.doesNotMatch(v, /#[0-9a-f]{3,8}\b|rgba?\(|hsla?\(/i, r.selector);
 });
 
-test("the account button opens the account menu; a token session gets Sign out", () => {
-  const shown = [];
+test("the account button opens the account menu and says when it is open, and a token session gets Sign out", () => {
+  const shown = [], watchers = [];
   const menu = node({ _trigger: null });
   menu.classList.add("hidden");
   const ctx = loadFunctions(["showUserMenu"], {
     $: id => (id === "kebabmenu" ? menu : node()), hideCtx(){}, hideKebab(){}, go(){}, signout(){}, changePassword(){}, setNavDrawer(){},
     showMenu: (m, entries, trigger) => shown.push({ m, labels: entries.map(e => e === "sep" ? "-" : e.label), trigger }),
     ME: { user: { id: "u1" } },
+    MutationObserver: class { constructor(fn){ this.fn = fn; watchers.push(this); } observe(){} disconnect(){ this.off = true; } },
   });
   const trigger = node();
   ctx.showUserMenu({ stopPropagation(){}, currentTarget: trigger });
   assert.deepEqual([...shown[0].labels], ["Change password", "Change appearance", "-", "Sign out"]);
   assert.equal(shown[0].trigger, trigger, "Escape returns focus to the account button");
+  assert.equal(trigger.getAttribute("aria-expanded"), "true");
+  menu._trigger = trigger;
+  menu.classList.remove("hidden");
+  watchers[0].fn();
+  assert.equal(trigger.getAttribute("aria-expanded"), "true", "still open");
+  menu.classList.add("hidden");
+  watchers[0].fn();
+  assert.equal(trigger.getAttribute("aria-expanded"), "false");
+  assert.ok(watchers[0].off);
   ctx.ME = { user: null };
   ctx.showUserMenu({ stopPropagation(){}, currentTarget: trigger });
   assert.deepEqual([...shown[1].labels], ["Sign out"]);
-  assert.match(NAV, /<button type="button" id="sbuserbtn" class="sb-userbtn" aria-haspopup="menu"><span id="sb-user" class="sb-user"><\/span>/);
+  assert.match(NAV, /<button type="button" id="sbuserbtn" class="sb-userbtn" aria-haspopup="menu" aria-expanded="false"><span id="sb-user" class="sb-user"><\/span>/);
   assert.match(app, /\$\("sbuserbtn"\)\.onclick = showUserMenu;/);
   // The top bar's account chip and button show only where the sidebar is a drawer.
-  const wide = css.slice(css.indexOf("@media (min-width: 901px)"));
-  assert.match(wide, /^@media \(min-width: 901px\) \{[\s\S]*?\.userchip, \.userchip-kebab \{ display:none; \}/);
+  // "not all and (max-width: 900px)" leaves no gap at a fractional width such as 900.5px.
+  const wide = css.slice(css.indexOf("@media not all and (max-width: 900px)"));
+  assert.match(wide, /^@media not all and \(max-width: 900px\) \{[\s\S]*?\.userchip, \.userchip-kebab \{ display:none; \}/);
 });

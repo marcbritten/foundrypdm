@@ -1291,7 +1291,7 @@ function syncNav(){
 // ── sidebar: folding groups, icon rail and phone drawer ──
 // Each group folds on its own. A folded group still shows the current page and a link with a
 // count. The menu button folds the whole sidebar to an icon rail on wide screens and opens it as a
-// drawer on narrow ones (901px is the same break as the bottom bar). This browser keeps the
+// drawer on narrow ones (up to 900px, the same break as the bottom bar). This browser keeps the
 // folded groups and the rail in localStorage.
 function navFoldedGroups(store){
   try { const v = JSON.parse(store.getItem("pdm_nav_folded") || "[]"); return Array.isArray(v) ? v : []; }
@@ -1335,14 +1335,16 @@ function setNavRail(on, root, store){
   if (store) try { if (on) store.setItem("pdm_nav_rail", "1"); else store.removeItem("pdm_nav_rail"); } catch(e){}
   syncMenuBtn(root);
 }
-// Opening the drawer moves focus into it; closing it with Escape returns focus to the menu button.
+// Opening the drawer moves focus into it. Closing it moves focus to the menu button when the caller
+// asks or when focus was in the drawer, so focus never stays on a link that is out of sight.
 function setNavDrawer(open, root, refocus){
   const sb = root.getElementById("sidebar"), shade = root.getElementById("sb-backdrop");
+  const inside = !open && sb.contains(root.activeElement);
   sb.classList.toggle("open", open);
   if (shade) shade.hidden = !open;
   syncMenuBtn(root);
   if (open){ const f = sb.querySelector("button, a[href]"); if (f) f.focus(); }
-  else if (refocus){ const b = root.getElementById("menubtn"); if (b) b.focus(); }
+  else if (refocus || inside){ const b = root.getElementById("menubtn"); if (b) b.focus(); }
 }
 function toggleNav(root, store){
   const sb = root.getElementById("sidebar");
@@ -1361,11 +1363,12 @@ function wireSidebar(root, store){
     if (root.querySelector(".modal-backdrop, dialog[open], .ctxmenu:not(.hidden), .kebabmenu:not(.hidden)")) return;
     setNavDrawer(false, root, true);
   });
-  // Tab past the end of the open drawer closes it, so focus never sits behind the backdrop.
+  // Focus that leaves the open drawer closes it (Tab past the last link reaches the menu button),
+  // so focus never sits behind the backdrop. The account menu opens from the drawer and keeps it.
   root.addEventListener("focusin", e => {
     const sb = root.getElementById("sidebar");
-    if (sb.classList.contains("open") && !sb.contains(e.target) && e.target !== root.getElementById("menubtn")
-      && !e.target.closest(".kebabmenu")) setNavDrawer(false, root, false);
+    if (sb.classList.contains("open") && !sb.contains(e.target)
+      && !(e.target.closest && e.target.closest(".kebabmenu"))) setNavDrawer(false, root, false);
   });
   window.addEventListener("resize", () => {
     if (!navIsDrawer() && root.getElementById("sidebar").classList.contains("open")) setNavDrawer(false, root, false);
@@ -5426,6 +5429,15 @@ function showUserMenu(ev){
     menu.style.left = left + "px";
     menu.style.top = top + "px";
   });
+  // The button says whether its menu is open. Any way the menu closes, or another menu takes its
+  // place, sets it back.
+  trigger.setAttribute("aria-expanded", "true");
+  const watch = new MutationObserver(() => {
+    if (!m.classList.contains("hidden") && m._trigger === trigger) return;
+    trigger.setAttribute("aria-expanded", "false");
+    watch.disconnect();
+  });
+  watch.observe(m, { attributes:true, attributeFilter:["class"], childList:true });
 }
 
 async function changePassword(){

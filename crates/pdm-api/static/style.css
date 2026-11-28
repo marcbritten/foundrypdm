@@ -184,11 +184,11 @@ td.mono, td.dim { font-size:var(--fs-base); }
 .brand-warn { margin:var(--sp-1) 0 var(--sp-2); padding-left:var(--sp-5); }
 /* Sidebar groups: a header button (icon, label, chevron) folds the group's links, and a guide line
    runs along their left. Labels, icons and headers are accent text on the panel. The current page
-   is also bold and underlined, with no fill. Pointer and keyboard focus underline a label, and
-   keyboard focus shows the shared ring. Sizes are in em of the label (--fs-base), so they follow
+   is also bold and underlined, with no fill. Pointer and keyboard focus underline a label. Keyboard
+   focus also shows the shared ring. Sizes are in em of the label (--fs-base), so they follow
    the Text size setting: rows 2.13em, icons 1.07em tall in a 1.33em slot, label gap .53em
    (.67em in headers), item icons .73em right of the header icon, the guide line 1em from the edge. */
-.sb-nav { flex:1; min-height:0; overflow-y:auto; padding:0 1.33em .87em 1em; }
+.sb-nav { flex:1; min-height:0; overflow-y:auto; padding:.2em 1.33em .87em 1em; }
 .sb-section + .sb-section { margin-top:.4em; }
 .sb-head, .sb-link { display:flex; align-items:center; min-height:2.13em; padding:0; color:var(--acc);
   font-size:var(--fs-base); line-height:var(--lh-tight); border-radius:var(--r-s); }
@@ -208,7 +208,8 @@ td.mono, td.dim { font-size:var(--fs-base); }
 .sb-tx { min-width:0; overflow-wrap:anywhere; }
 /* A folded group still shows the current page and a link with a count (such as approvals waiting). */
 .sb-section.folded .sb-link:not(.on):not(:has(.sb-count:not(:empty))) { display:none; }
-@media (pointer: coarse) { .sb-head, .sb-link, .sb-userbtn { min-height:44px; } }
+@media (pointer: coarse) { .sb-head, .sb-link, .sb-userbtn { min-height:44px; } .menubtn { min-width:44px; min-height:44px; justify-content:center; } }
+.sb-count:empty { display:none; }
 .sb-count { margin-left:auto; font-size:var(--fs-xs); font-weight:700; color:var(--acc);
   background:color-mix(in srgb, var(--acc) 18%, var(--panel));
   border:1px solid color-mix(in srgb, var(--acc) 35%, var(--line));
@@ -224,10 +225,12 @@ td.mono, td.dim { font-size:var(--fs-base); }
 .sb-user { display:flex; align-items:center; gap:.67em; min-width:0; font-weight:700; }
 .sb-user .sb-tx { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .sb-user .dim { font-weight:400; font-size:var(--fs-sm); }
-/* Wide screens: the menu button folds the sidebar to an icon rail. Labels are hidden from sight
-   only (screen readers still read them) and show as tooltips. A folded group opens in the rail,
-   so every page stays one click away. The account button in the sidebar replaces the top bar's. */
-@media (min-width: 901px) {
+/* Wide screens (every width the drawer rules leave out, fractions of a pixel too): the menu button
+   folds the sidebar to an icon rail. Labels are hidden from sight only (screen readers still read
+   them) and show as tooltips. Keyboard focus shows the label beside the rail. A folded group opens
+   in the rail, so every page stays one click away. The account button in the sidebar replaces the
+   top bar's. */
+@media not all and (max-width: 900px) {
   #sidebar.rail { width:3.75em; }
   #sidebar.rail .sb-brand { padding-inline:0; text-align:center; }
   #sidebar.rail .sb-brand [data-brand-name] { display:none; }
@@ -239,6 +242,9 @@ td.mono, td.dim { font-size:var(--fs-base); }
   #sidebar.rail .sb-items { margin-left:0; padding-left:0; border-left:none; }
   #sidebar.rail .sb-section .sb-link:not([hidden]) { display:flex; justify-content:center; position:relative; }
   #sidebar.rail .sb-tx { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+  #sidebar.rail .sb-link:focus-visible .sb-tx, #sidebar.rail .sb-userbtn:focus-visible .sb-tx { position:fixed; left:4.25em;
+    width:auto; height:auto; overflow:visible; clip-path:none; z-index:70; padding:.2em .5em; background:var(--panel2);
+    color:var(--fg); border:1px solid var(--line); border-radius:var(--r-s); font-weight:400; text-decoration:none; }
   #sidebar.rail .sb-link.on .sb-ic { box-shadow:0 2px 0 var(--acc); }
   #sidebar.rail .sb-count { position:absolute; top:0; right:0; margin:0; }
   #sidebar.rail .sb-userbtn { justify-content:center; position:relative; }
@@ -564,7 +570,7 @@ dialog.modal-backdrop::backdrop { background:transparent; }
 .bottomBar { display:none; }
 @media (max-width: 900px) {
   #sidebar { position:fixed; left:0; top:0; bottom:0; z-index:60; transform:translateX(-100%);
-    visibility:hidden; transition:transform .18s ease, visibility 0s linear .18s; box-shadow:var(--shadow); }
+    height:auto; visibility:hidden; transition:transform .18s ease, visibility 0s linear .18s; box-shadow:var(--shadow); }
   #sidebar.open { transform:none; visibility:visible; transition:transform .18s ease; }
   .sb-backdrop:not([hidden]) { position:fixed; inset:0; z-index:55; background:var(--backdrop); }
   .grid2, .grid3 { grid-template-columns:1fr; }

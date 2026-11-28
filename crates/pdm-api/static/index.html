@@ -139,7 +139,7 @@ try { if (/[?&]nobrand(?:[=&]|$)/.test(location.search)) document.getElementById
     <div class="sb-section" data-group="actions">
       <button type="button" class="sb-head" aria-expanded="true" aria-controls="sbg-actions"><span class="sb-ic"><svg class="icon"><use href="#ic-inbox"/></svg></span><span class="sb-tx">Actions</span><svg class="icon sb-chev"><use href="#ic-chevron"/></svg></button>
       <div class="sb-items" id="sbg-actions">
-      <a class="sb-link" href="#/approvals" data-nav="approvals"><span class="sb-ic"><svg class="icon"><use href="#ic-approval"/></svg></span><span class="sb-tx">Approvals</span><span class="sb-count" id="nb-approvals">0</span></a>
+      <a class="sb-link" href="#/approvals" data-nav="approvals"><span class="sb-ic"><svg class="icon"><use href="#ic-approval"/></svg></span><span class="sb-tx">Approvals</span><span class="sb-count" id="nb-approvals"></span></a>
       <a class="sb-link" href="#/activity" data-nav="activity"><span class="sb-ic"><svg class="icon"><use href="#ic-activity"/></svg></span><span class="sb-tx">Activity</span></a>
       <a class="sb-link" href="#/jobs" data-nav="jobs"><span class="sb-ic"><svg class="icon"><use href="#ic-gcode"/></svg></span><span class="sb-tx">Jobs</span></a>
       </div>
@@ -154,7 +154,7 @@ try { if (/[?&]nobrand(?:[=&]|$)/.test(location.search)) document.getElementById
     </div>
     </div>
     <div class="sb-foot">
-      <button type="button" id="sbuserbtn" class="sb-userbtn" aria-haspopup="menu"><span id="sb-user" class="sb-user"></span><svg class="icon sb-chev"><use href="#ic-chevron"/></svg></button>
+      <button type="button" id="sbuserbtn" class="sb-userbtn" aria-haspopup="menu" aria-expanded="false"><span id="sb-user" class="sb-user"></span><svg class="icon sb-chev"><use href="#ic-chevron"/></svg></button>
     </div>
   </nav>
   <div id="sb-backdrop" class="sb-backdrop" hidden></div>
