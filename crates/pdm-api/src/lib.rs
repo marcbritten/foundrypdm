@@ -19,6 +19,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 mod auth;
+mod branding;
 mod design_link;
 mod error;
 mod mail;
@@ -54,6 +55,7 @@ pub fn build_router(state: AppState) -> Router {
 
     let mut router: Router<AppState> = Router::new();
     router = router.merge(api);
+    router = router.merge(branding::router());
 
     if let Some(dir) = portal_dir() {
         // `no-cache` makes browsers revalidate on every load so a redeployed

@@ -1,6 +1,7 @@
 # API Specification
 
-HTTP/JSON, bearer-token auth (except `/version`, `/healthz`, `/readyz`, `/auth/login`). All
+HTTP/JSON, bearer-token auth (except `/version`, `/healthz`, `/readyz`, `/auth/login` and the
+sign-in page's `/public/branding`, `/public/branding.css` and `/public/branding/logo`). All
 tenant-scoped routes operate in the caller's `org_id`. Errors: `4xx/5xx` with body
 `{ "error": { "code", "message" } }` (some include structured detail, e.g. check-in conflict).
 Base URL in the dev image: `http://<host>:8080`.
@@ -64,6 +65,54 @@ Base URL in the dev image: `http://<host>:8080`.
   and `active: true` to enable it. Disabled users cannot sign in or authenticate
   with existing tokens. Disabling or demoting the last active administrator
   returns `409 Conflict`; this constraint also applies to concurrent updates.
+
+### Branding (`crates/pdm-api/src/branding.rs`)
+An organization's display name, logo and color overrides, which replace the "Foundry PDM" mark
+and the theme colors. Reads are open to any signed-in caller; writes are admin-only (403
+otherwise) and are audited (`org.branding_updated`, `org.branding_logo_set`,
+`org.branding_logo_cleared`, `org.branding_reset`, object type `organization`).
+- `GET /settings/branding` → **BrandingView**: `{ display_name, show_name_with_logo,
+  favicon_from_logo, logo, colors, themes, tokens, signin_org }`. `logo` is `null` or
+  `{ url, public_url, mime, width, height, bytes, updated_at }`; the URLs carry `?v=` = the first
+  12 hex digits of the logo's SHA-256, and `public_url` is set only when `signin_org` is true.
+  `colors` is `{ theme: { token: "#rrggbb" } }`. `themes` (`dark`, `light`, `slate`, `contrast`)
+  and `tokens` are the allow-lists the server enforces, so an editor can be built from them.
+  `signin_org` says whether the sign-in page shows this organization (see below).
+- `PUT /settings/branding` (admin) — partial update `{ display_name?, show_name_with_logo?,
+  favicon_from_logo?, colors? }` → BrandingView. An absent field keeps its value;
+  `display_name: null` (or blank) clears the name (at most 60 characters, no control or
+  invisible formatting characters such as direction marks or zero-width spaces). `colors` merges
+  per theme: a token set to `null` drops that override, a theme set
+  to `null` drops the theme, `colors: null` drops all overrides. Colors must be `#rrggbb` (stored
+  in lower case). An unknown field, theme or token, or a bad value, returns **400** naming the key;
+  nothing is saved. Bodies over 64 KiB get **413**.
+- `DELETE /settings/branding` (admin) — back to the defaults, logo included → BrandingView.
+- `PUT /settings/branding/logo` (admin) — the raw image as the body, `Content-Type: image/png` or
+  `image/webp`, at most 256 KiB (**413** above that), 16–2048 px on each side → BrandingView. The
+  type is checked from the file's header and must match `Content-Type`; SVG, GIF, JPEG and
+  anything else return **400** (convert SVG to PNG before uploading). Replaces any earlier logo.
+- `DELETE /settings/branding/logo` (admin) → BrandingView.
+- `GET /settings/branding/logo` — the image, with `X-Content-Type-Options: nosniff`,
+  `Content-Security-Policy: default-src 'none'; sandbox`, `Cross-Origin-Resource-Policy:
+  same-origin`, an `ETag` (`If-None-Match` → 304), and `Cache-Control: private, max-age=31536000,
+  immutable` when `?v=` matches the current logo (`private, no-cache` otherwise). 404 when none.
+
+**Public, no token** — what the sign-in page shows. The *sign-in organization* is the one named
+by `PDM_SIGNIN_ORG` (see `docs/docker-server.md`), or else the only organization when the server
+hosts exactly one; otherwise there is none and these routes answer with the defaults, so one
+organization's name and logo are never shown to another's users.
+- `GET /public/branding` → `{ display_name, show_name_with_logo, logo_url, favicon_url }` (every
+  field `null` without a sign-in organization). Never contains the organization's id or
+  registered name. `Cache-Control: no-cache` with an `ETag`.
+- `GET /public/branding.css` — `text/css`: the sign-in organization's color overrides, one rule
+  per theme, e.g. `html[data-theme="dark"]{--acc:#3b82f6;--on-acc:#0b1220}`; empty without
+  overrides. Built by the server from the allow-lists only. `no-cache` with an `ETag`.
+- `GET /public/branding/logo` — the sign-in organization's logo, with the same safety headers;
+  `Cache-Control: public, max-age=31536000, immutable` when `?v=` matches the current logo,
+  `no-cache` otherwise. 404 when there is none.
+
+The 413 answers and malformed-JSON errors on these routes come from the HTTP layer as plain
+text, not the `{ "error": … }` shape.
 
 ## Gaps (roadmap)
 - **Pagination** on list endpoints (currently unbounded).

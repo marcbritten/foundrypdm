@@ -14,6 +14,7 @@ use sqlx::FromRow;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod branding;
 pub mod gcode;
 
 // ── Error ────────────────────────────────────────────────────────────────

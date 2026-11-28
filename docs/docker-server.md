@@ -67,6 +67,12 @@ Set these on **pdm** and **pdm-worker**. Compose already sets them for the bundl
 | `PDM_MAX_UPLOAD_BYTES` | `2147483648` | Upload cap (2 GiB) |
 | `SOLIDCRAFT_GPU` | `auto` | `auto` / `hardware` / `software` / `cpu` |
 | `PDM_PORTAL_DIR` | `/opt/pdm/portal` | Static web UI (index.html, app.js) |
+| `PDM_SIGNIN_ORG` | — | API only. Name of the organization whose branding (name, logo, colors) the sign-in page shows. Unset or blank: a server with exactly one organization shows that one's; a server with several shows the defaults. A name no organization has turns sign-in branding off |
+
+The sign-in page is public: anyone who can reach the server sees the sign-in organization's
+display name and logo (`/public/branding*`, see `docs/api-specification.md`). After sign-in,
+`GET /settings/branding` returns each user's own organization's branding, whatever
+`PDM_SIGNIN_ORG` says.
 
 ### Sign-in sessions
 
