@@ -5,6 +5,7 @@
 //!   pdm-cli create-user --org acme --email a@acme.com --role editor [--password s3kr3t]
 //!   pdm-cli set-password --org acme --email a@acme.com --password s3kr3t
 //!   pdm-cli create-token --org acme --user a@acme.com
+//!   pdm-cli host-admin grant --email a@acme.com [--org acme]   (also: revoke, list)
 //!   pdm-cli update check [--json]
 //!   pdm-cli update apply [--yes]
 //!
@@ -48,7 +49,8 @@ enum Command {
         #[arg(long)]
         name: String,
     },
-    /// Create a user in an organization.
+    /// Create a user in an organization. The first admin created on a server with no host
+    /// admin yet also becomes host admin.
     CreateUser {
         #[arg(long)]
         org: String,
@@ -56,7 +58,7 @@ enum Command {
         email: String,
         #[arg(long, default_value = "")]
         display_name: String,
-        /// 'viewer' | 'editor' | 'admin'
+        /// 'viewer' | 'operator' | 'editor' | 'admin'
         #[arg(long, default_value = "editor")]
         role: String,
         /// Initial password (Argon2id-hashed before storage)
@@ -81,11 +83,62 @@ enum Command {
         #[arg(long, default_value = "cli-token")]
         name: String,
     },
+    /// Grant, revoke or list host admins (recovery: works without signing in).
+    HostAdmin {
+        #[command(subcommand)]
+        cmd: HostAdminCmd,
+    },
     /// Check for / apply the newest PDM release from Gitea.
     Update {
         #[command(subcommand)]
         cmd: update::UpdateCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum HostAdminCmd {
+    /// Make an active admin a host admin.
+    Grant {
+        #[arg(long)]
+        email: String,
+        /// Organization name; needed only when the email is used in more than one.
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// Take host admin away (refused for the last one).
+    Revoke {
+        #[arg(long)]
+        email: String,
+        /// Organization name; needed only when the email is used in more than one.
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// List the host admins.
+    List,
+}
+
+/// The one user with this email (in `org` when given).
+async fn find_user(
+    pool: &sqlx::PgPool,
+    email: &str,
+    org: Option<&str>,
+) -> Result<pdm_core::User, pdm_core::PdmError> {
+    if let Some(org) = org {
+        let org_row = pdm_db::get_org_by_name(pool, org)
+            .await?
+            .ok_or_else(|| pdm_core::PdmError::NotFound(format!("org '{org}'")))?;
+        return pdm_db::get_user_by_email(pool, org_row.id, email)
+            .await?
+            .ok_or_else(|| pdm_core::PdmError::NotFound(format!("user '{email}' in '{org}'")));
+    }
+    let mut users = pdm_db::get_users_by_email(pool, email).await?;
+    match users.len() {
+        0 => Err(pdm_core::PdmError::NotFound(format!("user '{email}'"))),
+        1 => Ok(users.remove(0)),
+        n => Err(pdm_core::PdmError::Validation(format!(
+            "{n} organizations have a user '{email}': add --org"
+        ))),
+    }
 }
 
 fn database_url(cli: &Cli) -> String {
@@ -176,7 +229,45 @@ async fn run_db_command(command: &Command, pool: &sqlx::PgPool) -> Result<(), pd
             if password.is_some() {
                 println!("password: set (not shown)");
             }
+            if role == "admin" && pdm_db::bootstrap_host_admin(pool, u.id).await? {
+                println!("host admin: yes (the server had none)");
+            }
         }
+
+        Command::HostAdmin { cmd } => match cmd {
+            HostAdminCmd::Grant { email, org } | HostAdminCmd::Revoke { email, org } => {
+                let grant = matches!(cmd, HostAdminCmd::Grant { .. });
+                let user = find_user(pool, email, org.as_deref()).await?;
+                let (user, changed) = pdm_db::set_host_admin(pool, user.id, grant).await?;
+                if changed {
+                    let action = if grant {
+                        "user.host_admin_granted"
+                    } else {
+                        "user.host_admin_revoked"
+                    };
+                    pdm_db::record_audit(
+                        pool,
+                        user.org_id,
+                        None,
+                        "pdm-cli",
+                        action,
+                        "user",
+                        Some(user.id),
+                        Some(serde_json::json!({ "email": user.email })),
+                    )
+                    .await?;
+                }
+                let state = if user.is_host_admin { "is" } else { "is not" };
+                let note = if changed { "" } else { " (unchanged)" };
+                println!("{} {state} a host admin{note}", user.email);
+            }
+            HostAdminCmd::List => {
+                for (u, org) in pdm_db::list_host_admins(pool).await? {
+                    let off = if u.active { "" } else { " (disabled)" };
+                    println!("{}\t{org}{off}", u.email);
+                }
+            }
+        },
 
         Command::SetPassword {
             org,

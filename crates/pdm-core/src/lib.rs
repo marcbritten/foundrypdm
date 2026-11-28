@@ -100,9 +100,14 @@ pub struct User {
     pub org_id: Uuid,
     pub email: String,
     pub display_name: String,
-    /// 'viewer' | 'editor' | 'admin' (Phase-1 simplification of the roles model).
+    /// 'viewer' | 'operator' | 'editor' | 'admin' (Phase-1 simplification of the roles model).
     pub role: String,
     pub active: bool,
+    /// Host admin: may change what the whole server shares (CAD CLI and web editor
+    /// builds, the Dutchman release channel, the preview GPU policy) and grant or
+    /// revoke host admin. Org admins manage only their own organization.
+    #[serde(default)]
+    pub is_host_admin: bool,
     /// Argon2id PHC hash of the user's password, if any.
     /// Never serialized in JSON responses.
     #[serde(skip_serializing, default)]
@@ -443,8 +448,8 @@ pub const DUTCHMAN_EXTS: [&str; 17] = [
     "onshape-bundle",
 ];
 
-/// Organization Dutchman settings: which release channel to convert with, and
-/// which conversion options to pass to the CLI.
+/// Dutchman settings: which release channel to convert with (server-wide, set by a host
+/// admin) and which conversion options to pass to the CLI (per organization).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DutchmanSettings {

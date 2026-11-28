@@ -41,6 +41,21 @@ docker compose -f solidcraft-pdm/docker/pdm-dev.yml exec pdm pdm-cli create-user
 
 Open http://localhost:8080/ and sign in.
 
+This first admin is also the server's **host admin**: the account that changes what every
+organization on the server shares (System › CAD CLI, SolidCraft web editor and Dutchman release
+channel; Settings › Preview renderer) and makes other admins host admins (Administration › Users).
+Other admins, in this organization or another, manage only their own organization until a host
+admin makes them host admins. On an upgraded server, see who holds it with `host-admin list`. To
+hand over or recover access:
+
+```sh
+docker compose -f solidcraft-pdm/docker/pdm-dev.yml exec pdm pdm-cli host-admin list
+docker compose -f solidcraft-pdm/docker/pdm-dev.yml exec pdm pdm-cli host-admin grant \
+  --email someone@example.com [--org Acme]
+```
+
+`host-admin revoke` takes the same options and refuses to remove the last host admin.
+
 ## Environment (DB and storage)
 
 Set these on **pdm** and **pdm-worker**. Compose already sets them for the bundled Postgres/MinIO.
@@ -57,7 +72,7 @@ Set these on **pdm** and **pdm-worker**. Compose already sets them for the bundl
 | `PDM_DUTCHMAN_CLI` | `/usr/local/bin/dutchman` | Dutchman binary (native CAD → SolidCraft with feature history) |
 | `PDM_DUTCHMAN_UPDATE` | `1` | Pull the referenced Dutchman release (boot + hourly + on first conversion); `0` opts out |
 | `PDM_DUTCHMAN_UPDATE_HOURS` | `1` | Hours between Dutchman release checks |
-| `PDM_DUTCHMAN_CHANNEL` | — | Host-level channel override for the update loop (`latest`, `nightly`, or a tag); the org's System › Dutchman choice otherwise wins |
+| `PDM_DUTCHMAN_CHANNEL` | — | Host-level channel override for the update loop (`latest`, `nightly`, or a tag); the server's System › Dutchman channel (set by a host admin) otherwise wins |
 | `PDM_DUTCHMAN_TIMEOUT_SECS` | `1800` | Wall-clock limit for one Dutchman conversion (the org can override it) |
 | `PDM_WORKER` | `0` on API, `1` on worker | Whether this process claims jobs |
 | `PDM_WORKER_CONCURRENCY` | `4` | Parallel jobs on the worker |
@@ -65,7 +80,7 @@ Set these on **pdm** and **pdm-worker**. Compose already sets them for the bundl
 | `PDM_SESSION_IDLE_MINUTES` | `120` | A web sign-in ends after this many minutes without a request (`0` = never); see [Sign-in sessions](#sign-in-sessions) |
 | `PDM_SESSION_LIFETIME_MINUTES` | `720` | A web sign-in ends this many minutes after it was made, however busy (`0` = no limit) |
 | `PDM_MAX_UPLOAD_BYTES` | `2147483648` | Upload cap (2 GiB) |
-| `SOLIDCRAFT_GPU` | `auto` | `auto` / `hardware` / `software` / `cpu` |
+| `SOLIDCRAFT_GPU` | `auto` | `auto` / `hardware` / `software` / `cpu`. Previews do not use it: each preview job passes the server-wide **Preview renderer** choice instead (see [GPU](#gpu-thumbnails)) |
 | `PDM_PORTAL_DIR` | `/opt/pdm/portal` | Static web UI (index.html, app.js) |
 | `PDM_SIGNIN_ORG` | — | API only. Name of the organization whose branding (name, logo, colors) the sign-in page shows. Unset or blank: a server with exactly one organization shows that one's; a server with several shows the defaults. A name no organization has turns sign-in branding off |
 
@@ -80,14 +95,50 @@ Signing in with a password (the portal or the Onshape panel, `POST /auth/login`)
 sign-in. It ends after `PDM_SESSION_IDLE_MINUTES` without a request (default 120) or
 `PDM_SESSION_LIFETIME_MINUTES` after it was made (default 720, 12 hours), whichever comes first,
 and the portal asks the person to sign in again. Signing out ends it at once. Two things count
-as use besides clicking around: the portal's optional auto-refresh, whenever it refreshes, and
-an open web editor (SolidCraft or another CAD editor) in a visible tab, so modelling for a long
+as use besides clicking around: the portal's optional auto-refresh, whenever it refreshes (a page
+that only receives [live updates](#live-updates) does not count), and an open web editor (SolidCraft or another CAD editor) in a visible tab, so modelling for a long
 time doesn't end the sign-in; the lifetime still applies. If a sign-in ends while a web editor is
 open, the portal stays on the editor so the model can still be downloaded. A value that is not a
 whole number of minutes keeps the default.
 
 CAD connectors, agents and scripts should use an API token, which an administrator creates for
 a user in Administration (or with `pdm-cli create-token`): API tokens never expire on their own.
+
+### Live updates
+
+Open portal pages hear about changes as they happen, over `GET /events/stream` (Server-Sent
+Events): every change recorded in the activity log (items, versions, projects, approvals, users,
+laser nests) and every background job that starts, finishes or fails sends a short hint saying
+what changed, not the details. With Auto-refresh on, list views refresh when a change concerns
+them (at most once every three seconds); otherwise, and on item and administration pages, a bar
+names who changed it and offers Refresh. Pages whose changes are not recorded in the activity log
+yet (settings, the tool library, machines, post-processors, sheet-metal standards, system) keep
+the six-second Auto-refresh. Jobs run by a separate worker process (`PDM_WORKER=0` on the API)
+reach the browsers too, through PostgreSQL `LISTEN`/`NOTIFY`; each API process keeps one database
+connection for this. That connection must reach PostgreSQL directly or through a session-mode
+pooler: a transaction-mode pooler (PgBouncer's `pool_mode = transaction`) drops notifications.
+While the listener is not connected the stream answers 503, and pages fall back to refreshing
+every six seconds when Auto-refresh is on.
+
+Behind a reverse proxy the stream must be passed through unbuffered and allowed to stay open. The
+server sends `X-Accel-Buffering: no`, which Nginx honors, and a heartbeat every 25 seconds, so any
+read timeout of a minute or more is enough. To set it explicitly in Nginx:
+
+```nginx
+location /events/stream {
+    proxy_pass http://pdm:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 1h;
+}
+```
+
+Keep response compression off for this path: a compressing proxy holds events back. Over plain
+HTTP/1.1 a browser opens only six connections per server, so the portal lets the stream of a tab
+that stays hidden go after 30 seconds and catches up when the tab is shown again; HTTP/2 (which
+most TLS proxies speak to browsers) lifts that limit.
 
 ### External Postgres
 
@@ -105,7 +156,7 @@ Set `PDM_S3_*` to AWS, MinIO, Garage, etc. Create the bucket before starting PDM
 
 ## GPU (thumbnails)
 
-The worker uses Vulkan when `/dev/dri` is visible. Compose passes `/dev/dri` and `SOLIDCRAFT_GPU=auto`. On hosts without a GPU, it falls back to CPU. Org setting **Settings → Preview renderer** can override (`auto` / `GPU` / `GPU software` / `CPU`).
+Preview snapshots use the server-wide GPU policy set under **Settings → Preview renderer** (host admin only; `auto` / `GPU` / `GPU software` / `CPU`; default `auto`). The worker passes it to the CLI as `SOLIDCRAFT_GPU` for every preview job, so a `SOLIDCRAFT_GPU` set on the host does not change previews. The policy matters for **Viewport snapshot** previews (and the coarse viewport fallback for very large models); the default **Transparent product render** style uses the CPU product-image renderer. With `auto`, a viewport snapshot uses Vulkan when `/dev/dri` is visible and falls back to the CPU on hosts without a GPU. Compose passes `/dev/dri`.
 
 If compose fails on a machine with no `/dev/dri`, remove the `devices:` block from `docker/pdm-dev.yml`.
 
@@ -158,7 +209,7 @@ and update, then retry the URL import. A current stable release is not necessari
 an Onshape-capable release. The import page keeps the job ID and failure message
 visible alongside the STEP fallback.
 
-Dutchman runs on a **release channel** chosen per org in **System ›
+Dutchman runs on a **release channel** chosen for the whole server by a host admin in **System ›
 Dutchman** (dropdown: latest stable, nightly, the Onshape-preview builds, or a
 pinned tag). The PDM keeps the host on that channel: at boot, hourly, and on
 the first conversion that references it. Conversion options (preset, part
@@ -202,11 +253,11 @@ PDM_BUILD_TAG=V.01-37 docker compose -f solidcraft-pdm/docker/pdm-dev.yml up -d
 
 ## After boot — Settings in the portal
 
-These are **not** env vars; they live in the org (Admin → Settings):
+These are **not** env vars; they live in the org (Admin → Settings), except where marked server-wide:
 
 - **Mail server** — SMTP host, port, user, password, from, STARTTLS/TLS. Required for **Invite user**.
 - **Onshape** — API access key + secret, default PDM project. Required for **Send to manufacturing**.
-- **Preview renderer** — GPU policy for the worker.
+- **Preview renderer** — server-wide GPU policy for preview snapshots (default Auto); only a host admin changes it.
 - **Part-number prefixes** — auto part numbers.
 
 Do not put SMTP or Onshape secrets in git.

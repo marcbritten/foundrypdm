@@ -22,7 +22,10 @@ UUID PKs; `org_id` on every tenant-scoped table. Postgres 13+.
   the unauthenticated sign-in page reads them and blob keys have no organization scope; deleted
   with the organization.
 - **users** — `org_id`, `email` (unique per org), `display_name`, `password_hash` (Argon2id, optional),
-  `role` (`viewer`|`editor`|`admin`), `active`.
+  `role` (`viewer`|`editor`|`admin`), `active`, `is_host_admin` (may change what the whole server
+  shares; `0029_host_admin.sql`).
+- **host_settings** — server-wide `key` → `value` jsonb: `dutchman_channel`, `gpu_policy`
+  (`0029_host_admin.sql`).
 - **api_tokens** — bearer tokens, stored SHA-256; scoped to user/service-account. `kind`: `web` for
   a password sign-in (expires), `api` for every other token.
 - **service_accounts** — non-interactive credentials.

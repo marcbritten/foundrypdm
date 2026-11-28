@@ -132,10 +132,17 @@ input:focus, select:focus, textarea:focus { outline:none; border-color:var(--acc
 .auth-card .f { margin-bottom:10px; }
 .auth-card input, .auth-card button { width:100%; }
 .auth-build { font-size:11px; margin-top:12px; }
-.tokshow { margin-top:10px; }
+.auth-card label { display:block; margin-bottom:var(--sp-1, 4px); color:var(--dim); }
+.auth-note { margin-top:var(--sp-1, 4px); }
 .divider { display:flex; align-items:center; gap:10px; color:var(--dim); font-size:11px;
   margin:16px 0; text-transform:uppercase; letter-spacing:.08em; }
 .divider:before, .divider:after { content:""; flex:1; height:1px; background:var(--line); }
+/* Settings: the default under a field, and a section's "Unsaved changes" / "Saved" state */
+.set-hint { margin-top:var(--sp-1, 4px); }
+.set-hint.set-err { color:var(--err); }
+.sec-state.unsaved { color:var(--fg); font-weight:600; }
+.gs-steps { margin:var(--sp-2, 8px) 0 0; padding-left:var(--sp-5, 24px); }
+.gs-steps li { margin-bottom:var(--sp-2, 8px); }
 
 /* ── Workspace shell ── */
 #ws { display:flex; min-height:100vh; }
@@ -143,6 +150,30 @@ input:focus, select:focus, textarea:focus { outline:none; border-color:var(--acc
   display:flex; flex-direction:column; position:sticky; top:0; height:100vh; }
 .sb-brand { font-weight:700; font-size:15px; padding:16px 18px 12px; letter-spacing:.02em; }
 .sb-brand .mark { color:var(--acc); margin-right:6px; }
+/* Organization branding: the logo's box (28px in the sidebar, 40px on the sign-in card; widths
+   keep it inside the sidebar) and the Settings, Branding editor. */
+.brand-logo { display:inline-block; vertical-align:middle; max-height:28px; max-width:180px; object-fit:contain; }
+.auth-logo .brand-logo { max-height:40px; max-width:260px; }
+.sb-brand .mark.has-logo:not(.logo-only) .brand-logo { max-width:120px; }
+/* An organization's name can be long: the brand row stays one line, cut with an ellipsis (the
+   full name is its tooltip), and keeps its height in the sidebar's column. */
+.sb-brand { flex-shrink:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.brand-h { font-size:var(--fs-base); font-weight:600; margin:var(--sp-5) 0 var(--sp-2); }
+.brand-tiles, .brand-samples { display:grid; grid-template-columns:repeat(auto-fill,minmax(11rem,1fr)); gap:var(--sp-3); margin:var(--sp-2) 0; }
+.brand-tile { display:flex; align-items:center; min-height:4rem; padding:var(--sp-3) var(--sp-4); background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:var(--r-m); }
+.brand-sample { display:flex; flex-direction:column; gap:var(--sp-1); padding:var(--sp-3); background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:var(--r-m); font-size:var(--fs-sm); }
+.brand-s-acc { color:var(--acc); }
+.brand-s-ok { color:var(--ok); }
+.brand-s-warn { color:var(--warn); }
+.brand-s-err { color:var(--err); }
+.brand-s-fill { background:var(--acc); color:var(--on-acc); padding:1px var(--sp-2); border-radius:var(--r-s); }
+.brand-s-btn { background:var(--primary-bg); color:var(--primary-fg); border:1px solid var(--primary-border); padding:1px var(--sp-2); border-radius:var(--r-s); }
+.brand-color { width:44px; height:28px; padding:2px; vertical-align:middle; }
+.brand-changed { font-size:var(--fs-sm); font-weight:600; margin-right:var(--sp-1); }
+.brand-table-wrap { overflow-x:auto; }
+.brand-nowrap { white-space:nowrap; }
+.brand-warn-h { font-weight:600; margin:var(--sp-2) 0 0; }
+.brand-warn { margin:var(--sp-1) 0 var(--sp-2); padding-left:var(--sp-5); }
 .sb-link { display:flex; align-items:center; gap:10px; padding:8px 18px; color:var(--fg);
   font-size:13.5px; border-left:3px solid transparent; cursor:pointer; user-select:none; }
 .sb-link:hover { background:var(--hover); }
@@ -226,6 +257,14 @@ button.tab:focus-visible { outline-offset:-2px; }
 .banner { border:1px solid var(--warn); background:color-mix(in srgb, var(--warn) 12%, var(--panel));
   border-radius:8px; padding:10px 12px; margin:8px 0; font-size:13px; display:flex;
   gap:10px; align-items:center; flex-wrap:wrap; }
+/* Live updates: "Updated by … — Refresh" under the top bar. The region stays (empty) on the page
+   so screen readers announce the bar; app.js sets its top to the top bar's height. */
+#livebar { position:sticky; z-index:19; }
+.livebar { display:flex; align-items:center; gap:var(--sp-2, 8px); flex-wrap:wrap;
+  margin:var(--sp-3, 12px) var(--sp-4, 16px) 0; padding:var(--sp-2, 8px) var(--sp-3, 12px);
+  background:var(--panel2); border:1px solid var(--line); border-radius:8px;
+  font-size:var(--fs-base, 14px); box-shadow:var(--shadow); }
+.livebar .livemsg { flex:1 1 9rem; }
 .toast-stack, .toast-stack > [role] { display:flex; flex-direction:column; align-items:flex-end; gap:8px; }
 .toast-stack { position:fixed; bottom:18px; right:18px; z-index:200; max-width:calc(100vw - 36px); }
 .toast { background:var(--panel);

@@ -16,10 +16,23 @@ function bytes(n){ if (n==null||n==="") return "—"; n=Number(n); if (isNaN(n))
   if (n<1024) return n+" B"; if (n<1048576) return (n/1024).toFixed(1)+" KB"; return (n/1048576).toFixed(1)+" MB"; }
 function shaShort(s){ return s ? String(s).slice(0,12)+"…" : "—"; }
 function itemName(it){ return (it && (it.description || it.part_number)) || "unnamed item"; }
+// Host admins change what the whole server shares (CAD CLI, web editor, Dutchman channel,
+// GPU policy); everyone else sees those controls read-only with this note.
+// (GET /me reports host_admin; right after sign-in ME is built from the login reply's user.)
+function isHostAdmin(){
+  if (!ME) return false;
+  if (typeof ME.host_admin === "boolean") return ME.host_admin;
+  const u = ME.user; return !!(u && u.is_host_admin && u.active && u.role === "admin"); }
+function hostOnlyNote(){ return "<p class='dim host-only'>" + (isHostAdmin()
+  ? "This applies to the whole server, not just this organization."
+  : "Only a host admin can change this. It applies to the whole server, not just this organization.") + "</p>"; }
+// Account buttons on a host admin's row: only another host admin may use them.
+function hostLock(u){ return u && u.is_host_admin && !isHostAdmin()
+  ? " disabled title='Only a host admin can change a host admin&#39;s account'" : ""; }
 function myId(){ return ME && ME.user ? ME.user.id : null; }
 function myName(){ return ME && ME.user ? (ME.user.display_name || ME.user.email) : ""; }
 function isRole(min){ const r = ME && ME.user ? ME.user.role : "viewer";
-  const L = {viewer:0, editor:1, admin:2}; return (L[r]??0) >= (L[min]??0); }
+  const L = {viewer:0, operator:1, editor:2, admin:3}; return (L[r]??0) >= (L[min]??0); }
 
 // ── state ────────────────────────────────────────────────────────────────
 let TOKEN = localStorage.getItem("pdm_token") || "";
@@ -222,6 +235,605 @@ async function attachThumbs(root){
     const u = await thumbUrl(src);
     if (u) el.innerHTML = "<img src='" + u + "' alt='' loading='lazy'>";
   }));
+}
+
+// ── organization branding ────────────────────────────────────────────────
+// An admin's display name, logo and color overrides (Settings, Branding), checked and stored by
+// the server (/settings/branding). Before sign-in, index.html links the sign-in organization's
+// /public/branding.css and init shows /public/branding's name and logo; after sign-in the user's
+// own organization's branding replaces both. Colors are token values only, written as
+// html[data-theme="…"]{--token:#rrggbb} the way the server writes them. ?nobrand in the address
+// turns the colors off for one visit.
+const BRAND_THEMES = [["dark", "Dark"], ["light", "Light"], ["slate", "Slate"], ["contrast", "High contrast"]];
+const BRAND_TOKEN_LABELS = {
+  bg:"Page background", panel:"Panels and cards", panel2:"Raised panels and fields",
+  line:"Lines and borders", fg:"Text", dim:"Muted text", acc:"Accent: links, selection, focus ring",
+  ok:"Success", err:"Error", warn:"Warning", hover:"Row under the pointer", active:"Selected row",
+  head:"Table heads", "on-acc":"Text on accent fills", "primary-bg":"Primary button",
+  "primary-border":"Primary button edge", "primary-hover":"Primary button under the pointer",
+  "primary-fg":"Primary button text", "seg-on-bg":"Selected segment", "field-line":"Form field edges",
+  "mark-dim":"Placeholder mark in empty previews", "text-2":"Secondary text",
+  "life-wip":"Lifecycle: work in progress", "life-in-review":"Lifecycle: in review",
+  "life-draft":"Lifecycle: draft", "life-released":"Lifecycle: released",
+  "life-obsolete":"Lifecycle: obsolete", "life-deprecated":"Lifecycle: deprecated",
+  "life-lock":"Lifecycle: locked"
+};
+// Pairs checked as colors are chosen, at the WCAG 2.2 AA minimums: [ink, surface, minimum, label].
+const BRAND_PAIRS = [
+  ["fg", "bg", 4.5, "Text on the page"], ["fg", "panel", 4.5, "Text on panels"],
+  ["fg", "panel2", 4.5, "Text on raised panels"], ["dim", "panel", 4.5, "Muted text on panels"],
+  ["text-2", "panel", 4.5, "Secondary text on panels"], ["acc", "panel", 4.5, "Links and accent text"],
+  ["on-acc", "acc", 4.5, "Text on accent fills (selected tabs and rows)"],
+  ["primary-fg", "primary-bg", 4.5, "Primary button text"],
+  ["ok", "panel", 4.5, "Success text"], ["err", "panel", 4.5, "Error text"],
+  ["warn", "panel", 4.5, "Warning text"], ["fg", "hover", 4.5, "Text on the row under the pointer"],
+  ["fg", "active", 4.5, "Text on selected rows"], ["dim", "head", 4.5, "Table head text"],
+  ["acc", "seg-on-bg", 4.5, "Text on the selected segment"],
+  ["primary-fg", "primary-hover", 4.5, "Primary button text under the pointer"],
+  ["life-wip", "panel", 4.5, "Lifecycle: work in progress"], ["life-in-review", "panel", 4.5, "Lifecycle: in review"],
+  ["life-draft", "panel", 4.5, "Lifecycle: draft"], ["life-released", "panel", 4.5, "Lifecycle: released"],
+  ["life-obsolete", "panel", 4.5, "Lifecycle: obsolete"], ["life-deprecated", "panel", 4.5, "Lifecycle: deprecated"],
+  ["life-lock", "panel", 4.5, "Lifecycle: locked"],
+  ["acc", "bg", 3, "Focus ring on the page"], ["field-line", "panel", 3, "Form field edges"]
+];
+let BRAND_ORG = false;   // the signed-in organization's branding is on screen; the public one must not replace it
+function brandOff(search){
+  return /[?&]nobrand(?:[=&]|$)/.test(search == null ? location.search : search);
+}
+// "#rrggbb" in lower case from "#rgb", "#rrggbb" or an opaque "rgb(…)"; null for anything else.
+function brandHex(v){
+  const s = String(v == null ? "" : v).trim().toLowerCase();
+  if (/^#[0-9a-f]{6}$/.test(s)) return s;
+  let m = s.match(/^#([0-9a-f])([0-9a-f])([0-9a-f])$/);
+  if (m) return "#" + m[1] + m[1] + m[2] + m[2] + m[3] + m[3];
+  m = s.match(/^rgba?\(\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)\s*(?:[,/]\s*([\d.]+%?)\s*)?\)$/);
+  if (m && (m[4] === undefined || m[4] === "1" || m[4] === "100%"))
+    return "#" + [m[1], m[2], m[3]].map(n => Math.min(255, Number(n)).toString(16).padStart(2, "0")).join("");
+  return null;
+}
+// WCAG 2.x contrast ratio of two colors (1 to 21), or null when either is not a plain color.
+function contrastRatio(a, b){
+  const lum = c => {
+    const h = brandHex(c); if (!h) return null;
+    const [r, g, bl] = [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255)
+      .map(x => x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4));
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+  };
+  const la = lum(a), lb = lum(b);
+  if (la == null || lb == null) return null;
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+// The pairs that fall below their minimum with `effective` (token -> color), as
+// { fg, bg, min, label, ratio }. A pair with a color that is not plain is skipped.
+function brandingWarnings(effective, pairs){
+  const out = [];
+  for (const [fg, bg, min, label] of pairs){
+    const ratio = contrastRatio(effective[fg], effective[bg]);
+    if (ratio != null && ratio < min) out.push({ fg, bg, min, label, ratio });
+  }
+  return out;
+}
+// Accent colors for each theme from one brand color: lightened on dark panels, darkened on light
+// ones, in 2% steps until it reads at 4.5:1 on every surface accent text sits on (the panel, the
+// selected segment and the selected row), with black or white text on it, whichever contrasts
+// more. High contrast is left alone unless withContrast. defaults: theme -> token -> color.
+function deriveAccent(hex, defaults, withContrast){
+  const base = brandHex(hex), out = {};
+  if (!base) return out;
+  const mix = (a, b, t) => "#" + [1, 3, 5].map(i => {
+    const x = parseInt(a.slice(i, i + 2), 16), y = parseInt(b.slice(i, i + 2), 16);
+    return Math.round(x + (y - x) * t).toString(16).padStart(2, "0");
+  }).join("");
+  for (const theme of ["dark", "light", "slate", "contrast"]){
+    if (theme === "contrast" && !withContrast) continue;
+    const set = (defaults || {})[theme] || {}, panel = brandHex(set.panel);
+    if (!panel) continue;
+    const surfaces = [panel, brandHex(set["seg-on-bg"]), brandHex(set.active)].filter(Boolean);
+    const worst = c => Math.min(...surfaces.map(s => contrastRatio(c, s)));
+    const toward = contrastRatio(panel, "#ffffff") > contrastRatio(panel, "#000000") ? "#ffffff" : "#000000";
+    let acc = base;
+    for (let step = 1; step <= 50 && worst(acc) < 4.5; step++) acc = mix(base, toward, step * 0.02);
+    const onAcc = contrastRatio("#000000", acc) >= contrastRatio("#ffffff", acc) ? "#000000" : "#ffffff";
+    out[theme] = { acc, "on-acc": onAcc };
+  }
+  return out;
+}
+// The stylesheet for color overrides, built like the server's /public/branding.css: one rule per
+// theme, html[data-theme="…"]{--token:#rrggbb;…}, from allow-listed themes and tokens and #rrggbb
+// values only, in a stable order.
+function brandCss(colors, tokens){
+  const allowed = new Set((tokens || []).filter(t => /^[a-z0-9-]+$/.test(t)));
+  let out = "";
+  for (const theme of Object.keys(colors || {}).sort()){
+    if (!["dark", "light", "slate", "contrast"].includes(theme)) continue;
+    const set = colors[theme] || {};
+    const decls = Object.keys(set).sort()
+      .filter(k => allowed.has(k) && /^#[0-9a-fA-F]{6}$/.test(String(set[k])))
+      .map(k => "--" + k + ":" + String(set[k]).toLowerCase());
+    if (decls.length) out += "html[data-theme=\"" + theme + "\"]{" + decls.join(";") + "}\n";
+  }
+  return out;
+}
+// The `colors` of PUT /settings/branding that turns the saved overrides into the pending ones:
+// new and changed tokens with their value, removed ones as null, a theme left with none as null.
+function brandColorPatch(saved, pending){
+  const out = {};
+  for (const theme of ["dark", "light", "slate", "contrast"]){
+    const s = (saved || {})[theme] || {}, p = (pending || {})[theme] || {};
+    if (!Object.keys(p).length){ if (Object.keys(s).length) out[theme] = null; continue; }
+    const t = {};
+    for (const k of Object.keys(p)) if (p[k] !== s[k]) t[k] = p[k];
+    for (const k of Object.keys(s)) if (!(k in p)) t[k] = null;
+    if (Object.keys(t).length) out[theme] = t;
+  }
+  return out;
+}
+// Shows an organization's name and logo in place of the product's: sidebar, sign-in card, tab
+// title and, when chosen, the tab icon. b = { name, showName, logoSrc, faviconSrc }, or null for
+// the product's own. The name goes in as text, never as HTML. A logo that fails to load falls
+// back to the mark and the name.
+function applyBrandIdentity(b, doc){
+  const name = (b && b.name) || "Foundry PDM";
+  const logo = (b && b.logoSrc) || "";
+  const showName = !logo || b.showName !== false;
+  const names = [...doc.querySelectorAll("[data-brand-name]")];
+  for (const el of names){ el.textContent = name; el.title = name; el.hidden = !showName; }
+  for (const el of doc.querySelectorAll("[data-brand-mark]")){
+    el.textContent = "";
+    el.classList.toggle("has-logo", Boolean(logo));
+    el.classList.toggle("logo-only", Boolean(logo) && !showName);
+    if (!logo){ el.textContent = "⬢"; continue; }
+    const img = doc.createElement("img");
+    img.className = "brand-logo";
+    img.alt = showName ? "" : name;
+    img.onerror = () => {
+      if (img.parentNode !== el) return;   // already replaced by a newer logo
+      el.textContent = "⬢"; el.classList.toggle("has-logo", false); el.classList.toggle("logo-only", false);
+      for (const n of names) n.hidden = false;
+    };
+    img.src = logo;
+    el.appendChild(img);
+  }
+  doc.title = name + " — Workspace";
+  const fav = doc.getElementById("favicon");
+  if (fav){
+    if (!fav.dataset.productHref) fav.dataset.productHref = fav.getAttribute("href");
+    fav.setAttribute("href", (b && b.faviconSrc) || fav.dataset.productHref);
+  }
+}
+// The signed-in organization's colors as a <style> after style.css; the sign-in organization's
+// #brand-css is switched off, since the signed-in one always wins. Nothing with ?nobrand.
+function applyBrandColors(colors, tokens, doc, search){
+  const link = doc.getElementById("brand-css");
+  if (link) link.disabled = true;
+  let el = doc.getElementById("org-brand");
+  if (brandOff(search)){ if (el) el.remove(); return; }
+  if (!el){ el = doc.createElement("style"); el.id = "org-brand"; doc.head.appendChild(el); }
+  el.textContent = brandCss(colors, tokens);
+}
+// Before sign-in: the sign-in organization's name and logo (its colors come from #brand-css).
+function loadPublicBranding(){
+  api("GET", "/public/branding").then(b => {
+    if (BRAND_ORG || !b) return;
+    applyBrandIdentity({ name: b.display_name, showName: b.show_name_with_logo !== false,
+      logoSrc: b.logo_url, faviconSrc: b.favicon_url }, document);
+  }).catch(() => {});
+}
+// After sign-in (and after each branding change): the user's organization's branding. A server
+// without branding keeps the product's.
+async function loadOrgBranding(view){
+  if (!view){
+    try { view = await api("GET", "/settings/branding"); }
+    catch(e){
+      // Signed in, but the organization's branding could not be read: show the product's own,
+      // not the sign-in organization's, which may be another organization's.
+      BRAND_ORG = true;
+      applyBrandIdentity(null, document);
+      const link = document.getElementById("brand-css");
+      if (link) link.disabled = true;
+      return null;
+    }
+  }
+  BRAND_ORG = true;
+  const logoSrc = view.logo ? await thumbUrl(view.logo.url) : null;
+  applyBrandIdentity({ name: view.display_name, showName: view.show_name_with_logo !== false,
+    logoSrc, faviconSrc: view.favicon_from_logo ? logoSrc : null }, document);
+  applyBrandColors(view.colors, view.tokens, document);
+  if (brandOff() && !loadOrgBranding.told){
+    loadOrgBranding.told = true;
+    toast("Organization colors are off for this visit. Remove ?nobrand from the address to turn them back on.", "ok");
+  }
+  return view;
+}
+// Each token's color in `theme` with `overrides` (token -> color) applied, as the browser computes
+// it: style.css holds the defaults, so they are read back, not copied here. Branding rules match
+// <html> only, so this probe always starts from the defaults.
+function themeColors(theme, tokens, overrides, doc){
+  const probe = doc.createElement("div");
+  probe.setAttribute("data-theme", theme);
+  probe.hidden = true;
+  for (const [k, val] of Object.entries(overrides || {})) probe.style.setProperty("--" + k, val);
+  doc.body.appendChild(probe);
+  const cs = getComputedStyle(probe), out = {};
+  for (const t of tokens || []){ const hex = brandHex(cs.getPropertyValue("--" + t)); if (hex) out[t] = hex; }
+  probe.remove();
+  return out;
+}
+// Canvas size for a logo that is redrawn: about 160 px tall, at most 2048 px wide and at least 16 px
+// each way; an image without a size of its own (some SVGs) is drawn 160 px square.
+function logoCanvasSize(w, h){
+  if (!(w > 0 && h > 0)) return { w: 160, h: 160 };
+  let ch = 160, cw = Math.round(w * ch / h);
+  if (cw > 2048){ cw = 2048; ch = Math.max(16, Math.round(h * cw / w)); }
+  return { w: Math.max(16, cw), h: ch };
+}
+// The file to upload as the logo. PNG and WebP go as they are when the server takes them (at
+// most 256 KB and 2048 px, at least 16 px); SVG, and anything larger, is redrawn as a PNG about
+// 160 px tall that keeps its transparency. An SVG is only ever loaded as an image, so any
+// script in it never runs.
+async function prepareLogo(file){
+  const svg = file.type === "image/svg+xml" || /\.svg$/i.test(file.name || "");
+  if (!svg && file.type !== "image/png" && file.type !== "image/webp")
+    throw new Error("choose a PNG, WebP or SVG file.");
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = () => reject(new Error("that file could not be read as an image."));
+      i.src = url;
+    });
+    const w = img.naturalWidth, h = img.naturalHeight;
+    if (!svg && (w < 16 || h < 16)) throw new Error("the image is " + w + " × " + h + " px; it needs at least 16 px each way.");
+    if (!svg && file.size <= 256 * 1024 && w <= 2048 && h <= 2048) return file;
+    const size = logoCanvasSize(w, h);
+    const canvas = document.createElement("canvas");
+    canvas.width = size.w; canvas.height = size.h;
+    canvas.getContext("2d").drawImage(img, 0, 0, size.w, size.h);
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
+    if (!blob) throw new Error("that image could not be converted to PNG.");
+    if (blob.size > 256 * 1024) throw new Error("the converted logo is larger than 256 KB; try a simpler image.");
+    return blob;
+  } finally { URL.revokeObjectURL(url); }
+}
+
+// Settings, Branding (admins only): mounted under the page head by viewSettings. Unsaved edits are
+// kept in BRAND_EDIT, so a re-render of Settings (the theme picker, Refresh, another card's save)
+// does not lose them.
+let BRAND_EDIT = null;
+async function mountBrandingCard(v, focusHead){
+  const head = v.querySelector(".head");
+  if (!head) return;
+  const sec = document.createElement("section");
+  sec.setAttribute("aria-labelledby", "brand-sec-h");
+  sec.innerHTML = "<h2 class='sec' id='brand-sec-h' tabindex='-1'>Branding</h2><div class='card' id='brand-card'><p class='dim'>Loading branding…</p></div>";
+  head.after(sec);
+  if (focusHead) sec.querySelector("#brand-sec-h").focus();
+  const card = sec.querySelector("#brand-card");
+  let view;
+  try { view = await api("GET", "/settings/branding"); }
+  catch(e){
+    if (!card.isConnected) return;
+    if (e.status === 404){
+      card.innerHTML = "<p class='dim'>This server does not support branding yet. Update the server to set a name, logo and colors here.</p>";
+      return;
+    }
+    card.innerHTML = "<p class='errtext' role='alert'>Couldn't load the branding settings: " + esc(e.message) + "</p>" +
+      "<button type='button' id='brand-retry'>Retry</button>";
+    card.querySelector("#brand-retry").onclick = () => { sec.remove(); mountBrandingCard(v, true); };
+    return;
+  }
+  if (!card.isConnected) return;
+  renderBrandEditor(card, brandEditState(view));
+}
+// The editor's state for `view`. A draft from before a re-render is kept: typed name and logo
+// options always, pending colors when they were made against the same saved colors.
+function brandEditState(view){
+  const prev = BRAND_EDIT;
+  const st = { view, theme: currentTheme(), colors: brandCopy(view.colors), defaults: {},
+    allOpen: false, accentHc: false, draft: {} };
+  if (prev){
+    st.draft = prev.draft;
+    if (JSON.stringify(prev.view.colors || {}) === JSON.stringify(view.colors || {}))
+      Object.assign(st, { theme: prev.theme, colors: prev.colors, allOpen: prev.allOpen, accentHc: prev.accentHc });
+  }
+  if (!BRAND_THEMES.some(([id]) => id === st.theme)) st.theme = "dark";
+  for (const [t] of BRAND_THEMES) st.defaults[t] = themeColors(t, view.tokens, null, document);
+  BRAND_EDIT = st;
+  return st;
+}
+function brandCopy(colors){
+  const out = {};
+  for (const [t, m] of Object.entries(colors || {})) out[t] = { ...m };
+  return out;
+}
+function renderBrandEditor(card, st){
+  const b = st.view, logo = b.logo, d = st.draft;
+  const showName = "show" in d ? d.show : b.show_name_with_logo !== false;
+  const favicon = "fav" in d ? d.fav : Boolean(b.favicon_from_logo);
+  card.innerHTML =
+    "<p class='dim'>Shown to everyone in this organization: in the sidebar, on the sign-in page and in the browser tab.</p>" +
+    "<p class='dim'>" + (b.signin_org
+      ? "Sign-in page: shows this branding. Anyone who can reach this server sees the name and logo there."
+      : "Sign-in page: shows the default name and colors. On a server with several organizations, the server setting PDM_SIGNIN_ORG chooses which one it shows.") + "</p>" +
+    "<h3 class='brand-h'>Name</h3>" +
+    "<div class='modal-field'><label for='brand-name'>Display name</label>" +
+    "<input id='brand-name' maxlength='60' placeholder='Foundry PDM' value='" + esc("name" in d ? d.name : (b.display_name || "")) + "' aria-describedby='brand-name-hint brand-name-err'>" +
+    "<p class='dim' id='brand-name-hint'>Replaces the product name in the sidebar, on the sign-in page and in the browser tab. Up to 60 characters; empty shows Foundry PDM.</p>" +
+    "<p class='errtext' id='brand-name-err' role='alert'></p></div>" +
+    "<div class='row'><button type='button' id='brand-name-save'>Save name</button><span class='dim' id='brand-name-status' role='status'></span></div>" +
+    "<h3 class='brand-h'>Logo</h3>" +
+    "<div class='brand-tiles'>" + BRAND_THEMES.map(([t, label]) =>
+      "<div class='brand-tile' data-theme='" + t + "'>" + (logo
+        ? "<img class='brand-logo' data-brand-tile alt='Logo on the " + esc(label) + " theme'>"
+        : "<span class='muted'>" + esc(label) + ": no logo, the mark and name are shown</span>") + "</div>").join("") + "</div>" +
+    "<p class='dim'>" + (logo ? esc(logo.width + " × " + logo.height + " px, " + (logo.mime === "image/webp" ? "WebP" : "PNG") + ", " + bytes(logo.bytes)) + ". " : "") +
+    "PNG or WebP up to 256 KB; an SVG is converted to PNG in your browser. The logo is shown up to 28 px tall in the sidebar and 40 px on the sign-in page, so upload at least twice that. " +
+    "The tiles show it on each theme's panels, with this organization's colors.</p>" +
+    "<div class='row'><input type='file' id='brand-file' accept='.png,.webp,.svg,image/png,image/webp,image/svg+xml' hidden>" +
+    "<button type='button' id='brand-upload'>" + (logo ? "Replace logo…" : "Upload logo…") + "</button>" +
+    (logo ? "<button type='button' class='danger' id='brand-logo-remove'>Remove logo</button>" : "") +
+    "<span class='dim' id='brand-logo-status' role='status'></span></div>" +
+    "<p class='errtext' id='brand-logo-err' role='alert'></p>" +
+    "<div class='row'><label><input type='checkbox' id='brand-showname'" + (showName ? " checked" : "") + "> Show the name next to the logo</label></div>" +
+    "<div class='row'><label><input type='checkbox' id='brand-favicon'" + (favicon ? " checked" : "") + "> Use the logo as the browser tab icon</label></div>" +
+    "<div class='row'><button type='button' id='brand-opts-save'>Save logo options</button><span class='dim' id='brand-opts-status' role='status'></span></div>" +
+    "<p class='errtext' id='brand-opts-err' role='alert'></p>" +
+    "<h3 class='brand-h'>Colors</h3><div id='brand-colors'></div>" +
+    "<h3 class='brand-h'>Reset</h3>" +
+    "<div class='row'><button type='button' class='danger' id='brand-reset'>Reset all branding</button></div>" +
+    "<p class='dim'>Removes the name, the logo and the color overrides of every theme. If the colors ever make the workspace hard to read, " +
+    "add <span class='mono brand-nowrap'>?nobrand</span> to the address, before the #, to turn them off for that visit.</p>";
+  if (logo) thumbUrl(logo.url).then(u => { if (u) card.querySelectorAll("[data-brand-tile]").forEach(img => { img.src = u; }); });
+
+  const input = card.querySelector("#brand-name");
+  input.oninput = () => { d.name = input.value; };
+  card.querySelector("#brand-showname").onchange = e => { d.show = e.target.checked; };
+  card.querySelector("#brand-favicon").onchange = e => { d.fav = e.target.checked; };
+  // Saves one part of the settings: busy, then "Saved." or the error under the part.
+  const saveButton = (id, label, statusId, errId, body, done) => {
+    const btn = card.querySelector(id);
+    btn.onclick = async () => {
+      if (btn.disabled) return;
+      const status = card.querySelector(statusId), err = card.querySelector(errId);
+      status.textContent = ""; err.textContent = "";
+      btn.disabled = true; btn.textContent = "Saving…";
+      try {
+        st.view = await api("PUT", "/settings/branding", body());
+        done();
+        await loadOrgBranding(st.view);
+        status.textContent = "Saved.";
+      } catch(e){ err.textContent = "Couldn't save: " + e.message; }
+      finally { btn.disabled = false; btn.textContent = label; }
+    };
+  };
+  saveButton("#brand-name-save", "Save name", "#brand-name-status", "#brand-name-err",
+    () => ({ display_name: input.value.trim() || null }), () => { delete d.name; });
+  saveButton("#brand-opts-save", "Save logo options", "#brand-opts-status", "#brand-opts-err",
+    () => ({ show_name_with_logo: card.querySelector("#brand-showname").checked,
+      favicon_from_logo: card.querySelector("#brand-favicon").checked }),
+    () => { delete d.show; delete d.fav; });
+
+  const file = card.querySelector("#brand-file"), up = card.querySelector("#brand-upload");
+  up.onclick = () => { if (!up.disabled) file.click(); };
+  file.onchange = async () => {
+    const f = file.files && file.files[0];
+    file.value = "";
+    if (!f || up.disabled) return;
+    const err = card.querySelector("#brand-logo-err"), label = up.textContent;
+    err.textContent = "";
+    up.disabled = true; up.textContent = "Uploading…";
+    try {
+      const blob = await prepareLogo(f);
+      st.view = await api("PUT", "/settings/branding/logo", undefined, blob);
+      await loadOrgBranding(st.view);
+      if (!card.isConnected) return;
+      renderBrandEditor(card, st);
+      card.querySelector("#brand-logo-status").textContent = "Logo saved.";
+      card.querySelector("#brand-upload").focus();
+    } catch(e){
+      err.textContent = "Couldn't upload the logo: " + e.message;
+      up.disabled = false; up.textContent = label; up.focus();
+    }
+  };
+  const rm = card.querySelector("#brand-logo-remove");
+  if (rm) rm.onclick = async () => {
+    const view = await openModal("Remove the logo?", [], { label:"Remove logo", busyLabel:"Removing…", danger:true,
+      onSubmit: () => api("DELETE", "/settings/branding/logo") },
+      "<p>The sidebar and the sign-in page go back to the mark and the name. To undo, upload the logo again.</p>");
+    if (!view) return;
+    st.view = view;
+    await loadOrgBranding(view);
+    if (!card.isConnected) return;
+    renderBrandEditor(card, st);
+    card.querySelector("#brand-logo-status").textContent = "Logo removed.";
+    card.querySelector("#brand-upload").focus();
+  };
+  card.querySelector("#brand-reset").onclick = async () => {
+    const view = await openModal("Reset all branding?", [], { label:"Reset branding", busyLabel:"Resetting…", danger:true,
+      onSubmit: () => api("DELETE", "/settings/branding") },
+      "<p>The display name, the logo and the color overrides of all four themes are removed for everyone in this organization.</p>");
+    if (!view) return;
+    st.view = view; st.colors = {}; st.draft = {};
+    await loadOrgBranding(view);
+    if (!card.isConnected) return;
+    renderBrandEditor(card, st);
+    card.querySelector("#brand-reset").focus();
+  };
+  renderBrandColors(card, st);
+}
+function brandEffective(st, theme){
+  return themeColors(theme, st.view.tokens, st.colors[theme], document);
+}
+function brandDirty(st){
+  return Object.keys(brandColorPatch(st.view.colors, st.colors)).length > 0;
+}
+// CSS that previews the pending colors: on the sample and logo tiles of every theme, and, with
+// pageToo, on the page itself. The page rules match only while the Branding card is on the page
+// (:has), so leaving Settings ends the preview, and their specificity beats the saved colors'
+// rules whatever the order. An override being removed shows what the token falls back to.
+// eff: theme -> token -> color with the pending overrides applied.
+function brandPreviewCss(saved, pending, eff, tokens, pageToo){
+  let css = "";
+  for (const t of ["dark", "light", "slate", "contrast"]){
+    const pend = (pending || {})[t] || {}, set = { ...pend };
+    for (const k of Object.keys((saved || {})[t] || {}))
+      if (!(k in pend) && eff && eff[t] && eff[t][k]) set[k] = eff[t][k];
+    const rule = brandCss({ [t]: set }, tokens);
+    if (!rule) continue;
+    const body = rule.slice(rule.indexOf("{"));
+    css += ".brand-sample[data-theme=\"" + t + "\"], .brand-tile[data-theme=\"" + t + "\"]" + body;
+    if (pageToo) css += "html[data-theme=\"" + t + "\"]:has(#brand-card)" + body;
+  }
+  return css;
+}
+function brandPreview(st){
+  const eff = {};
+  for (const [t] of BRAND_THEMES) eff[t] = brandEffective(st, t);
+  const css = brandPreviewCss(st.view.colors, st.colors, eff, st.view.tokens, !brandOff());
+  let el = $("brand-preview");
+  if (!css){ if (el) el.remove(); return; }
+  if (!el){ el = document.createElement("style"); el.id = "brand-preview"; document.head.appendChild(el); }
+  el.textContent = css;
+}
+function renderBrandColors(card, st){
+  const box = card.querySelector("#brand-colors");
+  if (!box) return;
+  const t = st.theme, tokens = st.view.tokens || [], pend = st.colors[t] || {};
+  const label = (BRAND_THEMES.find(([id]) => id === t) || [t, t])[1];
+  const eff = brandEffective(st, t), defs = st.defaults[t] || {};
+  box.innerHTML =
+    "<p class='dim'>Each theme keeps its own colors, high contrast included. Text that falls below WCAG AA is listed as you choose; saving still works.</p>" +
+    "<div class='row'><span class='dim' id='brand-theme-l'>Theme</span><div class='seg' role='group' aria-labelledby='brand-theme-l'>" +
+    BRAND_THEMES.map(([id, name]) => "<button type='button' data-brand-theme='" + id + "' aria-pressed='" + (id === t) + "'" +
+      (id === t ? " class='on'" : "") + ">" + esc(name) + "</button>").join("") + "</div></div>" +
+    "<div class='row'><label for='brand-accent'>Brand accent</label>" +
+    "<input type='color' class='brand-color' id='brand-accent' value='" + esc(eff.acc || "#000000") + "'>" +
+    "<label><input type='checkbox' id='brand-accent-hc'" + (st.accentHc ? " checked" : "") + "> Include high contrast</label>" +
+    "<button type='button' id='brand-accent-apply'>Apply to all themes</button></div>" +
+    "<p class='dim'>Sets each theme's accent from one color, lightened or darkened until it reads at 4.5:1 on that theme's panels, with black or white text on it. Save colors to keep it.</p>" +
+    "<div class='brand-samples' aria-hidden='true'>" + BRAND_THEMES.map(([id, name]) =>
+      "<div class='brand-sample' data-theme='" + id + "'><strong>" + esc(name) + "</strong>" +
+      "<span>Body text</span><span class='muted'>Muted text</span><span class='brand-s-acc'>Link text</span>" +
+      "<span><span class='brand-s-fill'>Selected</span> <span class='brand-s-btn'>Primary</span></span>" +
+      "<span><span class='brand-s-ok'>Released</span> · <span class='brand-s-warn'>Check</span> · <span class='brand-s-err'>Failed</span></span></div>").join("") +
+    "</div>" +
+    "<div id='brand-warn' role='status'></div>" +
+    "<details id='brand-all'" + (st.allOpen ? " open" : "") + "><summary>All colors: " + esc(label) + "</summary>" +
+    "<div class='brand-table-wrap'><table><thead><tr><th>Color</th><th>Default</th><th>This organization</th><th></th></tr></thead><tbody>" +
+    tokens.map(k => {
+      const changed = k in pend, name = BRAND_TOKEN_LABELS[k] || k;
+      return "<tr data-brand-token='" + esc(k) + "'><td><label for='bc-" + esc(k) + "'>" + esc(name) + "</label> <span class='dim mono'>--" + esc(k) + "</span></td>" +
+        "<td class='mono'>" + esc(defs[k] || "—") + "</td>" +
+        "<td><input type='color' class='brand-color' id='bc-" + esc(k) + "' value='" + esc(eff[k] || "#000000") + "'> <span class='mono' data-brand-value>" + (changed ? esc(pend[k]) : "") + "</span></td>" +
+        "<td><span class='brand-changed' data-brand-changed" + (changed ? "" : " hidden") + ">Changed</span> " +
+        "<button type='button' class='small' data-brand-token-reset='" + esc(k) + "'" + (changed ? "" : " disabled") +
+        " aria-label='Reset " + esc(name) + " to default'>Reset</button></td></tr>";
+    }).join("") +
+    "</tbody></table></div></details>" +
+    "<div class='row'><button type='button' id='brand-colors-save'>Save colors</button>" +
+    "<button type='button' id='brand-colors-discard'>Discard changes</button>" +
+    "<button type='button' id='brand-theme-reset'>Reset " + esc(label) + " to defaults</button>" +
+    "<span class='dim' id='brand-colors-status' role='status'>" + (brandDirty(st) ? "Unsaved changes" : "") + "</span></div>" +
+    "<p class='errtext' id='brand-colors-err' role='alert'></p>";
+  const again = focusId => { renderBrandColors(card, st); const el = card.querySelector(focusId); if (el) el.focus(); };
+  box.querySelectorAll("[data-brand-theme]").forEach(b => b.onclick = () => {
+    st.theme = b.dataset.brandTheme; again("[data-brand-theme='" + st.theme + "']");
+  });
+  box.querySelector("#brand-all").ontoggle = e => { st.allOpen = e.target.open; };
+  box.querySelector("#brand-accent-hc").onchange = e => { st.accentHc = e.target.checked; };
+  box.querySelector("#brand-accent-apply").onclick = () => {
+    // Measured on each theme's panel as this organization has it, pending changes included.
+    const panels = {};
+    for (const [id] of BRAND_THEMES) panels[id] = brandEffective(st, id);
+    const derived = deriveAccent(box.querySelector("#brand-accent").value, panels, st.accentHc);
+    for (const [theme, set] of Object.entries(derived)) st.colors[theme] = { ...(st.colors[theme] || {}), ...set };
+    again("#brand-accent-apply");
+  };
+  box.querySelectorAll("tr[data-brand-token]").forEach(tr => {
+    const k = tr.dataset.brandToken, inp = tr.querySelector("input[type=color]");
+    inp.oninput = () => {
+      st.colors[t] = st.colors[t] || {};
+      st.colors[t][k] = inp.value.toLowerCase();
+      tr.querySelector("[data-brand-value]").textContent = st.colors[t][k];
+      tr.querySelector("[data-brand-changed]").hidden = false;
+      tr.querySelector("[data-brand-token-reset]").disabled = false;
+      box.querySelector("#brand-colors-status").textContent = brandDirty(st) ? "Unsaved changes" : "";
+      brandPreview(st);
+    };
+    inp.onchange = () => refreshBrandWarnings(card, st);
+    tr.querySelector("[data-brand-token-reset]").onclick = () => {
+      if (st.colors[t]) delete st.colors[t][k];
+      st.allOpen = true;
+      again("#bc-" + k);
+    };
+  });
+  box.querySelector("#brand-colors-discard").onclick = () => { st.colors = brandCopy(st.view.colors); again("#brand-colors-discard"); };
+  box.querySelector("#brand-theme-reset").onclick = () => { delete st.colors[t]; again("#brand-theme-reset"); };
+  box.querySelector("#brand-colors-save").onclick = () => saveBrandColors(card, st);
+  refreshBrandWarnings(card, st);
+  brandPreview(st);
+}
+// Contrast warnings for the theme being edited (with a fix for text on fills) and a count for the
+// others. They never stop a save.
+function refreshBrandWarnings(card, st){
+  const box = card.querySelector("#brand-warn");
+  if (!box) return;
+  const all = BRAND_THEMES.map(([id, name]) => {
+    const eff = brandEffective(st, id);
+    return { id, name, eff, warn: brandingWarnings(eff, BRAND_PAIRS) };
+  });
+  const cur = all.find(x => x.id === st.theme);
+  const ink = bg => contrastRatio("#000000", bg) >= contrastRatio("#ffffff", bg) ? "#000000" : "#ffffff";
+  const others = all.filter(x => x.id !== st.theme && x.warn.length).map(x => x.name + ": " + x.warn.length);
+  box.innerHTML = (cur.warn.length
+    ? "<p class='brand-warn-h'>Contrast warnings, " + esc(cur.name) + ":</p><ul class='brand-warn'>" + cur.warn.map(w =>
+      "<li>" + esc(w.label) + ": " + (Math.floor(w.ratio * 100) / 100).toFixed(2) + ":1, needs " + w.min + ":1" +
+      ((w.fg === "on-acc" || w.fg === "primary-fg")
+        ? " <button type='button' class='small' data-brand-fix='" + w.fg + "' data-ink='" + ink(cur.eff[w.bg]) + "'>Use " +
+          (ink(cur.eff[w.bg]) === "#000000" ? "black" : "white") + " text</button>" : "") + "</li>").join("") + "</ul>"
+    : "<p class='dim'>No contrast warnings for " + esc(cur.name) + ".</p>") +
+    (others.length ? "<p class='dim'>Other themes with warnings: " + esc(others.join(", ")) + ".</p>" : "");
+  box.querySelectorAll("[data-brand-fix]").forEach(b => b.onclick = () => {
+    st.colors[st.theme] = { ...(st.colors[st.theme] || {}), [b.dataset.brandFix]: b.dataset.ink };
+    renderBrandColors(card, st);
+    const save = card.querySelector("#brand-colors-save"); if (save) save.focus();
+  });
+}
+// Saves the pending colors. With contrast warnings it asks first (it never refuses). While the
+// request runs the colors editor is inert, so nothing can be changed or sent twice.
+async function saveBrandColors(card, st){
+  const box = card.querySelector("#brand-colors");
+  if (!box || st.saving) return;
+  const patch = brandColorPatch(st.view.colors, st.colors);
+  if (!Object.keys(patch).length){ card.querySelector("#brand-colors-status").textContent = "No changes to save."; return; }
+  card.querySelector("#brand-colors-err").textContent = "";
+  const warned = BRAND_THEMES.map(([id, name]) => [name, brandingWarnings(brandEffective(st, id), BRAND_PAIRS).length])
+    .filter(([, n]) => n > 0).map(([name, n]) => name + ": " + n + (n === 1 ? " pair" : " pairs"));
+  const send = () => api("PUT", "/settings/branding", { colors: patch });
+  let view = null;
+  if (warned.length){
+    view = await openModal("Save colors with contrast warnings?", [], { label:"Save colors anyway", busyLabel:"Saving…", onSubmit: send },
+      "<p>Some text falls below WCAG AA (" + esc(warned.join(", ")) + "), so people may find it hard to read. You can change the colors again at any time.</p>");
+    if (!view) return;
+  } else {
+    const btn = card.querySelector("#brand-colors-save");
+    st.saving = true; box.inert = true; btn.textContent = "Saving…";
+    try { view = await send(); }
+    catch(e){
+      box.inert = false; btn.textContent = "Save colors";
+      const err = card.querySelector("#brand-colors-err");
+      if (err) err.textContent = "Couldn't save the colors: " + e.message;
+      return;
+    } finally { st.saving = false; }
+  }
+  st.view = view; st.colors = brandCopy(view.colors);
+  applyBrandColors(view.colors, view.tokens, document);
+  if (!card.isConnected) return;
+  box.inert = false;
+  renderBrandColors(card, st);
+  card.querySelector("#brand-colors-status").textContent = "Colors saved.";
+  card.querySelector("#brand-colors-save").focus();
 }
 
 // ── file kinds / badges ──────────────────────────────────────────────────
@@ -462,14 +1074,32 @@ async function signin(){
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username: email, password: pw, ...(org ? { org } : {}) }) });
     const d = await r.json().catch(()=>({}));
-    if (!r.ok) throw new Error((d.error && d.error.message) || ("HTTP " + r.status));
+    if (!r.ok){
+      if (signinNeedsOrg(r.status, d, org)){ authBusy(false); showOrgField(); return; }
+      throw new Error(r.status === 401 ? (org ? "the email, password or organization is not right" : "the email or password is not right") :
+        (d.error && d.error.message) || ("HTTP " + r.status));
+    }
     TOKEN = d.token; localStorage.setItem("pdm_token", TOKEN);
     $("login_password").value = "";
-    $("tokval").textContent = TOKEN;
-    $("tokshow").classList.remove("hidden");
     ME = { org_id: d.org && d.org.id, user: d.user, scopes: "full" };
     enterWorkspace();
   } catch(e){ authBusy(false); toast("Sign in failed: " + e.message, "err"); }
+}
+
+// /auth/login answers 400 bad_request when the email exists in several organizations
+// and none was named (its only 400 for a well-formed request); ask for the organization.
+function signinNeedsOrg(status, d, org){
+  return status === 400 && !org && !!(d && d.error && d.error.code === "bad_request");
+}
+function showOrgField(){
+  const f = $("login_org_f");
+  f.hidden = false;
+  $("login_org").required = true;
+  $("login_org").focus();
+  // A different email may belong to one organization only: ask again if it does not.
+  $("login_email").addEventListener("input", () => {
+    f.hidden = true; $("login_org").required = false; $("login_org").value = "";
+  }, { once: true });
 }
 
 async function signout(){
@@ -503,11 +1133,13 @@ async function enterWorkspace(){
     const parts = [d.version ? "v" + d.version : null, d.build, d.commit].filter(Boolean);
     if (parts.length) $("buildinfo").textContent = parts.join(" · ");
   } catch(e){}
+  loadOrgBranding();
   syncNav();
   const r = routeFromHash();
   if (r){ ROUTE = r; syncNav(); render(true); }
   else go("dashboard");
   refreshApprovalsBadge();
+  liveConnect();
 }
 
 // ── routing / rendering ─────────────────────────────────────────────────
@@ -3017,7 +3649,7 @@ async function viewDashboard(v){
   if (!PROJECTS.length || !USERS.length) await loadCommon();
   const home = await api("GET", "/home").catch(() => null);
   const k = home && home.kpis ? home.kpis : null;
-  const firstRun = k && !k.items && !PROJECTS.length;
+  const guide = await gettingStartedHTML(k);
   const recent = await api("GET", "/items?limit=5&sort=modified_at&dir=desc")
     .then(d => (d.items || []).map(it => Object.assign({}, it,
       { _project: PMAP[it.project_id] ? PMAP[it.project_id].name : "—" })))
@@ -3029,17 +3661,7 @@ async function viewDashboard(v){
   v.innerHTML =
     "<div class='head'><h2>Dashboard</h2>" +
     "<span class='dim muted' id='refreshstatus'>" + refreshModeLabel() + "</span></div>" +
-    (firstRun ?
-      "<div class='card' style='margin-bottom:14px'>" +
-      "<h2 class='sec'>Get started</h2>" +
-      "<p class='dim' style='margin:0 0 10px'>Three steps and the workspace is live:</p>" +
-      "<div class='row' style='margin-bottom:6px'><b>1.</b> Create a project " +
-      "<button class='small' id='onb1'>Open projects</button></div>" +
-      "<div class='row' style='margin-bottom:6px'><b>2.</b> Upload a file into it " +
-      "<button class='small' id='onb2'>How?</button></div>" +
-      "<div class='row'><b>3.</b> Invite a teammate " +
-      "<button class='small' id='onb3'>Administration</button></div>" +
-      "</div>" : "") +
+    guide +
     kpiStrip(k) +
     "<div class='grid2'>" +
       "<div><h2 class='sec'>Activity</h2>" +
@@ -3070,10 +3692,7 @@ async function viewDashboard(v){
     c.addEventListener("click", () => go(c.dataset.knav)));
   const g = v.querySelector("[data-go='projects']");
   if (g) g.onclick = () => go("projects");
-  const o1 = $("onb1"), o2 = $("onb2"), o3 = $("onb3");
-  if (o1) o1.onclick = () => go("projects");
-  if (o2) o2.onclick = () => go("projects");
-  if (o3) o3.onclick = () => go("admin");
+  wireGettingStarted(v);
   const da = $("dallact");
   if (da) da.onclick = () => go("activity");
   v.querySelectorAll("[data-ap]").forEach(b =>
@@ -3464,6 +4083,8 @@ async function viewToolDetail(v){
   const id = ROUTE.toolid;
   const d = await api("GET", "/tools/" + id);
   TOOL.id = id; TOOL.data = d.tool; TOOL.cutting = d.cutting_data || []; TOOL.docs = d.documents || [];
+  // A draft with no edits is redrawn from the record just loaded, so others' changes show.
+  if (TOOL.draft && TOOL.draft.id === id && !TOOL.draft.dirty) TOOL.draft = null;
   const t = TOOL.data;
   const tabCount = k => k === "cutting" ? TOOL.cutting.length : k === "general" ? TOOL.docs.length : 0;
   v.innerHTML =
@@ -3472,7 +4093,8 @@ async function viewToolDetail(v){
     "<span class='dim muted'>" + esc(kindLabel(t.kind)) + " · " + esc(t.units || "mm") +
     (t.tool_number != null ? " · T" + t.tool_number : "") + "</span>" +
     "<div class='grow'></div>" +
-    "<button id='tsave' class='primary small'>Save</button>" +
+    "<span class='sec-state dim' role='status' id='tool-state'></span>" +
+    "<button id='tsave' class='primary small'>Save tool</button>" +
     "<button id='tdel' class='small'>Delete</button></div>" +
     "<div class='tabs'>" +
     [["general","General"],["cutter","Cutter"],["cutting","Cutting data"],["post","Post processor"]]
@@ -3487,12 +4109,60 @@ async function viewToolDetail(v){
     pushHash(); renderToolTab();
   }));
   $("tsave").onclick = saveTool;
+  // Typed values go into the tool's draft, so they survive a tab switch or a re-render.
+  const onEdit = e => {
+    const id = e.target && e.target.id || "";
+    if (!TOOL_FIELDS.some(f => f[0] === id) && !id.startsWith("geom-")) return; // e.g. the document file picker
+    if (captureToolInputs().touched.size){ TOOL.draft.dirty = true; toolStateText(); }
+  };
+  $("ttab").addEventListener("input", onEdit);
+  $("ttab").addEventListener("change", onEdit);
+  guardUnsavedEdits();
+  toolStateText();
   $("tdel").onclick = async () => {
     if (!confirm("Delete tool \"" + t.name + "\"? Its cutting data and documents are removed too.")) return;
     try { await api("DELETE", "/tools/" + id); toast("Tool deleted", "ok"); go("tools"); }
     catch(e){ toast("Delete tool: " + e.message, "err"); }
   };
   renderToolTab();
+}
+// One draft per tool: every tab renders from it and Save tool sends it whole. It is
+// dropped only when the tool is saved or another tool is opened.
+const TOOL_FIELDS = [["g-desc","description"],["g-vendor","vendor"],["g-pn","part_number"],["g-link","link"],
+  ["c-kind","kind"],["c-units","units"],["c-rotation","rotation"],["c-flutes","flutes"],
+  ["c-material","tool_material"],["p-tnum","tool_number"]];
+function toolDraft(){
+  if (!TOOL.draft || TOOL.draft.id !== TOOL.id){
+    const t = Object.assign({}, TOOL.data || {});
+    t.dimensions = Object.assign({}, t.dimensions || {});
+    TOOL.draft = { id: TOOL.id, t, dirty: false, touched: new Set() };
+  }
+  return TOOL.draft;
+}
+// Copy whichever editor fields are on screen into the draft, noting the ones that changed:
+// only those are sent, so a save never writes back values someone else changed meanwhile.
+function captureToolInputs(){
+  const d = toolDraft();
+  const shown = v => String(v ?? "");
+  for (const [id, key] of TOOL_FIELDS){
+    const el = $(id);
+    if (el && el.value !== shown(d.t[key])){ d.t[key] = el.value; d.touched.add(key); }
+  }
+  const tab = $("ttab");
+  if (tab) tab.querySelectorAll("[id^='geom-']").forEach(el => {
+    const k = el.id.slice(5);
+    if (el.value !== shown(d.t.dimensions[k])){ d.t.dimensions[k] = el.value; d.touched.add("dimensions"); }
+  });
+  return d;
+}
+
+function toolStateText(text){
+  const s = $("tool-state");
+  if (!s) return;
+  const dirty = !!(TOOL.draft && TOOL.draft.id === TOOL.id && TOOL.draft.dirty);
+  const next = text || (dirty ? "Unsaved changes" : "");
+  if (s.textContent !== next) s.textContent = next; // live region: only on a change
+  s.classList.toggle("unsaved", dirty && !text);
 }
 function renderToolTab(){
   const v = $("ttab");
@@ -3506,7 +4176,7 @@ function tf(label, inputHtml){
   return "<div class='tfield'><label>" + label + "</label>" + inputHtml + "</div>";
 }
 function renderToolGeneral(v){
-  const t = TOOL.data;
+  const t = toolDraft().t;
   v.innerHTML =
     "<div class='card'>" +
     tf("Description", "<textarea id='g-desc' rows='3'>" + esc(t.description || "") + "</textarea>") +
@@ -3515,7 +4185,7 @@ function renderToolGeneral(v){
     tf("Part number", "<input id='g-pn' class='mono' value='" + esc(t.part_number || "") + "' placeholder='optional'>") +
     tf("Link", "<input id='g-link' value='" + esc(t.link || "") + "' placeholder='https://…'>") +
     "</div>" +
-    "<div style='margin-top:14px'><button id='tsave2' class='primary small'>Save general</button></div></div>" +
+    "<div style='margin-top:14px'><button id='tsave2' class='small'>Save tool</button></div></div>" +
     "<div class='card' style='margin-top:12px'><h2 class='sec'>Documents (" + TOOL.docs.length + ")</h2>" +
     (TOOL.docs.length ?
       "<table><thead><tr><th>Name</th><th>Size</th><th>Added</th><th></th></tr></thead><tbody>" +
@@ -3545,7 +4215,7 @@ function renderToolGeneral(v){
     });
 }
 function renderToolCutter(v){
-  const t = TOOL.data;
+  const t = toolDraft().t;
   const dims = t.dimensions || {};
   const geoms = TOOL_GEOMETRY[t.kind] || [];
   v.innerHTML =
@@ -3578,8 +4248,8 @@ function renderToolCutter(v){
         "<input id='geom-" + g[0] + "' type='number' step='any' value='" +
         (dims[g[0]] != null ? esc(String(dims[g[0]])) : "") + "'></div>").join("") +
       "</div></div>" : "") +
-    "<div style='margin-top:14px'><button id='tsave3' class='primary small'>Save cutter</button></div></div>";
-  $("c-kind").onchange = () => renderToolTab();
+    "<div style='margin-top:14px'><button id='tsave3' class='small'>Save tool</button></div></div>";
+  $("c-kind").onchange = () => { captureToolInputs(); renderToolTab(); };
   $("tsave3").onclick = saveTool;
 }
 function renderToolCutting(v){
@@ -3672,7 +4342,7 @@ async function addOrEditCutting(existing){
   } catch(e){ toast("Cutting data: " + e.message, "err"); }
 }
 function renderToolPost(v){
-  const t = TOOL.data;
+  const t = toolDraft().t;
   v.innerHTML =
     "<div class='card'><h2 class='sec'>Post processor</h2>" +
     "<div class='dim muted' style='margin-bottom:10px'>The tool number this cutter is loaded at on the machine, " +
@@ -3681,53 +4351,58 @@ function renderToolPost(v){
     tf("Tool number in machine", "<input id='p-tnum' type='number' min='0' step='1' value='" +
       (t.tool_number != null ? t.tool_number : "") + "' placeholder='e.g. 10'>") +
     "</div>" +
-    (t.tool_number != null ?
-      "<div class='dim' style='margin-top:8px'>Currently T" + t.tool_number + ".</div>" : "") +
-    "<div style='margin-top:14px'><button id='tsave4' class='primary small'>Save post processor</button></div></div>";
+    (TOOL.data.tool_number != null ?
+      "<div class='dim' style='margin-top:8px'>Currently T" + TOOL.data.tool_number + ".</div>" : "") +
+    "<div style='margin-top:14px'><button id='tsave4' class='small'>Save tool</button></div></div>";
   $("tsave4").onclick = saveTool;
 }
+// The body for PUT /tools/{id}: the fields edited in the draft. Geometry goes with a type
+// change or a geometry edit, holding only the keys of the draft's type.
 function collectToolEdits(){
-  const txt = id => { const el = $(id); return el ? (el.value.trim() || null) : undefined; };
-  const num = id => { const el = $(id); if (!el) return undefined;
-    const s = el.value.trim(); if (s === "") return null;
-    const v = Number(s); return isNaN(v) ? null : v; };
+  const d = toolDraft(), t = d.t;
+  const txt = v => { const s = String(v ?? "").trim(); return s === "" ? null : s; };
+  const num = v => { const s = String(v ?? "").trim(); if (s === "") return null;
+    const n = Number(s); return isNaN(n) ? null : n; };
   const edits = {};
-  const set = (k, val) => { if (val !== undefined) edits[k] = val; };
-  set("description", txt("g-desc"));
-  set("vendor", txt("g-vendor"));
-  set("part_number", txt("g-pn"));
-  set("link", txt("g-link"));
-  set("kind", txt("c-kind"));
-  set("units", txt("c-units"));
-  set("rotation", txt("c-rotation"));
-  set("flutes", num("c-flutes"));
-  set("tool_material", txt("c-material"));
-  set("tool_number", num("p-tnum"));
-  if ($("c-kind")) {
-    const dims = TOOL.data.dimensions || {};
-    for (const [k] of TOOL_GEOMETRY[TOOL.data.kind] || []) {
-      const el = $("geom-" + k);
-      if (!el) continue;
-      const s = el.value.trim();
-      if (s === "") delete dims[k];
-      else { const val = Number(s); dims[k] = isNaN(val) ? s : val; }
+  for (const [, key] of TOOL_FIELDS){
+    if (!d.touched.has(key)) continue;
+    edits[key] = key === "flutes" || key === "tool_number" ? num(t[key]) : txt(t[key]);
+  }
+  if (d.touched.has("dimensions") || d.touched.has("kind")){
+    const dims = {};
+    for (const [k] of TOOL_GEOMETRY[t.kind] || []){
+      const s = String(t.dimensions[k] ?? "").trim();
+      if (s !== ""){ const n = Number(s); dims[k] = isNaN(n) ? s : n; }
     }
-    for (const k of Object.keys(dims)) {
-      if (!(TOOL_GEOMETRY[TOOL.data.kind] || []).some(x => x[0] === k)) delete dims[k];
-    }
-    set("dimensions", Object.keys(dims).length ? dims : null);
+    edits.dimensions = Object.keys(dims).length ? dims : null;
   }
   return edits;
 }
 async function saveTool(){
+  if (TOOL.saving) return;
+  captureToolInputs();
+  const edits = collectToolEdits();
+  if (!Object.keys(edits).length){ toolStateText("No changes to save"); return; }
+  TOOL.saving = true;
+  // Fields stay locked while the request runs, so nothing typed meanwhile is lost.
+  const locked = [...document.querySelectorAll("#view .head button, #ttab input, #ttab select, #ttab textarea, #ttab button")]
+    .filter(el => !el.disabled);
+  locked.forEach(el => { el.disabled = true; });
+  toolStateText("Saving…");
   try {
-    const edits = collectToolEdits();
-    if (!Object.keys(edits).length){ toast("Nothing to save", "ok"); return; }
     TOOL.data = (await api("PUT", "/tools/" + TOOL.id, edits)).tool;
-    toast("Tool saved", "ok");
-    render(false);
-  } catch(e){ toast("Save tool: " + e.message, "err"); }
+    TOOL.draft = null;
+    await render(false);
+    toolStateText("Saved");
+  } catch(e){
+    toolStateText();
+    toast("Tool not saved: " + e.message, "err");
+  } finally {
+    TOOL.saving = false;
+    locked.forEach(el => { if (el.isConnected) el.disabled = false; });
+  }
 }
+
 async function uploadToolDoc(file){
   if (!file) return;
   try {
@@ -4213,14 +4888,23 @@ function applyTheme(id){
 function themePickerHTML(){
   const cur = currentTheme();
   return "<div class='theme-grid'>" + THEMES.map(t =>
-    "<button type='button' class='theme-card" + (t.id === cur ? " on" : "") + "' data-theme-id='" + t.id + "'>" +
+    "<button type='button' class='theme-card" + (t.id === cur ? " on" : "") + "' data-theme-id='" + t.id + "' aria-pressed='" + (t.id === cur) + "'>" +
     "<div class='theme-swatches'>" + t.swatches.map(c => "<span style='background:" + c + "'></span>").join("") + "</div>" +
     "<strong>" + esc(t.name) + "</strong><span class='dim'>" + esc(t.desc) + "</span></button>"
   ).join("") + "</div>";
 }
+// Mark the picked card in place; re-rendering the page would wipe unsaved edits.
+function markPicked(root, attr, id){
+  root.querySelectorAll("[" + attr + "]").forEach(b => {
+    const on = b.getAttribute(attr) === id;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", String(on));
+  });
+}
 function wireThemePicker(root){
-  (root || document).querySelectorAll("[data-theme-id]").forEach(b => {
-    b.onclick = () => { applyTheme(b.dataset.themeId); toast("Theme: " + (THEMES.find(t => t.id === b.dataset.themeId) || {}).name, "ok"); if (ROUTE.name === "admin" || ROUTE.name === "settings") render(false); };
+  root = root || document;
+  root.querySelectorAll("[data-theme-id]").forEach(b => {
+    b.onclick = () => { applyTheme(b.dataset.themeId); markPicked(root, "data-theme-id", currentTheme()); };
   });
 }
 
@@ -4374,7 +5058,7 @@ async function saveOrgFont(root, btn){
 }
 
 const GPU_POLICIES = [
-  { id:"auto", name:"Auto", desc:"GPU if present, else CPU" },
+  { id:"auto", name:"Auto", desc:"GPU if present, else CPU (default)" },
   { id:"hardware", name:"GPU", desc:"Require the machine GPU" },
   { id:"software", name:"GPU software", desc:"Driver on CPU (llvmpipe)" },
   { id:"cpu", name:"CPU", desc:"SolidCraft CPU rasterizer" }
@@ -4382,19 +5066,23 @@ const GPU_POLICIES = [
 function gpuPickerHTML(cur, canEdit){
   return "<div class='theme-grid'>" + GPU_POLICIES.map(t =>
     "<button type='button' class='theme-card" + (t.id === cur ? " on" : "") + "' data-gpu-id='" + t.id + "'" +
-    (canEdit ? "" : " disabled") + ">" +
+    " aria-pressed='" + (t.id === cur) + "'" + (canEdit ? "" : " disabled") + ">" +
     "<strong>" + esc(t.name) + "</strong><span class='dim'>" + esc(t.desc) + "</span></button>"
   ).join("") + "</div>";
 }
 function wireGpuPicker(root, canEdit){
   if (!canEdit) return;
-  (root || document).querySelectorAll("[data-gpu-id]").forEach(b => {
+  root = root || document;
+  const cards = [...root.querySelectorAll("[data-gpu-id]")];
+  cards.forEach(b => {
     b.onclick = async () => {
+      if (b.classList.contains("on") || b.disabled) return;
+      cards.forEach(x => x.disabled = true);
       try {
-        await api("PUT", "/settings/gpu-policy", { gpu_policy: b.dataset.gpuId });
-        toast("Preview renderer: " + ((GPU_POLICIES.find(t => t.id === b.dataset.gpuId) || {}).name || b.dataset.gpuId), "ok");
-        render(false);
-      } catch(e){ toast("GPU policy: " + e.message, "err"); }
+        const d = await api("PUT", "/settings/gpu-policy", { gpu_policy: b.dataset.gpuId });
+        markPicked(root, "data-gpu-id", d.gpu_policy || b.dataset.gpuId);
+      } catch(e){ toast("GPU policy not saved: " + e.message, "err"); }
+      finally { cards.forEach(x => x.disabled = false); }
     };
   });
 }
@@ -4407,14 +5095,18 @@ function usersTable(list){
       "<td><span style='display:inline-flex;gap:8px;align-items:center'>" + userAv(u, !u.active) +
         "<span>" + esc(u.display_name || "—") + "</span></span></td>" +
       "<td class='mono'>" + esc(u.email) + "</td>" +
-      "<td>" + esc(u.role) + "</td>" +
+      "<td>" + esc(u.role) + (u.is_host_admin ? " <span class='dim'>· host admin</span>" : "") + "</td>" +
       "<td class='muted'>" + (u.active ? "Active" : "Disabled") + "</td>" +
        "<td class='muted'>" + String(u.created_at || "").slice(0, 10) + "</td>" +
-        "<td style='white-space:nowrap'><button class='small' data-edit='" + u.id + "'>edit</button> " +
-        "<button class='small' data-pw='" + u.id + "'>password</button> " +
-        "<button class='small' data-tok='" + u.id + "'>＋ token</button> " +
-        "<button class='small' data-active='" + u.id + "'>" + (u.active ? "Disable" : "Enable") + "</button></td>" +
-       "</tr>").join("") + "</tbody></table>";
+        "<td style='white-space:nowrap'><button class='small' data-edit='" + u.id + "'" + hostLock(u) + ">edit</button> " +
+        "<button class='small' data-pw='" + u.id + "'" + hostLock(u) + ">password</button> " +
+        "<button class='small' data-tok='" + u.id + "'" + hostLock(u) + ">＋ token</button> " +
+        "<button class='small' data-active='" + u.id + "'" + hostLock(u) + ">" + (u.active ? "Disable" : "Enable") + "</button>" +
+        (isHostAdmin() && u.active && u.role === "admin"
+          ? " <button class='small' data-hostadm='" + u.id + "'>" + (u.is_host_admin ? "Revoke host admin" : "Make host admin") + "</button>"
+          : "") + "</td>" +
+       "</tr>").join("") + "</tbody></table>" +
+    (list.some(u => hostLock(u)) ? "<p class='dim'>Only a host admin can change a host admin's account.</p>" : "");
 }
 function auditTable(list){
   if (!list.length) return "<div class='empty'>No audit events.</div>";
@@ -4431,18 +5123,64 @@ function auditTable(list){
         "</pre></details></td></tr>";
     }).join("") + "</tbody></table>";
 }
+// Settings card: should a release wait for an approval? (org setting, default off).
+// It loads and saves on its own, so it never redraws the rest of the Settings page.
+async function releaseApprovalCard(box, canEdit){
+  if (!box) return;
+  box.innerHTML = "<h2 class='sec'>Release approval</h2><div class='card'><p class='dim'>Loading…</p></div>";
+  let on;
+  try { on = !!(await api("GET", "/settings/release-approval")).require_approval_on_release; }
+  catch(e){
+    box.innerHTML = "<h2 class='sec'>Release approval</h2><div class='card'><p>Release approval setting not loaded: " +
+      esc(e.message) + "</p><button id='ra-retry'>Try again</button></div>";
+    $("ra-retry").onclick = () => releaseApprovalCard(box, canEdit);
+    return;
+  }
+  box.innerHTML = "<h2 class='sec'>Release approval</h2><div class='card'>" +
+    "<label><input id='ra-on' type='checkbox'" + (on ? " checked" : "") + (canEdit ? "" : " disabled") +
+    " aria-describedby='ra-hint'> Releases need an approval first</label>" +
+    "<p class='dim' id='ra-hint'>When on, Release opens an approval request and puts the item in review. " +
+    "The request goes to every editor and admin unless the release names its approvers; the revision is made when it is approved. " +
+    "When off, Release makes the revision at once. Default: off.</p>" +
+    (canEdit ? "<div class='row'><button id='ra-save'>Save release approval</button>" +
+      "<span class='dim' id='ra-state' role='status'></span></div>" : "") + "</div>";
+  const cb = $("ra-on"), save = $("ra-save"), state = $("ra-state");
+  if (!save) return;
+  cb.onchange = () => { state.textContent = cb.checked !== on ? "Unsaved changes" : ""; };
+  save.onclick = async () => {
+    if (save.disabled) return;
+    save.disabled = cb.disabled = true; save.textContent = "Saving…";
+    try {
+      const d = await api("PUT", "/settings/release-approval", { require_approval_on_release: cb.checked });
+      on = !!d.require_approval_on_release;
+      cb.checked = on;
+      state.textContent = "Saved";
+    } catch(e){ toast("Release approval not saved: " + e.message, "err"); }
+    finally { save.disabled = cb.disabled = false; save.textContent = "Save release approval"; }
+  };
+}
+
 function genPassword(){
   const c = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
   let s = "";
   for (let i = 0; i < 12; i++) s += c[Math.floor(Math.random() * c.length)];
   return s;
 }
+// Role picker options, lowest rank first; each role can also do everything the ones before it can.
+function roleOptions(){
+  return [
+    { value:"viewer", label:"Viewer — reads and comments" },
+    { value:"operator", label:"Operator — also records shop-floor job status and inspections" },
+    { value:"editor", label:"Editor — also changes items, files, tools and manufacturing records" },
+    { value:"admin", label:"Admin — also manages users and settings" }
+  ];
+}
 async function addUser(){
   const f = await openModal("Add user", [
     { id:"email", label:"Email", required:true, placeholder:"name@company.com", type:"text" },
     { id:"display_name", label:"Display name", placeholder:"e.g. Jane" },
     { id:"role", label:"Role", type:"select",
-      options:[{value:"editor",label:"Editor"},{value:"viewer",label:"Viewer"},{value:"admin",label:"Admin"}], value:"editor" },
+      options:roleOptions(), value:"editor" },
     { id:"password", label:"Password (min 4 characters)", required:true, type:"password" }
   ], "Add user");
   if (!f) return;
@@ -4455,26 +5193,48 @@ async function addUser(){
   } catch(e){ toast("Add user: " + e.message, "err"); }
 }
 async function inviteUser(){
-  const f = await openModal("Invite user", [
+  const known = new Set(USERS.map(u => String(u.email).toLowerCase()));
+  const r = await openModal("Invite user", [
     { id:"email", label:"Email", required:true, placeholder:"name@company.com", type:"text" },
     { id:"display_name", label:"Display name", placeholder:"e.g. Jane" },
-    { id:"role", label:"Role", type:"select",
-      options:[{value:"editor",label:"Editor"},{value:"viewer",label:"Viewer"},{value:"admin",label:"Admin"}], value:"editor" }
-  ], "Send invite");
-  if (!f) return;
-  try {
-    await api("POST", "/users/invite", {
-      email: f.email, display_name: f.display_name || null, role: f.role
-    });
-    toast("Invite emailed to " + f.email, "ok");
-    render(false);
-  } catch(e){ toast("Invite: " + e.message, "err"); }
+     { id:"role", label:"Role", type:"select",
+       options:roleOptions(), value:"editor" }
+   ], { label:"Send invite", busyLabel:"Sending…", onSubmit: async f => {
+     const email = f.email.trim();
+     try {
+       await api("POST", "/users/invite", { email, display_name: f.display_name || null, role: f.role });
+       return { email };
+     } catch(e){
+       // The email step comes last: a failed send can leave a new account nobody can use.
+       const made = known.has(email.toLowerCase()) ? null : await findUserByEmail(email);
+       if (!made) throw e;
+       return { email, made, err: e };
+     }
+   } });
+  if (!r) return;
+  render(false);
+  if (r.made) await inviteMailFailed(r.email, r.err, r.made);
+  else toast("Invite emailed to " + r.email, "ok");
 }
+// Read the user list rather than the error text to learn whether the account exists.
+async function findUserByEmail(email){
+  return api("GET", "/users")
+    .then(d => (d.users || []).find(u => String(u.email).toLowerCase() === email.toLowerCase()) || null)
+    .catch(() => null);
+}
+async function inviteMailFailed(email, err, user){
+  const ok = await openModal("Invite email not sent", [], "Reset password",
+    "<p><b>" + esc(email) + "</b> was added, but the invite email failed: " + esc(err.detail || err.message) + "</p>" +
+    "<p>They cannot sign in yet. Reset their password and share it with them, or fix the mail settings " +
+    "and reset it later.</p>");
+  if (ok) await resetPassword(user);
+}
+
 async function editUser(u){
   const f = await openModal("Edit user — " + u.email, [
     { id:"display_name", label:"Display name", value:u.display_name || "" },
     { id:"role", label:"Role", type:"select",
-      options:[{value:"editor",label:"Editor"},{value:"viewer",label:"Viewer"},{value:"admin",label:"Admin"}], value:u.role },
+      options:roleOptions(), value:u.role },
     { id:"active", label:"Account status", type:"select",
       options:[{value:"true",label:"Active"},{value:"false",label:"Disabled"}], value:String(u.active) }
   ], "Save");
@@ -4490,6 +5250,20 @@ async function editUser(u){
     toast("User “" + u.email + "” updated", "ok");
     render(false);
   } catch(e){ toast("Edit user: " + e.message, "err"); }
+}
+// Grant or revoke host admin (shown to host admins only; the server refuses the last one).
+// The row's new label is the confirmation; errors stay in the dialog.
+async function toggleHostAdmin(u){
+  const grant = !u.is_host_admin, self = u.id === myId();
+  const ok = await openModal(grant ? "Make " + u.email + " a host admin?" : "Revoke host admin from " + u.email + "?", [],
+    { label: grant ? "Make host admin" : "Revoke host admin", busyLabel: grant ? "Granting…" : "Revoking…", danger: !grant,
+      onSubmit: async () => { await api("PUT", "/users/" + u.id + "/host-admin", { host_admin: grant }); return true; } },
+    "<p class='modal-note'>" + (grant
+      ? "Host admins change what every organization on this server shares (CAD CLI, web editor, Dutchman channel, GPU policy) and can make other admins host admins."
+      : "They stay an admin of their organization." + (self ? " This is your account: you will no longer be able to change server-wide settings." : "")) + "</p>");
+  if (!ok) return;
+  if (!grant && self) ME.host_admin = false;
+  render(false);
 }
 async function toggleUserActive(u){
   const active = !u.active;
@@ -4570,19 +5344,66 @@ async function changePassword(){
   } catch(e){ toast("Change password: " + e.message, "err"); }
 }
 
-// Admin: set a brand-new password for any user (no current password needed).
+// Copy text to the clipboard; falls back to selecting the field where the Clipboard API
+// is missing (plain-http hosts). Resolves true when the text was copied.
+async function copyText(text, field){
+  try { await navigator.clipboard.writeText(text); return true; }
+  catch(e){
+    if (!field) return false;
+    field.focus(); field.select();
+    try { return document.execCommand("copy"); } catch(_){ return false; }
+  }
+}
+// Show / Hide and Copy buttons for a password field in a dialog.
+function wireSecretField(field, showBtn, copyBtn){
+  if (!field) return;
+  if (showBtn) showBtn.onclick = () => {
+    const hide = field.type === "text";
+    field.type = hide ? "password" : "text";
+    showBtn.textContent = hide ? "Show" : "Hide";
+    showBtn.setAttribute("aria-pressed", String(!hide));
+  };
+  if (copyBtn) copyBtn.onclick = async () => {
+    // The fallback selects the text, which a password field does not allow: show it first.
+    const viaApi = await copyText(field.value, null);
+    if (!viaApi && field.type === "password" && showBtn) showBtn.onclick();
+    const ok = viaApi || await copyText(field.value, field);
+    copyBtn.textContent = ok ? "Copied" : "Copy";
+    if (!ok) toast("Not copied. The password is selected: copy it with Ctrl+C (Cmd+C on a Mac).", "err");
+    else setTimeout(() => { copyBtn.textContent = "Copy"; }, 2000);
+  };
+}
+function secretFieldHTML(id, label, value, editable){
+  return "<div class='modal-field'><label for='" + id + "'>" + esc(label) + "</label>" +
+    "<div class='row' style='margin:0;flex-wrap:nowrap'><input id='" + id + "' type='text' class='mono' spellcheck='false' autocomplete='off'" +
+    (editable ? " required minlength='4'" : " readonly") + " value='" + esc(value) + "' style='flex:1'>" +
+    "<button type='button' class='small' id='" + id + "-show' aria-pressed='true'>Hide</button>" +
+    "<button type='button' class='small' id='" + id + "-copy'>Copy</button></div></div>";
+}
+
+// Admin: set a brand-new password for any user (no current password needed). The
+// generated password is shown so it can be shared; the admin may type another instead.
 async function resetPassword(u){
-  const pw = genPassword();
-  const f = await openModal("Reset password — " + (u.display_name || u.email), [
-    { id:"new", label:"New password (min 4 characters)", required:true, type:"password", value: pw },
-    { id:"confirm", label:"Confirm new password", required:true, type:"password", value: pw }
-  ], "Reset password");
-  if (!f) return;
-  if (f.new !== f.confirm){ toast("Passwords do not match", "err"); return; }
-  try {
-    await api("POST", "/users/" + u.id + "/password", { password: f.new });
-    toast("Password reset for " + (u.display_name || u.email), "ok");
-  } catch(e){ toast("Reset password: " + e.message, "err"); }
+  const who = u.display_name || u.email;
+  let field = null;
+  const pending = openModal("Reset password for " + who, [],
+    { label:"Reset password", busyLabel:"Resetting…", onSubmit: async () => {
+      const pw = field.value;
+      await api("POST", "/users/" + u.id + "/password", { password: pw });
+      return { pw };
+    } },
+    secretFieldHTML("rp-new", "New password (at least 4 characters)", genPassword(), true) +
+    "<p class='dim'>A password was generated for you. You can type your own instead.</p>");
+  field = $("rp-new");
+  wireSecretField(field, $("rp-new-show"), $("rp-new-copy"));
+  const r = await pending;
+  if (!r || !r.pw) return;
+  const pw = r.pw;
+  const done = openModal("New password for " + who, [], "Done",
+    "<p>Share it with " + esc(who) + " securely. It is not shown again.</p>" +
+    secretFieldHTML("rp-done", "New password", pw, false));
+  wireSecretField($("rp-done"), $("rp-done-show"), $("rp-done-copy"));
+  await done;
 }
 // ── system (server + bundled SolidCraft CLI + infrastructure) ────────────
 function fmtUptime(sec){
@@ -4613,6 +5434,7 @@ function viewSystem(v){
       const row = (k, val) =>
         "<tr><td class='dim'>" + k + "</td><td class='mono'>" +
         (val == null ? "—" : esc(String(val))) + "</td></tr>";
+      const hostDis = isHostAdmin() ? "" : " disabled";
       const pdm = d.pdm || {}, cli = d.solidcraft_cli || {}, pg = d.postgres || {},
             st = d.storage || {}, c = d.counts || {}, gpu = d.gpu || {};
       const survey = gpu.survey || {};
@@ -4644,8 +5466,8 @@ function viewSystem(v){
           "</table>" +
           (cli.error ? "<p class='dim errtext'>" + esc(cli.error) + "</p>" : "") +
           "<p class='dim'><a href='https://github.com/tangency-labs/solidcraft/releases/latest' target='_blank' rel='noreferrer'>tangency-labs/solidcraft</a></p>" +
-          "<div class='row'><button id='cli-upd' class='primary'>" +
-            (cad.update_available ? "Update CLI" : "Check / reinstall CLI") + "</button></div>" +
+          "<div class='row'><button id='cli-upd' class='primary'" + hostDis + ">" +
+            (cad.update_available ? "Update CLI" : "Check / reinstall CLI") + "</button></div>" + hostOnlyNote() +
           "</div>" +
         "<div class='card'><h2 class='sec'>Dutchman (feature-tree converter)</h2><table>" +
           "<tr><td class='dim'>Installed</td><td class='mono'>" +
@@ -4663,15 +5485,15 @@ function viewSystem(v){
               : "Auto-update is off (PDM_DUTCHMAN_UPDATE=0).") +
           " <a href='https://github.com/dutchman-cad/dutchman/releases' target='_blank' rel='noreferrer'>dutchman-cad/dutchman releases</a></p>" +
           "<div class='row'><label for='dm-channel'>Release channel</label>" +
-          "<select id='dm-channel'>" +
+          "<select id='dm-channel'" + hostDis + ">" +
             ((dm.channels || []).map(c =>
               "<option value='" + esc(c.value) + "'" +
               (dm.settings && dm.settings.channel === c.value ? " selected" : "") + ">" + esc(c.label) + "</option>")
             .join("")) +
           "</select></div>" +
-          "<div class='row'><button id='dm-upd' class='primary'>" +
+          "<div class='row'><button id='dm-upd' class='primary'" + hostDis + ">" +
             (dm.update_available ? "Download the referenced release" : "Check / reinstall Dutchman") +
-            "</button></div>" +
+            "</button></div>" + hostOnlyNote() +
           "<h2 class='sec' style='margin-top:12px'>Conversion settings (this org)</h2>" +
           "<div class='row'><label for='dm-preset'>Preset</label>" +
           "<select id='dm-preset'>" + ["fast","standard","full"].map(p =>
@@ -4703,8 +5525,8 @@ function viewSystem(v){
               ? "Tracks the newest release automatically (every 6 h; PDM_WEB_UPDATE=0 opts out)."
               : "Auto-update is off (PDM_WEB_UPDATE=0).") +
           " Open editors pick up a new build on the next open.</p>" +
-          "<div class='row'><button id='scweb-upd' class='primary'>" +
-            (scweb.update_available ? "Update web editor" : "Check / reinstall web editor") + "</button></div>" +
+          "<div class='row'><button id='scweb-upd' class='primary'" + hostDis + ">" +
+            (scweb.update_available ? "Update web editor" : "Check / reinstall web editor") + "</button></div>" + hostOnlyNote() +
           "</div>" +
         "<div class='card'><h2 class='sec'>Preview renderer</h2><table>" +
           row("Policy", gpu.policy) +
@@ -4779,6 +5601,129 @@ function viewSystem(v){
 }
 
 // ── settings (org part-number prefixes) ─────────────────────────────────
+// ── settings sections ───────────────────────────────────────────────────
+// Each Settings section saves on its own. Typing in a section marks it "Unsaved
+// changes"; saving updates only that section, so edits elsewhere on the page stay.
+function setSectionState(sec, state){
+  if (!sec) return;
+  sec.classList.toggle("dirty", state === "unsaved");
+  const s = sec.querySelector(".sec-state");
+  if (!s) return;
+  // A live region: write only on a change, so a screen reader does not repeat it per key.
+  const text = state === "unsaved" ? "Unsaved changes" : state === "saved" ? "Saved" : "";
+  if (s.textContent !== text) s.textContent = text;
+  s.classList.toggle("unsaved", state === "unsaved");
+}
+function wireDirty(root){
+  root.querySelectorAll("[data-section]").forEach(sec => {
+    const touch = () => { sec.dataset.rev = String((Number(sec.dataset.rev) || 0) + 1); setSectionState(sec, "unsaved"); };
+    sec.addEventListener("input", touch);
+    sec.addEventListener("change", touch);
+  });
+}
+function unsavedEdits(){
+  return !!document.querySelector("#view [data-section].dirty") ||
+    (ROUTE.name === "tool" && !!(TOOL.draft && TOOL.draft.dirty));
+}
+let UNSAVED_GUARD = false;
+function guardUnsavedEdits(){
+  if (UNSAVED_GUARD) return;
+  UNSAVED_GUARD = true;
+  window.addEventListener("beforeunload", e => { if (unsavedEdits()){ e.preventDefault(); e.returnValue = ""; } });
+}
+// Run one section's save with a busy button; say "Saved" only when nothing was typed
+// while the request ran. Resolves to the server's answer, or null on failure.
+async function saveSection(btn, busyLabel, what, send){
+  if (!btn || btn.disabled) return null;
+  const sec = btn.closest("[data-section]");
+  const rev = sec ? sec.dataset.rev : undefined;
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = busyLabel;
+  try {
+    const d = await send();
+    if (sec && sec.dataset.rev === rev) setSectionState(sec, "saved");
+    return d;
+  } catch(e){ toast(what + " not saved: " + e.message, "err"); return null; }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+function unsavedHTML(){ return "<span class='sec-state dim' role='status'></span>"; }
+function setHint(id, text){ return text ? "<div class='set-hint dim' id='" + id + "-hint'>" + text + "</div>" : ""; }
+// A labelled text input for a Settings card; hint (HTML) sits under it.
+function setInput(id, label, value, o){
+  o = o || {};
+  return "<div class='modal-field'" + (o.wide ? " style='grid-column:1/-1'" : "") + ">" +
+    "<label for='" + id + "'>" + label + "</label>" +
+    "<input id='" + id + "'" + (o.type ? " type='" + o.type + "'" : "") +
+    (o.cls ? " class='" + o.cls + "'" : "") +
+    (o.inputmode ? " inputmode='" + o.inputmode + "'" : "") +
+    (o.placeholder ? " placeholder='" + esc(o.placeholder) + "'" : "") +
+    (o.hint ? " aria-describedby='" + id + "-hint'" : "") +
+    " value='" + esc(value == null ? "" : String(value)) + "'" + (o.canEdit === false ? " disabled" : "") + ">" +
+    setHint(id, o.hint) + "</div>";
+}
+function setSelect(id, label, options, cur, o){
+  o = o || {};
+  return "<div class='modal-field'><label for='" + id + "'>" + label + "</label>" +
+    "<select id='" + id + "'" + (o.hint ? " aria-describedby='" + id + "-hint'" : "") + (o.canEdit === false ? " disabled" : "") + ">" +
+    options.map(([v, l]) => "<option value='" + v + "'" + (v === cur ? " selected" : "") + ">" + esc(l) + "</option>").join("") +
+    "</select>" + setHint(id, o.hint) + "</div>";
+}
+// Say what is wrong with a field in its hint line, until the field is edited again.
+function fieldProblem(id, msg){
+  const el = $(id), h = $(id + "-hint");
+  if (!el) return;
+  el.setAttribute("aria-invalid", "true");
+  if (!h){ toast(msg, "err"); return; }
+  if (h.dataset.hint === undefined) h.dataset.hint = h.textContent;
+  h.textContent = msg; h.classList.add("set-err");
+  el.addEventListener("input", () => {
+    el.removeAttribute("aria-invalid");
+    h.textContent = h.dataset.hint; h.classList.remove("set-err");
+  }, { once: true });
+}
+function secretHint(isSet){
+  return isSet ? "Set. Leave blank to keep the current one." : "Not set.";
+}
+
+// Laser-nest defaults. Keys follow pdm_core::NestDefaults (serde camelCase): the
+// server silently drops any other key, which is how "Part source unit" never saved.
+const NEST_LEN_FIELDS = [["nd-width","width","Sheet width"],["nd-length","length","Sheet length"],
+  ["nd-margin","margin","Sheet margin"],["nd-spx","spacingX","Part spacing (H)"],["nd-spy","spacingY","Part spacing (V)"]];
+function nestDefaultsBody(f){
+  const body = { units: f.units, partUnit: f.partUnit, grainDirection: f.grainDirection,
+    nestingCorner: f.nestingCorner, guillotine: !!f.guillotine, addPartLabels: !!f.addPartLabels };
+  const bad = [];
+  for (const [, key, label] of NEST_LEN_FIELDS){
+    const s = String(f[key] ?? "").trim();
+    const n = Number(s);
+    if (s === "") body[key] = null;
+    else if (isFinite(n) && n >= 0) body[key] = n;
+    else bad.push(label);
+  }
+  return { body, bad };
+}
+// Switching units re-expresses each length from its exact size, so in → mm → in gives
+// back what was typed. null = blank or not a number (left as typed).
+function lengthToMm(s, unit){
+  s = String(s ?? "").trim();
+  const v = Number(s);
+  return s === "" || !isFinite(v) ? null : (unit === "in" ? v * 25.4 : v);
+}
+function mmToText(mm, unit){
+  return String(Number((unit === "in" ? mm / 25.4 : mm).toFixed(unit === "in" ? 4 : 3)));
+}
+// What the New laser nest panel uses for a blank length: its built-in value (ncDefaultState),
+// said in the unit shown, with the built-in figure when that differs. "" when unknown.
+function nestBlankHint(key, unit){
+  const d = typeof ncDefaultState === "function" ? ncDefaultState() : null;
+  if (!d || (d.units !== "in" && d.units !== "mm")) return "";
+  const s0 = d.sheets && d.sheets[0] || {};
+  const v = { width: s0.width, length: s0.length, margin: d.margin, spacingX: d.spacingX, spacingY: d.spacingY }[key];
+  if (typeof v !== "number") return "";
+  if (unit === d.units) return "Blank: " + v + " " + unit + ".";
+  return "Blank: " + mmToText(lengthToMm(v, d.units), unit) + " " + unit + " (" + v + " " + d.units + ").";
+}
+
 async function viewSettings(v){
   const canEdit = isRole("admin");
   const [d, gp, mail, osh, proj, preview, nestDef] = await Promise.all([
@@ -4793,6 +5738,8 @@ async function viewSettings(v){
   const nd = nestDef.defaults || {};
   const prefixes = d.prefixes || [];
   const gpuPolicy = gp.gpu_policy || "auto";
+  const ro = { canEdit };
+  const ndUnits = nd.units === "mm" ? "mm" : "in";
   v.innerHTML =
     "<div class='head'><h2>Settings</h2>" +
     "<span class='dim muted'>organization settings · shared by the web workspace and the desktop app</span>" +
@@ -4803,78 +5750,73 @@ async function viewSettings(v){
     "<h2 class='sec'>Preview renderer</h2>" +
     "<div class='card'><p class='dim'>Transparent product renders use the CPU product-image renderer, with no grid or axes. " +
     "Viewport snapshots retain the original background and use the GPU policy below. Regenerate an existing preview to apply a new style.</p>" +
-    "<div class='row'><label for='preview-style'>Preview style</label><select id='preview-style'" + (canEdit ? "" : " disabled") + ">" +
+    "<div class='row' data-section='preview-style'><label for='preview-style'>Preview style</label><select id='preview-style' aria-describedby='preview-style-hint'" + (canEdit ? "" : " disabled") + ">" +
     "<option value='transparent'" + (preview.preview_style !== "viewport" ? " selected" : "") + ">Transparent product render</option>" +
     "<option value='viewport'" + (preview.preview_style === "viewport" ? " selected" : "") + ">Viewport snapshot (background, grid and axes)</option></select>" +
-    (canEdit ? "<button id='preview-style-save'>Save preview style</button>" : "") + "</div>" +
-    gpuPickerHTML(gpuPolicy, canEdit) + "</div>" +
+    (canEdit ? "<button id='preview-style-save'>Save preview style</button>" + unsavedHTML() : "") + "</div>" +
+    "<p class='dim' id='preview-style-hint'>Default: Transparent product render.</p>" +
+    gpuPickerHTML(gpuPolicy, isHostAdmin()) + hostOnlyNote() + "</div>" +
     "<h2 class='sec'>Mail server</h2>" +
-    "<div class='card'><p class='dim'>SMTP used when you invite a user. Leave password blank to keep the current one.</p>" +
+    "<div class='card' data-section='mail'><p class='dim'>SMTP used when you invite a user.</p>" +
     "<div class='grid2'>" +
-      "<div class='modal-field'><label>Host</label><input id='mail-host' value='" + esc(mail.host || "") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Port</label><input id='mail-port' value='" + esc(String(mail.port || 587)) + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Username</label><input id='mail-user' value='" + esc(mail.username || "") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Password</label><input id='mail-pass' type='password' placeholder='" + (mail.password_set ? "unchanged" : "") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>From address</label><input id='mail-from' placeholder='Foundry PDM &lt;pdm@example.com&gt;' value='" + esc(mail.from || "") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Encryption</label><select id='mail-tls'" + (canEdit?"":" disabled") + ">" +
-        ["starttls","tls","none"].map(t => "<option value='" + t + "'" + (mail.tls === t ? " selected" : "") + ">" +
-          (t === "starttls" ? "STARTTLS (587)" : t === "tls" ? "TLS (465)" : "None") + "</option>").join("") +
-      "</select></div>" +
-      "<div class='modal-field' style='grid-column:1/-1'><label>Sign-in URL (optional)</label><input id='mail-url' placeholder='https://pdm.example.com' value='" + esc(mail.login_url || "") + "'" + (canEdit?"":" disabled") + "></div>" +
+      setInput("mail-host", "Host", mail.host, ro) +
+      setInput("mail-port", "Port", mail.port || 587, Object.assign({ inputmode:"numeric", hint:"Default: 587." }, ro)) +
+      setInput("mail-user", "Username", mail.username, ro) +
+      setInput("mail-pass", "Password", "", Object.assign({ type:"password", hint: secretHint(mail.password_set) }, ro)) +
+      setInput("mail-from", "From address", mail.from, Object.assign({ placeholder:"Foundry PDM <pdm@example.com>" }, ro)) +
+      setSelect("mail-tls", "Encryption", [["starttls","STARTTLS (587)"],["tls","TLS (465)"],["none","None"]],
+        mail.tls || "starttls", Object.assign({ hint:"Default: STARTTLS." }, ro)) +
+      setInput("mail-url", "Sign-in URL (optional)", mail.login_url, Object.assign({ wide:true, placeholder:"https://pdm.example.com" }, ro)) +
     "</div>" +
-    (canEdit ? "<div class='row' style='margin-top:10px'><button id='mail-save' class='primary'>Save mail</button><button id='mail-test'>Send test</button>" +
-      "<span class='dim'>" + (mail.configured ? "configured" : "not configured") + "</span></div>" : "") +
+    (canEdit ? "<div class='row' style='margin-top:10px'><button id='mail-save'>Save mail</button><button id='mail-test'>Send test</button>" +
+      "<span class='dim' id='mail-stat'>" + (mail.configured ? "Status: configured" : "Status: not configured") + "</span>" + unsavedHTML() + "</div>" : "") +
     "</div>" +
     "<h2 class='sec'>Onshape</h2>" +
-    "<div class='card'><p class='dim'>Register an Onshape OAuth app, then an <b>Element right panel</b> extension (Part Studio and Assembly) whose Action URL is:</p>" +
+    "<div class='card' data-section='os'><p class='dim'>Register an Onshape OAuth app, then an <b>Element right panel</b> extension (Part Studio and Assembly) whose Action URL is:</p>" +
     "<p class='mono' style='word-break:break-all'>" + esc(location.origin) + "/static/onshape.html?documentId={$documentId}&amp;workspaceId={$workspaceOrVersionId}&amp;elementId={$elementId}&amp;server=https://cad.onshape.com</p>" +
     "<p class='dim'>Subscribe the company to the app. CAD users open the panel in Onshape and click Send — PDM exports STEP on the server (Onshape does not allow API calls from the browser).</p>" +
     "<div class='grid2'>" +
-      "<div class='modal-field'><label>Base URL</label><input id='os-base' value='" + esc(osh.base_url || "https://cad.onshape.com") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Access key</label><input id='os-key' value='" + esc(osh.access_key || "") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field' style='grid-column:1/-1'><label>Secret</label><input id='os-secret' type='password' placeholder='" + (osh.secret_set ? "unchanged" : "") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field' style='grid-column:1/-1'><label>Default PDM project</label><select id='os-proj'" + (canEdit?"":" disabled") + ">" +
+      setInput("os-base", "Base URL", osh.base_url || "https://cad.onshape.com", Object.assign({ hint:"Default: https://cad.onshape.com" }, ro)) +
+      setInput("os-key", "Access key", osh.access_key, ro) +
+      setInput("os-secret", "Secret", "", Object.assign({ type:"password", wide:true, hint: secretHint(osh.secret_set) }, ro)) +
+      "<div class='modal-field' style='grid-column:1/-1'><label for='os-proj'>Default PDM project</label><select id='os-proj'" + (canEdit?"":" disabled") + ">" +
         "<option value=''>—</option>" +
         (proj.projects||[]).map(p => "<option value='"+p.id+"'" + (String(osh.default_project_id||"")===String(p.id)?" selected":"") + ">"+esc(p.name)+"</option>").join("") +
       "</select></div>" +
-      "<div class='modal-field' style='grid-column:1/-1'><label><input id='os-folder-sync' type='checkbox'" + (osh.folder_sync_enabled ? " checked" : "") + (canEdit ? "" : " disabled") + "> Enable Onshape folder sync</label></div>" +
+      "<div class='modal-field' style='grid-column:1/-1'><label><input id='os-folder-sync' type='checkbox' style='width:auto'" + (osh.folder_sync_enabled ? " checked" : "") + (canEdit ? "" : " disabled") + "> Enable Onshape folder sync</label>" +
+      setHint("os-folder-sync", "Default: off.") + "</div>" +
     "</div>" +
-    (canEdit ? "<div class='row' style='margin-top:10px'><button id='os-save' class='primary'>Save Onshape</button>" +
-      "<span class='dim'>" + (osh.configured ? "configured" : "not configured") + "</span></div>" : "") +
+    (canEdit ? "<div class='row' style='margin-top:10px'><button id='os-save'>Save Onshape</button>" +
+      "<span class='dim' id='os-stat'>" + (osh.configured ? "Status: configured" : "Status: not configured") + "</span>" + unsavedHTML() + "</div>" : "") +
     "</div>" +
     "<h2 class='sec'>Laser nesting defaults</h2>" +
-    "<div class='card'><p class='dim'>Pre-fills the New laser nest panel. Blank fields keep the panel's built-in default. " +
-    "Units of measure applies to the sheet/part dimensional fields.</p>" +
+    "<div class='card' data-section='nd'><p class='dim'>Pre-fills the New laser nest panel. A blank field keeps the panel's built-in value, shown under it. " +
+    "Units of measure applies to the sheet and spacing fields; changing it converts the values shown.</p>" +
     "<div class='grid2'>" +
-      "<div class='modal-field'><label>Units of measure</label><select id='nd-units'" + (canEdit?"":" disabled") + ">" +
-        ["in","mm"].map(u => "<option value='"+u+"' " + (nd.units===u?"selected":"") + ">" + (u==="in"?"Inches":"Millimetres") + "</option>").join("") + "</select></div>" +
-      "<div class='modal-field'><label>Part source unit</label><select id='nd-punit'" + (canEdit?"":" disabled") + ">" +
-        ["auto","in","mm"].map(u => "<option value='"+u+"' " + (nd.partUnit===u?"selected":"") + ">" + (u==="auto"?"Auto (file units)":u==="in"?"Inches":"Millimetres") + "</option>").join("") + "</select></div>" +
-      "<div class='modal-field'><label>Sheet width</label><input id='nd-width' value='" + esc(String(nd.width ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Sheet length</label><input id='nd-length' value='" + esc(String(nd.length ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Sheet margin</label><input id='nd-margin' value='" + esc(String(nd.margin ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Part spacing (H)</label><input id='nd-spx' value='" + esc(String(nd.spacingX ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Part spacing (V)</label><input id='nd-spy' value='" + esc(String(nd.spacingY ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Grain direction</label><select id='nd-grain'" + (canEdit?"":" disabled") + ">" +
-        [["along_length","Vertical"],["along_width","Horizontal"],["any","Ignore"]].map(([u,l]) =>
-          "<option value='"+u+"' " + (nd.grainDirection===u?"selected":"") + ">" + l + "</option>").join("") + "</select></div>" +
-      "<div class='modal-field'><label>Nesting corner</label><select id='nd-corner'" + (canEdit?"":" disabled") + ">" +
-        [["lower_left","Lower Left"],["lower_right","Lower Right"],["upper_left","Upper Left"],["upper_right","Upper Right"]].map(([u,l]) =>
-          "<option value='"+u+"' " + (nd.nestingCorner===u?"selected":"") + ">" + l + "</option>").join("") + "</select></div>" +
-      "<div class='modal-field'><label><input id='nd-gull' type='checkbox'" + (nd.guillotine?" checked":"") + (canEdit?"":" disabled") + "> Guillotine cut</label></div>" +
-      "<div class='modal-field'><label><input id='nd-labels' type='checkbox'" + (nd.addPartLabels?" checked":"") + (canEdit?"":" disabled") + "> Add part labels</label></div>" +
+      setSelect("nd-units", "Units of measure", [["in","Inches"],["mm","Millimetres"]], ndUnits, Object.assign({ hint:"Default: Inches." }, ro)) +
+      setSelect("nd-punit", "Part source unit", [["auto","Auto (file units)"],["in","Inches"],["mm","Millimetres"]],
+        nd.partUnit || "auto", Object.assign({ hint:"Default: Auto (file units)." }, ro)) +
+      NEST_LEN_FIELDS.map(([id, key, label]) => setInput(id, label + " (<span class='nd-u'>" + ndUnits + "</span>)", nd[key],
+        Object.assign({ inputmode:"decimal", hint: nestBlankHint(key, ndUnits) }, ro))).join("") +
+      setSelect("nd-grain", "Grain direction", [["along_length","Vertical"],["along_width","Horizontal"],["any","Ignore"]],
+        nd.grainDirection || "along_length", Object.assign({ hint:"Default: Vertical." }, ro)) +
+      setSelect("nd-corner", "Nesting corner", [["lower_left","Lower Left"],["lower_right","Lower Right"],["upper_left","Upper Left"],["upper_right","Upper Right"]],
+        nd.nestingCorner || "lower_left", Object.assign({ hint:"Default: Lower Left." }, ro)) +
+      "<div class='modal-field'><label><input id='nd-gull' type='checkbox' style='width:auto'" + (nd.guillotine?" checked":"") + (canEdit?"":" disabled") + "> Guillotine cut</label>" + setHint("nd-gull", "Default: off.") + "</div>" +
+      "<div class='modal-field'><label><input id='nd-labels' type='checkbox' style='width:auto'" + (nd.addPartLabels?" checked":"") + (canEdit?"":" disabled") + "> Add part labels</label>" + setHint("nd-labels", "Default: off.") + "</div>" +
     "</div>" +
-    (canEdit ? "<div class='row' style='margin-top:10px'><button id='nd-save' class='primary'>Save nesting defaults</button></div>" : "") +
+    (canEdit ? "<div class='row' style='margin-top:10px'><button id='nd-save'>Save nesting defaults</button>" + unsavedHTML() + "</div>" : "") +
     "</div>" +
     "<div class='head'><h2 class='sec' style='margin:0'>Part-number prefixes</h2>" +
     "<div class='grow'></div>" +
-    (canEdit ? "<button id='pn-add' class='primary'>＋ Add prefix</button>" : "") +
+    (canEdit ? "<button id='pn-add'><svg class='icon'><use href='#ic-plus'/></svg> Add prefix</button>" : "") +
     "</div>" +
     "<div class='card'><p class='dim'>When a part number is left blank on upload or create, the server auto-assigns one as " +
     "<b class='mono'>PREFIX-000001</b>, <b class='mono'>PREFIX-000002</b>, … The prefix is looked up from the item's " +
     "<b>category</b> below. Categories with no configured prefix fall back to the category name itself.</p>" +
-    prefixTable(prefixes, canEdit) +
+    "<div id='pn-table'>" + prefixTable(prefixes, canEdit) + "</div>" +
     "<p class='dim muted' style='margin-top:10px'>Existing items keep their part numbers; changing a prefix only affects newly auto-assigned ones.</p></div>" +
+    "<div id='release-approval'></div>" +
     "<h2 class='sec'>My account</h2>" +
     "<div class='card'><p class='dim'>Password for your account (" + esc(myName()) + "). " +
     "Org admins can also reset any user's password from Administration.</p>" +
@@ -4883,71 +5825,96 @@ async function viewSettings(v){
   if (addBtn) addBtn.onclick = () => addPrefix();
   const cpBtn = $("changepw");
   if (cpBtn) cpBtn.onclick = () => changePassword();
+  releaseApprovalCard($("release-approval"), canEdit);
   wireFontPicker(v);
   wireThemePicker(v);
-  wireGpuPicker(v, canEdit);
-  if ($("preview-style-save")) $("preview-style-save").onclick = async () => {
-    try { await api("PUT", "/settings/preview-style", {preview_style:$("preview-style").value}); toast("Preview style saved", "ok"); }
-    catch(e){ toast("Preview style: " + e.message, "err"); }
-  };
+  if (canEdit) mountBrandingCard(v);
+  wireGpuPicker(v, isHostAdmin());
+  wirePrefixTable(v);
+  wireDirty(v);
+  guardUnsavedEdits();
+  if ($("preview-style-save")) $("preview-style-save").onclick = () =>
+    saveSection($("preview-style-save"), "Saving…", "Preview style",
+      () => api("PUT", "/settings/preview-style", { preview_style: $("preview-style").value }));
   const mailSave = $("mail-save");
   if (mailSave) mailSave.onclick = async () => {
-    const port = Number($("mail-port").value);
-    try {
-      await api("PUT", "/settings/mail", {
-        host: $("mail-host").value.trim(),
-        port: Number.isFinite(port) && port > 0 ? port : 587,
-        username: $("mail-user").value.trim(),
-        password: $("mail-pass").value,
-        from: $("mail-from").value.trim(),
-        tls: $("mail-tls").value,
-        login_url: $("mail-url").value.trim()
-      });
-      toast("Mail server saved", "ok");
-      render(false);
-    } catch(e){ toast("Mail: " + e.message, "err"); }
+    const ps = $("mail-port").value.trim();
+    const port = ps === "" ? 587 : Number(ps);
+    if (!Number.isInteger(port) || port < 1 || port > 65535){
+      fieldProblem("mail-port", "Enter a whole number from 1 to 65535, or leave it blank for 587.");
+      $("mail-port").focus();
+      return;
+    }
+    const sentPass = $("mail-pass").value;
+    const d = await saveSection(mailSave, "Saving…", "Mail settings", () => api("PUT", "/settings/mail", {
+      host: $("mail-host").value.trim(), port,
+      username: $("mail-user").value.trim(),
+      password: $("mail-pass").value,
+      from: $("mail-from").value.trim(),
+      tls: $("mail-tls").value,
+      login_url: $("mail-url").value.trim()
+    }));
+    if (!d) return;
+    GS_ADMIN = null; // the dashboard guide reads mail status again
+    if ($("mail-pass").value === sentPass) $("mail-pass").value = "";
+    if ($("mail-pass-hint")) $("mail-pass-hint").textContent = secretHint(d.password_set);
+    if ($("mail-port").value.trim() === ps) $("mail-port").value = String(d.port || port);
+    if ($("mail-stat")) $("mail-stat").textContent = d.configured ? "Status: configured" : "Status: not configured";
   };
   const mailTest = $("mail-test");
   if (mailTest) mailTest.onclick = async () => {
+    if (mailTest.disabled) return;
+    mailTest.disabled = true; mailTest.textContent = "Sending…";
     try {
       const d = await api("POST", "/settings/mail/test", {});
       toast("Test message sent to " + (d.to || "you"), "ok");
-    } catch(e){ toast("Mail test: " + e.message, "err"); }
+    } catch(e){ toast("Test message not sent: " + e.message, "err"); }
+    finally { mailTest.disabled = false; mailTest.textContent = "Send test"; }
   };
   const osSave = $("os-save");
   if (osSave) osSave.onclick = async () => {
-    try {
-      await api("PUT", "/settings/onshape", {
-        base_url: $("os-base").value.trim(),
-        access_key: $("os-key").value.trim(),
-        secret: $("os-secret").value,
-        default_project_id: $("os-proj").value || null,
-        folder_sync_enabled: $("os-folder-sync").checked
-      });
-      toast("Onshape API saved", "ok");
-      render(false);
-    } catch(e){ toast("Onshape: " + e.message, "err"); }
+    const sentSecret = $("os-secret").value;
+    const d = await saveSection(osSave, "Saving…", "Onshape settings", () => api("PUT", "/settings/onshape", {
+      base_url: $("os-base").value.trim(),
+      access_key: $("os-key").value.trim(),
+      secret: $("os-secret").value,
+      default_project_id: $("os-proj").value || null,
+      folder_sync_enabled: $("os-folder-sync").checked
+    }));
+    if (!d) return;
+    if ($("os-secret").value === sentSecret) $("os-secret").value = "";
+    if ($("os-secret-hint")) $("os-secret-hint").textContent = secretHint(d.secret_set);
+    if ($("os-stat")) $("os-stat").textContent = d.configured ? "Status: configured" : "Status: not configured";
   };
+  const ndUnitSel = $("nd-units");
+  if (ndUnitSel){
+    let shown = ndUnitSel.value;
+    const exact = {};
+    for (const [id] of NEST_LEN_FIELDS){
+      exact[id] = lengthToMm($(id).value, shown);
+      $(id).addEventListener("input", () => { exact[id] = lengthToMm($(id).value, shown); });
+    }
+    ndUnitSel.addEventListener("change", () => {
+      shown = ndUnitSel.value;
+      for (const [id] of NEST_LEN_FIELDS) if (exact[id] != null) $(id).value = mmToText(exact[id], shown);
+      v.querySelectorAll(".nd-u").forEach(s => s.textContent = shown);
+      for (const [id, key] of NEST_LEN_FIELDS){ const h = $(id + "-hint"); if (h) h.textContent = nestBlankHint(key, shown); }
+    });
+  }
   const ndSave = $("nd-save");
   if (ndSave) ndSave.onclick = async () => {
-    const numOr = id => { const n = num($(id).value); return isFinite(n) ? n : null; };
-    try {
-      await api("PUT", "/settings/nest-defaults", {
-        units: $("nd-units").value,
-        part_unit: $("nd-punit").value,
-        width: numOr("nd-width"),
-        length: numOr("nd-length"),
-        margin: numOr("nd-margin"),
-        spacingX: numOr("nd-spx"),
-        spacingY: numOr("nd-spy"),
-        grainDirection: $("nd-grain").value,
-        nestingCorner: $("nd-corner").value,
-        guillotine: $("nd-gull").checked,
-        addPartLabels: $("nd-labels").checked,
-      });
-      toast("Nesting defaults saved", "ok");
-      render(false);
-    } catch(e){ toast("Nesting defaults: " + e.message, "err"); }
+    const f = { units: $("nd-units").value, partUnit: $("nd-punit").value,
+      grainDirection: $("nd-grain").value, nestingCorner: $("nd-corner").value,
+      guillotine: $("nd-gull").checked, addPartLabels: $("nd-labels").checked };
+    for (const [id, key] of NEST_LEN_FIELDS) f[key] = $(id).value;
+    const { body, bad } = nestDefaultsBody(f);
+    if (bad.length){
+      const ids = NEST_LEN_FIELDS.filter(x => bad.includes(x[2])).map(x => x[0]);
+      ids.forEach(id => fieldProblem(id, "Enter a number of 0 or more, or leave it blank."));
+      $(ids[0]).focus();
+      return;
+    }
+    await saveSection(ndSave, "Saving…", "Nesting defaults", () => api("PUT", "/settings/nest-defaults", body));
   };
 }
 function prefixTable(prefixes, canEdit){
@@ -4958,56 +5925,106 @@ function prefixTable(prefixes, canEdit){
     "<td>" + esc(p.category) + "</td>" +
     (canEdit ? "<td style='white-space:nowrap'>" +
       "<button class='small' data-edit='" + esc(p.category) + "'>Edit</button> " +
-      "<button class='small danger' data-del='" + esc(p.category) + "'>Delete</button></td>" : "") +
+      "<button class='small danger' data-del='" + esc(p.category) + "' data-prefix='" + esc(p.prefix) + "'>Delete</button></td>" : "") +
     "</tr>").join("");
-  const onEdit = canEdit
-    ? (v) => v.querySelectorAll("[data-edit]").forEach(b =>
-        b.addEventListener("click", () => editPrefix(b.dataset.edit)))
-    : () => {};
-  const onDel = canEdit
-    ? (v) => v.querySelectorAll("[data-del]").forEach(b =>
-        b.addEventListener("click", () => deletePrefix(b.dataset.del)))
-    : () => {};
-  const wrap = document.createElement("div");
-  wrap.innerHTML = "<table><thead><tr><th>Prefix</th><th>Category</th>" +
+  return "<table><thead><tr><th>Prefix</th><th>Category</th>" +
     (canEdit ? "<th></th>" : "") + "</tr></thead><tbody>" + rows + "</tbody></table>";
-  onEdit(wrap); onDel(wrap);
-  return wrap.innerHTML;
+}
+// Wire the prefix table's buttons once it is in the page (it used to be wired on a
+// detached copy, so Edit and Delete did nothing).
+function wirePrefixTable(root){
+  root.querySelectorAll("[data-edit]").forEach(b => b.onclick = () => editPrefix(b.dataset.edit));
+  root.querySelectorAll("[data-del]").forEach(b => b.onclick = () => deletePrefix(b.dataset.del, b.dataset.prefix));
+}
+// Redraw only the prefix table, leaving unsaved edits in other sections alone.
+async function refreshPrefixes(){
+  const box = $("pn-table");
+  if (!box) return;
+  GS_ADMIN = null; // the dashboard guide reads prefixes again
+  try {
+    const d = await api("GET", "/settings/part-number-prefixes");
+    box.innerHTML = prefixTable(d.prefixes || [], isRole("admin"));
+    wirePrefixTable(box);
+  } catch(e){ toast("Prefix list not refreshed: " + e.message, "err"); }
 }
 async function addPrefix(){
   const f = await openModal("Add part-number prefix", [
     { id:"category", label:"Category", required:true, placeholder:"e.g. Drain Tray" },
     { id:"prefix", label:"Prefix", required:true, placeholder:"e.g. DT" }
-  ], "Add prefix");
-  if (!f) return;
-  try {
-    await api("POST", "/settings/part-number-prefixes",
-      { category: f.category.trim(), prefix: f.prefix.trim() });
-    toast("Prefix added", "ok");
-    render(false);
-  } catch(e){ toast("Add prefix: " + e.message, "err"); }
+  ], { label:"Add prefix", busyLabel:"Adding…", onSubmit: f => api("POST", "/settings/part-number-prefixes",
+    { category: f.category.trim(), prefix: f.prefix.trim() }) });
+  if (f) await refreshPrefixes();
 }
 async function editPrefix(category){
-  const d = await api("GET", "/settings/part-number-prefixes");
-  const p = (d.prefixes || []).find(x => x.category === category);
-  const f = await openModal("Edit prefix — " + category, [
-    { id:"prefix", label:"New prefix", required:true, value: p ? p.prefix : "" }
-  ], "Save");
-  if (!f) return;
+  let p = null;
   try {
-    await api("POST", "/settings/part-number-prefixes",
-      { category: category, prefix: f.prefix.trim() });
-    toast("Prefix updated", "ok");
-    render(false);
-  } catch(e){ toast("Edit prefix: " + e.message, "err"); }
+    const d = await api("GET", "/settings/part-number-prefixes");
+    p = (d.prefixes || []).find(x => x.category === category) || null;
+  } catch(e){ toast("Prefix not loaded: " + e.message, "err"); return; }
+  const f = await openModal("Edit prefix for " + category, [
+    { id:"prefix", label:"Prefix", required:true, value: p ? p.prefix : "" }
+  ], { label:"Save prefix", busyLabel:"Saving…", onSubmit: f => api("POST", "/settings/part-number-prefixes",
+    { category: category, prefix: f.prefix.trim() }) });
+  if (f) await refreshPrefixes();
 }
-async function deletePrefix(category){
-  if (!confirm("Delete the prefix for \"" + category + "\"? New items in this category will fall back to the category name.")) return;
-  try {
-    await api("DELETE", "/settings/part-number-prefixes/" + encodeURIComponent(category));
-    toast("Prefix deleted", "ok");
-    render(false);
-  } catch(e){ toast("Delete prefix: " + e.message, "err"); }
+async function deletePrefix(category, prefix){
+  const ok = await openModal("Delete prefix " + (prefix || "") + " for " + category + "?", [],
+    { label:"Delete prefix", busyLabel:"Deleting…", danger:true, onSubmit: async () => {
+      await api("DELETE", "/settings/part-number-prefixes/" + encodeURIComponent(category));
+      return true;
+    } },
+    "<p>New items in <b>" + esc(category) + "</b> will then be numbered with the category name as their prefix. " +
+    "Existing part numbers do not change.</p>");
+  if (ok) await refreshPrefixes();
+}
+// ── getting started (dashboard) ─────────────────────────────────────────
+// Stays until every step is done or the user hides it (per browser). Admin-only steps
+// are shown to admins only. Mail and prefix status are re-read at most once a minute.
+let GS_ADMIN = null, GS_ADMIN_AT = 0;
+
+function gettingStartedSteps(s){
+  const steps = [
+    { key:"project", text:"Create a project", done: s.projects > 0, go:"projects", btn:"Open projects" },
+    { key:"upload", text:"Upload a file: open a project and choose Upload, or drop files on it",
+      done: s.items > 0, go:"projects", btn:"Open projects" },
+  ];
+  if (s.admin) steps.push(
+    { key:"mail", text:"Set up the mail server (needed to send invites)", done: !!s.mail, go:"settings", btn:"Open Settings" },
+    { key:"invite", text:"Invite a teammate", done: s.users > 1, go:"admin", btn:"Open Administration" },
+    { key:"prefix", text:"Set part-number prefixes (optional)", done: s.prefixes > 0, go:"settings", btn:"Open Settings", optional:true });
+  return steps;
+}
+async function gettingStartedHTML(k){
+  let hidden = false;
+  try { hidden = localStorage.getItem("pdm_getting_started") === "hidden"; } catch(e){}
+  if (hidden || !k) return "";
+  const admin = isRole("admin");
+  if (admin && (!GS_ADMIN || Date.now() - GS_ADMIN_AT > 60000)){
+    const [mail, pn] = await Promise.all([
+      api("GET", "/settings/mail").catch(() => null),
+      api("GET", "/settings/part-number-prefixes").catch(() => null)]);
+    GS_ADMIN = { mail: mail ? !!mail.configured : null, prefixes: pn ? (pn.prefixes || []).length : null };
+    GS_ADMIN_AT = Date.now();
+  }
+  const steps = gettingStartedSteps({ admin, projects: PROJECTS.length, items: k.items || 0,
+    users: USERS.length, mail: admin && GS_ADMIN.mail !== false, prefixes: admin ? (GS_ADMIN.prefixes ?? 1) : 0 });
+  if (steps.every(s => s.done || s.optional)) return "";
+  return "<div class='card' id='getting-started' style='margin-bottom:14px'>" +
+    "<div class='head'><h2 class='sec' style='margin:0'>Get started</h2><div class='grow'></div>" +
+    "<button class='small' id='gs-hide'>Hide this guide</button></div>" +
+    "<ol class='gs-steps'>" + steps.map(s => "<li>" +
+      (s.done ? "<span class='dim'>" + esc(s.text) + " (done)</span>" :
+        esc(s.text) + " <button class='small' data-gs='" + s.go + "'>" + esc(s.btn) + "</button>") +
+      "</li>").join("") + "</ol></div>";
+}
+function wireGettingStarted(v){
+  v.querySelectorAll("[data-gs]").forEach(b => b.onclick = () => go(b.dataset.gs));
+  const hide = $("gs-hide");
+  if (hide) hide.onclick = () => {
+    try { localStorage.setItem("pdm_getting_started", "hidden"); } catch(e){}
+    const card = $("getting-started");
+    if (card) card.remove();
+  };
 }
 
 async function viewAdmin(v){
@@ -5017,18 +6034,23 @@ async function viewAdmin(v){
       "<b>" + esc(myName()) + "</b> with role <b>" + esc(ME && ME.user ? ME.user.role : "?") + "</b>.</p></div>";
     return;
   }
-  const [us, aud, vs] = await Promise.all([
+  const [us, aud, vs, mail] = await Promise.all([
     api("GET", "/users"),
     api("GET", "/audit?limit=100").catch(() => ({ events: [] })),
-    api("GET", "/version").catch(() => ({}))
+    api("GET", "/version").catch(() => ({})),
+    api("GET", "/settings/mail").catch(() => null)
   ]);
   USERS = us.users || [];
   UMAP = {};
   for (const u of USERS) UMAP[u.id] = u;
+  // Invites are emailed: without a mail server the server refuses them, so say so here.
+  const noMail = !!mail && !mail.configured;
   v.innerHTML =
     "<div class='head'><h2>Administration</h2><div class='grow'></div>" +
-    "<button id='adduser' class='primary'>＋ Add user</button>" +
-    "<button id='invbtn'>＋ Invite user</button></div>" +
+    "<button id='adduser' class='primary'><svg class='icon'><use href='#ic-plus'/></svg> Add user</button>" +
+    "<button id='invbtn'" + (noMail ? " disabled aria-describedby='inv-why'" : "") + "><svg class='icon'><use href='#ic-plus'/></svg> Invite user</button></div>" +
+    (noMail ? "<p class='dim' id='inv-why'>Invite user needs a mail server. " +
+      "<a href='#/settings' id='inv-setup'>Set up the mail server in Settings</a>, or use Add user and share the password yourself.</p>" : "") +
     "<h2 class='sec'>Appearance</h2>" +
     "<div class='card'><p class='dim'>Colour theme for the web workspace. Stored in this browser.</p>" +
     themePickerHTML() + "</div>" +
@@ -5044,12 +6066,14 @@ async function viewAdmin(v){
     "<div style='margin-top:10px'><button class='small' id='syslink'>System status →</button></div></div>";
   $("adduser").onclick = addUser;
   $("invbtn").onclick = inviteUser;
+  if ($("inv-setup")) $("inv-setup").onclick = e => { e.preventDefault(); go("settings"); };
   $("syslink").onclick = () => go("system");
   wireThemePicker(v);
   v.querySelectorAll("[data-tok]").forEach(b => b.addEventListener("click", () => giveToken(UMAP[b.dataset.tok])));
   v.querySelectorAll("[data-pw]").forEach(b => b.addEventListener("click", () => resetPassword(UMAP[b.dataset.pw])));
   v.querySelectorAll("[data-edit]").forEach(b => b.addEventListener("click", () => editUser(UMAP[b.dataset.edit])));
   v.querySelectorAll("[data-active]").forEach(b => b.addEventListener("click", () => toggleUserActive(UMAP[b.dataset.active])));
+  v.querySelectorAll("[data-hostadm]").forEach(b => b.addEventListener("click", () => toggleHostAdmin(UMAP[b.dataset.hostadm])));
   $("setsave").onclick = async () => {
     try {
       const payload = JSON.parse($("setjson").value || "{}");
@@ -6678,18 +7702,33 @@ function tabPermissions(box){
 // Full view renders replace controls, previews and scroll state. Keep timer-
 // driven renders opt-in; explicit refresh and updates after an action still work.
 function refreshModeLabel(){
+  if (LIVE.state === "live") return AUTO_REFRESH ? "Live: lists update as things change"
+    : "Live: a bar offers Refresh when something changes";
+  if (LIVE.state === "signedout") return "Live updates paused: sign in again to resume";
   return AUTO_REFRESH ? "Auto-refresh every " + POLL_MS / 1000 + "s" : "Manual refresh";
 }
+// Whether a timer or a live update may rebuild the view now. Editing pages, and anything the user
+// is in the middle of (a dialog or menu, a focused field, selected rows, the nest panel or an
+// expanded nest), are left alone: a field may hold a draft after it loses focus.
+function canRerender(){
+  if (!ME || document.hidden || AUTH_BUSY) return false;
+  if (LIVE_EDIT_PAGES.includes(ROUTE.name)) return false;
+  if (document.querySelector(".modal-backdrop, dialog[open], .ctxmenu:not(.hidden), .kebabmenu:not(.hidden)")) return false;
+  const ae = document.activeElement;
+  if (ae && ae !== document.body &&
+    (ae.isContentEditable || ["INPUT", "TEXTAREA", "SELECT", "IFRAME"].includes(ae.tagName))) return false;
+  if (document.querySelector("#view .bulkbar")) return false;
+  if (ROUTE.name === "laser-nests" && (NC.active ||
+    [...document.querySelectorAll("#view .ln-detail")].some(b => b.dataset.loaded === "1" && b.style.display !== "none")))
+    return false;
+  return true;
+}
 function startPolling(){
+  // Opted-in list views refresh on a timer while live updates are not connected, and always on
+  // pages that live updates do not cover. Not while signed out: that waits for the user.
   setInterval(() => {
-    if (!AUTO_REFRESH || !ME || document.hidden || AUTH_BUSY) return;
-    // Even when opted in, do not rebuild editing/settings pages or an open
-    // editor, menu or dialog. A field may contain a draft after it loses focus.
-    if (["detail", "settings", "admin"].includes(ROUTE.name)) return;
-    if (document.querySelector(".modal-backdrop, dialog[open], .ctxmenu:not(.hidden), .kebabmenu:not(.hidden)")) return;
-    const ae = document.activeElement;
-    if (ae && ae !== document.body &&
-      (ae.isContentEditable || ["INPUT", "TEXTAREA", "SELECT", "IFRAME"].includes(ae.tagName))) return;
+    if (!AUTO_REFRESH || LIVE.state === "signedout" || !canRerender()) return;
+    if (LIVE.state === "live" && LIVE_ROUTES.includes(ROUTE.name)) return;
     if (CUR_RELOAD) Promise.resolve(CUR_RELOAD()).catch(() => {});
     refreshApprovalsBadge();
   }, POLL_MS);
@@ -6700,6 +7739,254 @@ function startPolling(){
     if (!ME || !TOKEN || document.hidden || !document.querySelector("dialog.web-editor[open]")) return;
     fetch("/me", { headers: { "Authorization": "Bearer " + TOKEN } }).catch(() => {});
   }, 30000);
+}
+
+// ── live updates ────────────────────────────────────────────────────────
+// GET /events/stream pushes a short hint whenever something is recorded in the organization's
+// activity log, including background jobs. It is read with fetch() so the sign-in's bearer header
+// goes along (an EventSource cannot send it). With Auto-refresh on, list views refresh when a hint
+// concerns them; otherwise, and on editing pages or while the user is busy (canRerender), a bar
+// says who changed what and offers Refresh. A dropped stream reconnects with a growing pause and
+// catches up from the last audit id it saw; meanwhile Auto-refresh falls back to the timer.
+const LIVE_FIRST_MS = 15000;   // no first event by then: a proxy is holding the stream back
+const LIVE_STALL_MS = 60000;   // silence longer than two heartbeats: the connection is gone
+const LIVE_BATCH_MS = 500;     // one check-in brings several hints; refresh once
+const LIVE_HIDDEN_MS = 30000;
+const LIVE_GAP_MS = 3000;      // at most one live refresh this often, never two at once
+const LIVE_EDIT_PAGES = ["detail", "settings", "admin", "tool"];
+// Pages whose changes are in the activity log (liveConcerns); the rest keep the timed refresh.
+const LIVE_ROUTES = ["detail", "admin", "jobs", "laser-nests", "approvals", "activity", "dashboard",
+  "projects", "explorer", "items", "search", "mfg"];
+const LIVE = { state:"off", ctl:null, lastId:null, backoff:0, retryTimer:null, hideTimer:null,
+  authTimer:null, pending:[], batchTimer:null, deferTimer:null, barRoute:null, barTimer:null,
+  refreshing:false, lastRefresh:0, refreshTimer:null, news:null };
+
+// Server-Sent Events framing: complete events ("\n\n"-terminated) out of `buf`, and the rest.
+// Comment lines (the heartbeat) carry no event.
+function sseParse(buf){
+  buf = buf.replace(/\r\n/g, "\n");
+  const events = [];
+  let i;
+  while ((i = buf.indexOf("\n\n")) >= 0){
+    const block = buf.slice(0, i); buf = buf.slice(i + 2);
+    const ev = { event:"message", data:"", id:null }, data = [];
+    let any = false;
+    for (const line of block.split("\n")){
+      if (!line || line[0] === ":") continue;
+      const c = line.indexOf(":");
+      const field = c < 0 ? line : line.slice(0, c);
+      let value = c < 0 ? "" : line.slice(c + 1);
+      if (value[0] === " ") value = value.slice(1);
+      if (field === "event") ev.event = value;
+      else if (field === "data") data.push(value);
+      else if (field === "id") ev.id = value;
+      else continue;
+      any = true;
+    }
+    if (any){ ev.data = data.join("\n"); events.push(ev); }
+  }
+  return { events, rest: buf };
+}
+function liveJson(s){ try { return JSON.parse(s); } catch(e){ return null; } }
+function liveStatus(){ const el = $("refreshstatus"); if (el) el.textContent = refreshModeLabel(); }
+
+async function liveConnect(){
+  liveStop();
+  clearInterval(LIVE.authTimer);
+  if (!ME || !TOKEN || document.hidden) return;
+  const ctl = new AbortController(), token = TOKEN;
+  LIVE.ctl = ctl; LIVE.state = "connecting";
+  let ready = false, heard = Date.now();
+  const watchdog = setInterval(() => {
+    const quiet = Date.now() - heard;
+    if ((!ready && quiet > LIVE_FIRST_MS) || quiet > LIVE_STALL_MS) ctl.abort();
+  }, 2000);
+  try {
+    const url = "/events/stream" + (LIVE.lastId != null ? "?since=" + encodeURIComponent(LIVE.lastId) : "");
+    const r = await fetch(url, { headers: { "Authorization": "Bearer " + token, "Accept": "text/event-stream" },
+      cache: "no-store", signal: ctl.signal });
+    if (r.status === 401) return liveSignedOut(ctl, token);
+    if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;){
+      const { value, done } = await reader.read();
+      if (done) break;
+      heard = Date.now();
+      const p = sseParse(buf + dec.decode(value, { stream:true }));
+      buf = p.rest;
+      for (const ev of p.events){
+        const d = liveJson(ev.data) || {};
+        if (ev.event === "change") liveQueue(d);
+        else if (ev.event === "reset") liveQueue({ object_type:"*" });
+        else if (ev.event === "ready"){
+          ready = true; LIVE.backoff = 0; LIVE.state = "live"; liveStatus();
+          LIVE.lastId = Math.max(LIVE.lastId || 0, Number(d.last_id) || 0);
+        } else if (ev.event === "resync"){
+          // Hints were dropped on the way: reconnect at once and catch up from lastId.
+          LIVE.ctl = null; ctl.abort(); setTimeout(liveConnect, 0); return;
+        } else if (ev.event === "expired") return liveSignedOut(ctl, token);
+      }
+    }
+  } catch(e){ /* aborted, or the network went away */ }
+  finally { clearInterval(watchdog); }
+  if (LIVE.ctl === ctl) liveRetry();
+}
+// Stop this tab's stream (hidden tab, or a new connection replacing it). A paused stream keeps
+// watching for a new sign-in.
+function liveStop(){
+  clearTimeout(LIVE.retryTimer);
+  const c = LIVE.ctl; LIVE.ctl = null;
+  if (c) c.abort();
+  if (LIVE.state !== "signedout"){ LIVE.state = "off"; liveStatus(); }
+}
+function liveRetry(){
+  LIVE.ctl = null; LIVE.state = "down"; liveStatus();
+  const wait = Math.min(60000, 2000 * 2 ** LIVE.backoff) * (0.75 + Math.random() / 2);
+  LIVE.backoff = Math.min(LIVE.backoff + 1, 5);
+  clearTimeout(LIVE.retryTimer);
+  LIVE.retryTimer = setTimeout(liveConnect, wait);
+}
+// The sign-in behind the stream ended. Nothing is asked here: the next request the user makes
+// meets the usual in-place sign-in, and once a new sign-in is in place the stream resumes.
+function liveSignedOut(ctl, token){
+  if (LIVE.ctl === ctl) LIVE.ctl = null;
+  ctl.abort();
+  // Already signed in again (a request met the sign-in dialog first): carry on with the new one.
+  if (TOKEN && TOKEN !== token){ LIVE.state = "off"; setTimeout(liveConnect, 0); return; }
+  LIVE.state = "signedout"; liveStatus();
+  // A message with a Sign in button, not the sign-in dialog: the user may not be at the desk. None
+  // while the sign-in dialog is already open.
+  if (ME && ME.user && !REAUTH) signedOutNotice();
+  clearInterval(LIVE.authTimer);
+  LIVE.authTimer = setInterval(() => {
+    if (!TOKEN || TOKEN === token) return;
+    clearInterval(LIVE.authTimer); LIVE.state = "off"; liveConnect();
+  }, 2000);
+}
+
+function liveQueue(h){
+  if (h.audit_id != null) LIVE.lastId = Math.max(LIVE.lastId || 0, Number(h.audit_id) || 0);
+  LIVE.pending.push(h);
+  if (!LIVE.batchTimer) LIVE.batchTimer = setTimeout(liveFlush, LIVE_BATCH_MS);
+}
+// Does this hint change what the current page shows? ("*": not known, so yes.)
+function liveConcerns(h){
+  const t = h.object_type || "", a = h.action || "";
+  if (t === "*") return true;
+  if (/^user\.(login|token_created|password_changed)$/.test(a)) return false;
+  switch (ROUTE.name){
+    case "detail": {
+      const id = DETAIL.id, vs = (DETAIL.data && DETAIL.data.versions) || [];
+      return !!id && (h.object_id === id || h.item_id === id ||
+        (t === "version" && vs.some(v => v.id === h.object_id)));
+    }
+    case "admin": return t === "user";
+    case "jobs": return t === "job";
+    case "laser-nests": return t === "laser_nest" || (t === "job" && !!h.nest_id);
+    case "approvals": return t === "approval_request" || /^item\.(release|lifecycle)/.test(a);
+    case "activity": return t !== "job";
+    case "dashboard": return true;
+    case "projects": case "explorer": case "items": case "search": case "mfg":
+      return ["item", "project", "folder", "version"].includes(t) ||
+        (t === "job" && a !== "job.started" && !!h.item_id);
+    default: return false;   // settings, tools, machines…: nothing there is recorded yet
+  }
+}
+function liveFlush(){
+  LIVE.batchTimer = null;
+  const hints = LIVE.pending; LIVE.pending = [];
+  if (!ME) return;
+  if (AUTO_REFRESH && hints.some(h => h.object_type === "*" || h.object_type === "approval_request" ||
+    /^item\.(release|lifecycle)/.test(h.action || ""))) refreshApprovalsBadge();
+  const mine = hints.filter(liveConcerns);
+  if (!mine.length) return;
+  // Any change refreshes an opted-in list, the user's own too: a desktop client or agent acting as
+  // them changes it from elsewhere (the gap keeps an action's own refresh from doubling up).
+  if (AUTO_REFRESH && canRerender()) return liveRefresh();
+  // The bar is for other people's changes: the user's own are on the page they made them on. A
+  // job starting is news only where jobs are listed.
+  const news = mine.filter(h => !(h.actor_id && h.actor_id === myId()) &&
+    (h.action !== "job.started" || ROUTE.name === "jobs" || ROUTE.name === "dashboard"));
+  if (!news.length) return;
+  LIVE.news = news[news.length - 1];
+  liveBar(LIVE.news);
+  // A list view that was busy refreshes by itself once the user is done.
+  if (AUTO_REFRESH && !LIVE_EDIT_PAGES.includes(ROUTE.name)) liveDefer(ROUTE);
+}
+// Refresh the list now, or once the last refresh is LIVE_GAP_MS old and finished, so a burst of
+// changes (an import, a run of jobs) costs one refresh every few seconds, not two a second.
+function liveRefresh(){
+  liveBarHide();
+  clearTimeout(LIVE.refreshTimer); LIVE.refreshTimer = null;
+  const wait = LIVE.lastRefresh + LIVE_GAP_MS - Date.now();
+  if (LIVE.refreshing || wait > 0){
+    const route = ROUTE;
+    LIVE.refreshTimer = setTimeout(() => {
+      LIVE.refreshTimer = null;
+      if (ROUTE !== route) return;   // navigated: that view loaded fresh
+      if (canRerender()) liveRefresh();
+      else { liveBar(LIVE.news || {}); liveDefer(route); }
+    }, Math.max(wait, 250));
+    return;
+  }
+  if (!CUR_RELOAD) return;
+  LIVE.refreshing = true; LIVE.lastRefresh = Date.now();
+  Promise.resolve().then(CUR_RELOAD).catch(() => {}).finally(() => { LIVE.refreshing = false; });
+}
+function liveDefer(route){
+  clearInterval(LIVE.deferTimer);
+  LIVE.deferTimer = setInterval(() => {
+    if (ROUTE !== route || !LIVE.barRoute){ clearInterval(LIVE.deferTimer); return; }
+    if (canRerender()){ clearInterval(LIVE.deferTimer); liveRefresh(); }
+  }, 1000);
+}
+function liveWho(h){
+  if (h.object_type === "*") return "Updated while this page was not connected";
+  if (h.actor_id){
+    const u = UMAP[h.actor_id];
+    return "Updated by " + (u ? (u.display_name || u.email) : "another user");
+  }
+  if (h.object_type === "job")
+    return h.action === "job.failed" ? "A background job failed" :
+      h.action === "job.started" ? "A background job started" : "A background job finished";
+  return "Updated";
+}
+// The bar sits in a polite live region that is always on the page, so screen readers announce
+// it; it never takes focus, and it goes away on navigation.
+function liveBar(h){
+  const region = $("livebar");
+  if (!region) return;
+  region.style.top = ($("topbar") ? $("topbar").offsetHeight : 0) + "px";
+  let bar = region.querySelector(".livebar");
+  if (!bar){
+    bar = document.createElement("div"); bar.className = "livebar";
+    const msg = document.createElement("span"); msg.className = "livemsg";
+    const again = document.createElement("button"); again.type = "button"; again.className = "small";
+    again.textContent = "Refresh";
+    again.onclick = () => { liveBarHide(); if (CUR_RELOAD) CUR_RELOAD(); else render(true); };
+    const x = document.createElement("button"); x.type = "button"; x.className = "small";
+    x.textContent = "Dismiss"; x.onclick = liveBarHide;
+    bar.append(msg, again, x);
+    region.appendChild(bar);
+  }
+  // Rewritten only when it says something new, so a screen reader is not told the same twice.
+  const msg = bar.querySelector(".livemsg"), text = liveWho(h) + ".";
+  if (msg.textContent !== text) msg.textContent = text;
+  LIVE.barRoute = ROUTE;
+  clearInterval(LIVE.barTimer);
+  LIVE.barTimer = setInterval(() => { if (ROUTE !== LIVE.barRoute) liveBarHide(); }, 500);
+}
+function liveBarHide(){
+  clearInterval(LIVE.barTimer); clearInterval(LIVE.deferTimer);
+  LIVE.barRoute = null;
+  const region = $("livebar");
+  if (!region) return;
+  // Pressed from the keyboard: keep focus on the page (the view's heading), not lost to <body>.
+  const hadFocus = region.contains(document.activeElement);
+  region.textContent = "";
+  const v = $("view"), h = hadFocus && v ? v.querySelector("h2, h3") || v : null;
+  if (h){ if (!h.hasAttribute("tabindex")) h.tabIndex = -1; h.focus({ preventScroll:true }); }
 }
 
 // ── init ────────────────────────────────────────────────────────────────
@@ -6741,10 +8028,12 @@ function startPolling(){
   }
   $("menubtn").onclick = () => $("sidebar").classList.toggle("open");
   $("refreshbtn").onclick = () => (CUR_RELOAD ? CUR_RELOAD() : render(true));
+  $("refreshbtn").addEventListener("click", () => liveBarHide());
   const autoRefresh = document.createElement("button");
   autoRefresh.id = "autorefreshbtn";
   autoRefresh.className = "small";
-  autoRefresh.title = "Automatically refresh list views every six seconds. Editing pages refresh manually.";
+  autoRefresh.title = "Refresh list views as soon as something changes (every six seconds when live updates are " +
+    "not available). Editing pages, and pages you are busy on, show a Refresh bar instead.";
   const updateRefreshMode = () => {
     autoRefresh.textContent = "Auto-refresh: " + (AUTO_REFRESH ? "On" : "Off");
     autoRefresh.setAttribute("aria-pressed", String(AUTO_REFRESH));
@@ -6758,16 +8047,20 @@ function startPolling(){
   };
   $("refreshbtn").after(autoRefresh);
   updateRefreshMode();
+  const liveRegion = document.createElement("div");
+  liveRegion.id = "livebar"; liveRegion.setAttribute("role", "status");
+  $("topbar").after(liveRegion);
+  // Live updates follow the tab: a hidden tab lets its stream go (browsers allow only a few open
+  // connections per server) and catches up when it is shown again.
+  document.addEventListener("visibilitychange", () => {
+    clearTimeout(LIVE.hideTimer);
+    if (document.hidden) LIVE.hideTimer = setTimeout(liveStop, LIVE_HIDDEN_MS);
+    else if (ME && !LIVE.ctl && LIVE.state !== "signedout") liveConnect();
+  });
   $("signout").onclick = signout;
   $("userkebab").onclick = showUserMenu;
-  $("signin").onclick = signin;
-  $("connect").onclick = connectFromToken;
-  $("tokcopy").onclick = async () => {
-    try { await navigator.clipboard.writeText(TOKEN); toast("Token copied", "ok"); }
-    catch(e){ toast("Copy failed", "err"); }
-  };
-  $("login_password").addEventListener("keydown", e => { if (e.key === "Enter") signin(); });
-  $("token").addEventListener("keydown", e => { if (e.key === "Enter") connectFromToken(); });
+  $("signin-form").onsubmit = e => { e.preventDefault(); signin(); };
+  $("token-form").onsubmit = e => { e.preventDefault(); connectFromToken(); };
   $("globsearch").addEventListener("keydown", e => {
     if (e.key === "Enter"){
       const q = e.target.value.trim();
@@ -6786,8 +8079,10 @@ function startPolling(){
   api("GET", "/version").then(d => {
     const parts = [d.version ? "v" + d.version : null, d.build, d.commit,
       d.built_at ? "built " + d.built_at : null].filter(Boolean);
-    if (parts.length) $("authbuild").textContent = parts.join(" · ");
+    // The product name stays here when an organization brands the sign-in card.
+    if (parts.length) $("authbuild").textContent = "Foundry PDM " + parts.join(" · ");
   }).catch(() => {});
+  loadPublicBranding();
   startPolling();
   if (TOKEN) connectFromToken();
   else $("login-view").classList.remove("hidden");

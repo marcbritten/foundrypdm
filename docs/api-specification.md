@@ -18,7 +18,7 @@ Base URL in the dev image: `http://<host>:8080`.
   `session_expired` and the token is deleted, so later ones get 401 `auth_failed`. Tokens from
   `POST /users/{id}/tokens` never expire on their own.
 - `POST /auth/logout` — invalidate the current token.
-- `GET /me` — the signed-in identity.
+- `GET /me` — the signed-in identity; `host_admin: true` for a host admin.
 - `GET /me/settings`, `PUT /me/settings` — per-user jsonb payload (`{ payload }`). SolidCraft
   syncs its Prefs here.
 
@@ -56,7 +56,20 @@ Base URL in the dev image: `http://<host>:8080`.
 
 ### Search / audit
 - `GET /search?q=&project?` → `{ results: [ItemSummary] }`.
-- `GET /audit?item?` → `{ events: [ {id, action, object_type, actor_id, at, ...} ] }`.
+- `GET /audit?item?` → `{ events: [ {id, action, object_type, actor_id, at, ...} ] }` (newest first; background-job
+  rows are left out).
+- `GET /audit?since=<id>&limit?` → `{ events, last_id, has_more }`: the rows recorded after audit id `since`, oldest
+  first, background-job rows (`job.started`, `job.finished`, `job.failed`, object type `job`) included. `limit`
+  defaults to 100, at most 200. While `has_more` is true, continue from the last returned row's id; `last_id` is the
+  organization's highest audit id.
+- `GET /events/stream?since?` — live change hints for the caller's organization as Server-Sent Events, with the usual
+  `Authorization: Bearer` header (read it with `fetch()`; an `EventSource` cannot send the header). Events:
+  `change` (`id:` is the audit id; data `{audit_id, actor_id, action, object_type, object_id, item_id?, nest_id?}`,
+  no detail), `ready` (`{last_id}`), `resync` (hints may have been missed: reconnect with `?since=`), `reset` (too
+  many missed to replay: refresh everything) and `expired` (the sign-in ended; the stream closes). A comment line
+  comes every 25 s. `503` (`live_unavailable`) while the server's database listener is not connected. With `?since=<id>`, the rows recorded after that id come first as `change` events. Opening the
+  stream does not count as use of a web sign-in. Behind a proxy, see the Live updates section of
+  `docker-server.md`.
 
 ### Admin (Phase-1)
 - `POST /users` — create a user. `POST /users/{id}/tokens` — issue a token.
@@ -65,6 +78,17 @@ Base URL in the dev image: `http://<host>:8080`.
   and `active: true` to enable it. Disabled users cannot sign in or authenticate
   with existing tokens. Disabling or demoting the last active administrator
   returns `409 Conflict`; this constraint also applies to concurrent updates.
+- Host admins (see `docs/security.md`): `PUT /users/{id}/host-admin` `{ host_admin }` grants or
+  revokes it for an active admin of any organization (`409` for a non-admin or the last host
+  admin); `GET /host-admins` lists them. Both need a host admin, as do
+  `POST /settings/cad-cli/update`, `POST /settings/solidcraft-web/update`,
+  `POST /settings/dutchman/update`, `PUT /settings/gpu-policy` and changing `channel` in
+  `PUT /settings/dutchman`. A host admin's password, tokens and account are changed only by a
+  host admin.
+- `GET /settings/release-approval` → `{ require_approval_on_release }` (any member; default `false`).
+  `PUT /settings/release-approval` `{ require_approval_on_release: bool }` (admin) — when `true`,
+  `POST /items/{id}/release` opens an approval request and puts the item in review instead of
+  releasing at once; the revision is made when the request is approved.
 
 ### Branding (`crates/pdm-api/src/branding.rs`)
 An organization's display name, logo and color overrides, which replace the "Foundry PDM" mark

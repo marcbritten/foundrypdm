@@ -54,7 +54,7 @@ and releases the checkout lock.
 - **AuthN:** bearer API tokens (`api_tokens`, SHA-256-stored). `POST /auth/login` exchanges
   username+password (Argon2id) for a web sign-in token that expires (`docs/security.md`); API
   tokens for connectors and scripts don't.
-- **AuthZ:** RBAC via `users.role` (viewer/editor/admin) in Phase 1; full `roles`/`permissions`/
+- **AuthZ:** RBAC via `users.role` (viewer/operator/editor/admin, see `security.md`) in Phase 1; full `roles`/`permissions`/
   `groups`/`memberships` schema exists for the later model. **Org isolation** is enforced in every
   query (`org_id` in the WHERE clause), not by convention.
 - See `docs/security.md`.

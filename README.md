@@ -53,7 +53,10 @@ docker compose exec pdm pdm-cli create-user \
   --password "change-me"
 ```
 
-Open http://localhost:8080/ and sign in.
+Open http://localhost:8080/ and sign in. This first admin is also the server's host admin: the
+one who changes what every organization on the server shares and can make other admins host
+admins (see [docs/security.md](docs/security.md#authorization); recovery:
+`pdm-cli host-admin grant --email … [--org …]`).
 
 ### 4. Manage your installation
 
@@ -74,6 +77,9 @@ for advanced CAD, GPU and S3 configuration.
 
 Admin → **Settings** (not env vars):
 
+- **Branding** — display name, logo and theme colors for the sidebar, the sign-in page and
+  the browser tab; on a server with several organizations, `PDM_SIGNIN_ORG` picks the one the
+  sign-in page shows. `?nobrand` in the address turns the colors off for one visit
 - **Mail server** — SMTP so **Invite user** works
 - **Onshape** — API keys + default project for Send to manufacturing
 - **Preview renderer** — GPU vs CPU for thumbnails
@@ -82,6 +88,8 @@ Admin → **Settings** (not env vars):
 In **Administration → Users**, admins can disable or enable accounts. Disabled
 accounts retain their files and history, but cannot sign in or use existing API
 tokens until enabled again. At least one active administrator must remain.
+Each account has a role: viewer, operator (also records shop-floor job status and
+inspections), editor or admin; see [docs/security.md](docs/security.md#authorization).
 
 Do not commit SMTP or Onshape secrets.
 

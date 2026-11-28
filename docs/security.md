@@ -16,11 +16,40 @@
 - **OIDC** is a later hardening item (provider TBD; keep Argon2id as fallback).
 
 ## Authorization
-- **RBAC** via `users.role` (`viewer` | `editor` | `admin`) in Phase 1. The full
+- **RBAC** via `users.role` in Phase 1. Roles rank `viewer` < `operator` < `editor` < `admin`;
+  each can also do everything the roles before it can:
+
+  | Role | Adds |
+  |---|---|
+  | `viewer` | Reads the organization's projects, items, files and records; comments; opens versions through design links; frees a lock they hold; decides an approval request that names them. |
+  | `operator` | Records what happens on the shop floor: production job status (`POST /production-jobs/{id}/status`), print job status (`POST /print-jobs/{id}/status`) and inspections (`POST /inspections`). |
+  | `editor` | Changes the vault (projects, items, check-out and check-in, uploads, properties, release, lifecycle, archive, delete; Onshape imports, CAD conversions, previews), tools, machines, post-processors and manufacturing records (setups, CAM projects, NC programs and their release, production and print jobs, sheet metal, nests); raises approval requests and decides any of them. |
+  | `admin` | Manages users, API tokens and the organization's settings. |
+
+  Set a role with `pdm-cli create-user --role <role>` or in **Administration → Users**. The full
   `roles`/`permissions`/`groups`/`memberships` model is in the schema for the later phase.
 - **Org isolation** is enforced in **every** query (`org_id` in the WHERE clause), not by convention —
   a user of one org cannot read another org's items/blobs/versions.
 - Service accounts (`service_accounts`) for headless/non-user credentials.
+- **Host admins.** Some things are shared by every organization on a server: the CAD CLI and
+  SolidCraft web editor builds on the host, the Dutchman release channel (one binary converts for
+  everyone) and the GPU policy of the shared preview renderer. Only a host admin
+  (`users.is_host_admin`, an active admin) changes them; org admins see them read-only and get
+  `403` from the API. Org admins keep everything scoped to their own organization.
+  - The first admin made with `pdm-cli create-user --role admin` on a server with no host admin
+    becomes one. On upgrade (migration 0029), the earliest-created active admin of the
+    organization created first does (any organization's, if that one has none), and the channel
+    and GPU policy start from that organization. After upgrading, check with
+    `pdm-cli host-admin list` and grant or revoke as needed.
+  - Host admins grant and revoke it for admins of any organization (`PUT /users/{id}/host-admin`,
+    or the Users table in Administration). The last host admin cannot be revoked, and a host admin
+    cannot be disabled or demoted until it is revoked. Grants and revocations are audited.
+  - From the grant on, only a host admin can reset a host admin's password, give them an API token
+    or edit their account. Passwords and API tokens set before the grant are left as they are: if
+    another admin ever set that account's password or issued it a token, change the password and
+    replace the tokens (after an upgrade too).
+  - Recovery when no host admin can sign in: `pdm-cli host-admin grant --email … [--org …]`;
+    `pdm-cli host-admin list` shows who holds it.
 
 ## Data & storage
 - **Content-addressed, immutable blobs** (SHA-256). Integrity is verified on check-in

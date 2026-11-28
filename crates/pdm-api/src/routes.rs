@@ -225,7 +225,7 @@ pub struct ChangePasswordReq {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn require_org(authed: &Authed) -> Uuid {
+pub(crate) fn require_org(authed: &Authed) -> Uuid {
     authed.org_id
 }
 
@@ -454,9 +454,11 @@ pub async fn system_info(
 /// GET /me
 pub async fn me(Extension(authed): Extension<Authed>) -> Result<Json<serde_json::Value>, AppError> {
     let user = authed.user.clone();
+    let host_admin = user.as_ref().is_some_and(is_host_admin);
     Ok(serde_json::json!({
         "org_id": authed.org_id,
         "user": user,
+        "host_admin": host_admin,
         "scopes": authed.scopes
     })
     .into())
@@ -529,12 +531,43 @@ pub async fn change_own_password(
 // ── Settings: part-number prefixes ─────────────────────────────────────
 
 /// Org-admin only. Returns a forbidden error when the caller isn't an admin.
-fn require_admin(authed: &Authed) -> Result<&User, AppError> {
+pub(crate) fn require_admin(authed: &Authed) -> Result<&User, AppError> {
     let user = require_user(authed)?;
     if user.role != "admin" {
         return Err(AppError(PdmError::Forbidden("admin only".into())));
     }
     Ok(user)
+}
+
+/// A host admin: an active admin with `is_host_admin` (see `pdm_db::set_host_admin`).
+fn is_host_admin(user: &User) -> bool {
+    user.is_host_admin && user.active && user.role == "admin"
+}
+
+/// Host-admin only: for what the whole server shares (the CAD CLI and web editor builds on
+/// this host, the Dutchman release channel, the preview GPU policy), which org admins of one
+/// organization must not change for every other one.
+fn require_host_admin(authed: &Authed) -> Result<&User, AppError> {
+    let user = require_user(authed)?;
+    if !is_host_admin(user) {
+        return Err(AppError(PdmError::Forbidden(
+            "only a host admin can change this: it applies to the whole server, not just this \
+             organization — ask a host admin"
+                .into(),
+        )));
+    }
+    Ok(user)
+}
+
+/// Only a host admin may act on a host admin's account (password, tokens, profile): an org
+/// admin who could reset it could sign in as them and become a host admin.
+fn require_may_manage(actor: &User, target: &User) -> Result<(), AppError> {
+    if target.is_host_admin && !is_host_admin(actor) {
+        return Err(AppError(PdmError::Forbidden(
+            "only a host admin can change a host admin's account".into(),
+        )));
+    }
+    Ok(())
 }
 
 /// GET /settings/part-number-prefixes — list the org's configured part-number prefixes.
@@ -1023,11 +1056,12 @@ pub async fn get_cad_cli(
     .into())
 }
 
-/// POST /settings/cad-cli/update — download GitHub latest solidcraft-cli onto this host.
+/// POST /settings/cad-cli/update — download GitHub latest solidcraft-cli onto this host
+/// (host admin).
 pub async fn update_cad_cli(
     Extension(authed): Extension<Authed>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_admin(&authed)?;
+    require_host_admin(&authed)?;
     let dest = std::env::var("PDM_SOLVECRAFT_CLI")
         .unwrap_or_else(|_| pdm_update::CAD_CLI_DEFAULT_PATH.to_string());
     let tag = pdm_update::apply_cad_cli(std::path::Path::new(&dest))
@@ -1086,7 +1120,8 @@ pub async fn get_dutchman(
     .into())
 }
 
-/// PUT /settings/dutchman — this org's Dutchman conversion settings (admin).
+/// PUT /settings/dutchman — this org's Dutchman conversion settings (admin); the release
+/// channel is server-wide and needs a host admin.
 #[derive(serde::Deserialize)]
 pub struct DutchmanSettingsReq {
     channel: Option<String>,
@@ -1105,8 +1140,16 @@ pub async fn save_dutchman(
     require_admin(&authed)?;
     let org = require_org(&authed);
     let mut settings = pdm_db::get_dutchman_settings(&state.pool, org).await?;
-    if let Some(v) = body.channel.filter(|s| !s.trim().is_empty()) {
-        settings.channel = v.trim().to_string();
+    // The release channel is server-wide (one Dutchman binary serves every organization):
+    // only a host admin changes it. Re-sending the current channel with the org's own
+    // conversion options stays open to org admins.
+    let new_channel = body
+        .channel
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && *s != settings.channel);
+    if let Some(v) = &new_channel {
+        require_host_admin(&authed)?;
+        settings.channel = v.clone();
     }
     if let Some(v) = body.preset.filter(|s| !s.trim().is_empty()) {
         settings.preset = v.trim().to_string();
@@ -1122,6 +1165,10 @@ pub async fn save_dutchman(
     }
     if let Some(v) = body.onshape_max_calls {
         settings.onshape_max_calls = v;
+    }
+    settings.validate()?;
+    if let Some(v) = &new_channel {
+        pdm_db::set_host_dutchman_channel(&state.pool, v).await?;
     }
     pdm_db::set_dutchman_settings(&state.pool, org, &settings).await?;
     Ok(serde_json::json!({ "settings": settings }).into())
@@ -1150,13 +1197,13 @@ pub async fn save_nest_defaults(
     Ok(serde_json::json!({ "defaults": body }).into())
 }
 
-/// POST /settings/dutchman/update — pull the release the org's channel
-/// references onto this host now (admin).
+/// POST /settings/dutchman/update — pull the release the server's channel
+/// references onto this host now (host admin).
 pub async fn update_dutchman(
     State(state): State<AppState>,
     Extension(authed): Extension<Authed>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_admin(&authed)?;
+    require_host_admin(&authed)?;
     let org = require_org(&authed);
     let settings = pdm_db::get_dutchman_settings(&state.pool, org).await?;
     let dest = std::path::PathBuf::from(pdm_update::dutchman_cli_path());
@@ -1212,11 +1259,11 @@ pub async fn get_solidcraft_web(
 }
 
 /// POST /settings/solidcraft-web/update — download the newest web build onto
-/// this host now (admin).
+/// this host now (host admin).
 pub async fn update_solidcraft_web(
     Extension(authed): Extension<Authed>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_admin(&authed)?;
+    require_host_admin(&authed)?;
     let dir = solidcraft_web_dir().ok_or_else(|| {
         AppError(PdmError::BadRequest(
             "no SolidCraft web build directory on this server (PDM_PORTAL_DIR)".into(),
@@ -1300,15 +1347,15 @@ pub struct OnshapeLookupQuery {
     pub part_id: Option<String>,
 }
 
-/// PUT /settings/gpu-policy — set preview renderer (admin). `auto` | `hardware` | `software` | `cpu`.
+/// PUT /settings/gpu-policy — set the server-wide preview renderer policy (host admin; the
+/// renderer runs on the shared worker). `auto` | `hardware` | `software` | `cpu`.
 pub async fn put_gpu_policy(
     State(state): State<AppState>,
     Extension(authed): Extension<Authed>,
     Json(body): Json<GpuPolicyReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_admin(&authed)?;
-    let org = require_org(&authed);
-    let gpu_policy = pdm_db::set_gpu_policy(&state.pool, org, &body.gpu_policy).await?;
+    require_host_admin(&authed)?;
+    let gpu_policy = pdm_db::set_gpu_policy(&state.pool, &body.gpu_policy).await?;
     Ok(serde_json::json!({ "gpu_policy": gpu_policy }).into())
 }
 
@@ -2680,11 +2727,12 @@ pub async fn search(
 
 // ── Audit ───────────────────────────────────────────────────────────────
 
-/// GET /audit?item=...&limit=...
+/// GET /audit?item=...&limit=...  (or ?since=<audit id>: what a live page missed)
 #[derive(Deserialize)]
 pub struct AuditQuery {
     pub item: Option<Uuid>,
     pub limit: Option<u32>,
+    pub since: Option<i64>,
 }
 
 pub async fn audit(
@@ -2693,6 +2741,17 @@ pub async fn audit(
     Query(q): Query<AuditQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
+    if let Some(since) = q.since {
+        // Oldest first, background jobs included; `last_id` is the cursor for the next call.
+        let limit = q.limit.unwrap_or(100).clamp(1, 200);
+        let events = pdm_db::list_audit_since(&state.pool, org, since, limit).await?;
+        let last_id = pdm_db::last_audit_id(&state.pool, org).await?;
+        let has_more = events.len() >= limit as usize;
+        return Ok(
+            serde_json::json!({ "events": events, "last_id": last_id, "has_more": has_more })
+                .into(),
+        );
+    }
     let limit = q.limit.unwrap_or(50).min(200);
     let events = pdm_db::list_audit(&state.pool, org, q.item, limit).await?;
     Ok(serde_json::json!({ "events": events }).into())
@@ -2774,7 +2833,7 @@ pub async fn release(
     // Optional per-release approval gate (org setting "require_approval_on_release").
     // When gated, release() only creates a pending approval request (item -> in_review);
     // the revision + WIP -> Released flip happen on `POST /approvals/{id}/decide` approve.
-    let gated = pdm_db::org_setting_bool(&state.pool, org, "require_approval_on_release").await?;
+    let gated = pdm_db::org_setting_bool(&state.pool, org, crate::release_approval::KEY).await?;
     if gated {
         let assignees = body.assignee_ids.clone().unwrap_or_default();
         let assignees = if assignees.is_empty() {
@@ -2953,7 +3012,10 @@ pub async fn logout(
 
 // ── Users / Admin ───────────────────────────────────────────────────────
 
-const ROLE_LEVEL: &[(&str, u8)] = &[("viewer", 0), ("editor", 1), ("admin", 2)];
+/// Roles in rank order: each may do everything the ones before it may. Operators record what
+/// happens on the shop floor (production and print job status, inspections); editors change
+/// the vault, libraries and manufacturing records; admins manage users and settings.
+const ROLE_LEVEL: &[(&str, u8)] = &[("viewer", 0), ("operator", 1), ("editor", 2), ("admin", 3)];
 
 fn role_level(role: &str) -> u8 {
     ROLE_LEVEL
@@ -3105,6 +3167,7 @@ pub async fn set_user_password_handler(
     if target.org_id != org {
         return Err(AppError(PdmError::Forbidden("user not in this org".into())));
     }
+    require_may_manage(admin, &target)?;
     if body.password.len() < 4 {
         return Err(AppError(PdmError::Validation("password too short".into())));
     }
@@ -3146,8 +3209,9 @@ pub async fn update_user_handler(
     if target.org_id != org {
         return Err(AppError(PdmError::Forbidden("user not in this org".into())));
     }
+    require_may_manage(admin, &target)?;
     let role = body.role.as_deref().unwrap_or(&target.role);
-    if !matches!(role, "viewer" | "editor" | "admin") {
+    if !matches!(role, "viewer" | "operator" | "editor" | "admin") {
         return Err(AppError(PdmError::Validation(format!(
             "invalid role '{role}'"
         ))));
@@ -3167,6 +3231,74 @@ pub async fn update_user_handler(
     )
     .await?;
     Ok(serde_json::json!({ "user": user }).into())
+}
+
+#[derive(Deserialize)]
+pub struct HostAdminReq {
+    pub host_admin: bool,
+}
+
+/// PUT /users/{user_id}/host-admin — grant or revoke host admin (host admin only). The user
+/// may be in any organization; only an active admin can be granted it, and the last host
+/// admin cannot be revoked. Recorded in the audit log of the user's organization (and of the
+/// caller's, when that is another one).
+pub async fn set_host_admin_handler(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    Path(user_id): Path<Uuid>,
+    Json(body): Json<HostAdminReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let host = require_host_admin(&authed)?.clone();
+    let (user, changed) = pdm_db::set_host_admin(&state.pool, user_id, body.host_admin).await?;
+    if changed {
+        let action = if body.host_admin {
+            "user.host_admin_granted"
+        } else {
+            "user.host_admin_revoked"
+        };
+        let detail = serde_json::json!({ "email": user.email });
+        let mut orgs = vec![user.org_id];
+        if host.org_id != user.org_id {
+            orgs.push(host.org_id);
+        }
+        for org in orgs {
+            pdm_db::record_audit(
+                &state.pool,
+                org,
+                Some(host.id),
+                "",
+                action,
+                "user",
+                Some(user.id),
+                Some(detail.clone()),
+            )
+            .await?;
+        }
+    }
+    Ok(serde_json::json!({ "user": user }).into())
+}
+
+/// GET /host-admins — every host admin on the server and their organization (host admin only).
+pub async fn list_host_admins_handler(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_host_admin(&authed)?;
+    let rows = pdm_db::list_host_admins(&state.pool).await?;
+    let host_admins: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(u, org_name)| {
+            serde_json::json!({
+                "id": u.id,
+                "email": u.email,
+                "display_name": u.display_name,
+                "org_id": u.org_id,
+                "org_name": org_name,
+                "active": u.active,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "host_admins": host_admins }).into())
 }
 
 /// GET /jobs?limit=... — recent background jobs (dashboard processing widget).
@@ -3473,6 +3605,7 @@ pub async fn create_token_handler(
     if target.org_id != org {
         return Err(AppError(PdmError::Forbidden("user not in this org".into())));
     }
+    require_may_manage(admin, &target)?;
     let token_value = format!("pdm_{}", Uuid::new_v4());
     let hash = {
         use sha2::{Digest, Sha256};
@@ -4194,7 +4327,7 @@ pub async fn set_production_job_status(
     Path(id): Path<Uuid>,
     Json(body): Json<SetJobStatusReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_role(&authed, "editor")?;
+    require_role(&authed, "operator")?;
     let org = require_org(&authed);
     let j = pdm_db::set_production_job_status(&state.pool, org, id, &body.status).await?;
     Ok(serde_json::json!({ "production_job": j }).into())
@@ -4218,7 +4351,7 @@ pub async fn create_inspection(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreateInspectionReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_role(&authed, "editor")?;
+    require_role(&authed, "operator")?;
     let org = require_org(&authed);
     let i = pdm_db::create_inspection(
         &state.pool,
@@ -4467,7 +4600,7 @@ pub async fn set_print_job_status(
     Path(id): Path<Uuid>,
     Json(body): Json<SetPrintJobStatusReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_role(&authed, "editor")?;
+    require_role(&authed, "operator")?;
     let org = require_org(&authed);
     let p = pdm_db::set_print_job_status(&state.pool, org, id, &body.status).await?;
     Ok(serde_json::json!({ "print_job": p }).into())
@@ -6068,6 +6201,11 @@ pub fn api_router() -> Router<AppState> {
             "/settings/preview-style",
             get(get_preview_style).put(put_preview_style),
         )
+        .route(
+            "/settings/release-approval",
+            get(crate::release_approval::get_release_approval)
+                .put(crate::release_approval::put_release_approval),
+        )
         .route("/settings/cad-cli", get(get_cad_cli))
         .route("/settings/cad-cli/update", post(update_cad_cli))
         .route("/settings/dutchman", get(get_dutchman).put(save_dutchman))
@@ -6186,12 +6324,15 @@ pub fn api_router() -> Router<AppState> {
         .route("/jobs/{id}", get(get_job_handler))
         .route("/search", get(search))
         .route("/audit", get(audit))
+        .route("/events/stream", get(crate::events::stream))
         .route("/home", get(home))
         .route("/users", get(list_users_handler).post(create_user_handler))
         .route("/users/invite", post(invite_user_handler))
         .route("/users/{user_id}", put(update_user_handler))
         .route("/users/{user_id}/password", post(set_user_password_handler))
         .route("/users/{user_id}/tokens", post(create_token_handler))
+        .route("/users/{user_id}/host-admin", put(set_host_admin_handler))
+        .route("/host-admins", get(list_host_admins_handler))
         .route("/jobs", get(list_jobs_handler))
         .route(
             "/approvals",

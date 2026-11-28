@@ -56,10 +56,13 @@ Push to your registry with `docker push solvecraft-pdm:<tag>` after building.
 - **Refresh behavior (web UI V.01-29):** pages use manual refresh by default so
   background updates cannot reset drafts, previews, menus or scroll position.
   Use the Refresh button to reload the current view. **Auto-refresh: Off/On**
-  beside it is remembered in this browser. Opting in refreshes list views every
-  six seconds; item details, Settings, Administration, and open dialogs/editors
-  remain protected from timer-driven refreshes. Completed actions still update
-  their view normally.
+  beside it is remembered in this browser. Changes made elsewhere arrive as they
+  happen (live updates): with Auto-refresh off, a bar under the top bar says who
+  changed something and offers Refresh; opting in refreshes list views when
+  something they show changes (every six seconds where live updates are not
+  available). Item details, Settings, Administration, and open dialogs/editors
+  remain protected from automatic refreshes and show the bar instead. Completed
+  actions still update their view normally.
 
 - Sign in (email/password) or connect with a `pdm_…` token. Sessions persist
   across refreshes; Sign out revokes the token.
@@ -216,7 +219,7 @@ interval — no reboot, no image rebuild:
 - **Dutchman** — the PDM converts native CAD (Fusion, Inventor, SolidWorks,
   FreeCAD, CATIA, Rhino, Creo View, ACIS, STEP, Onshape bundles) with a
   [dutchman-cad/dutchman](https://github.com/dutchman-cad/dutchman) release
-  picked from a **channel** (System › Dutchman, per org): the newest stable
+  picked from a **channel** (System › Dutchman, one per server, set by a host admin): the newest stable
   (`latest`), `nightly`, the `onshape-preview` builds (Onshape import), or a
   pinned tag. The image bakes the newest stable in at build
   (`docker/install-dutchman.sh`); the server re-checks on boot and hourly
@@ -224,7 +227,7 @@ interval — no reboot, no image rebuild:
   a `.info` file beside the binary; and a conversion job pulls it on demand
   when the binary is missing or from another channel. `PDM_DUTCHMAN_UPDATE=0`
   opts out; `PDM_DUTCHMAN_CLI` names the binary (default
-  `/usr/local/bin/dutchman`); `PDM_DUTCHMAN_CHANNEL` overrides the org choice
+  `/usr/local/bin/dutchman`); `PDM_DUTCHMAN_CHANNEL` overrides the server's choice
   for the host's update loop; `PDM_DUTCHMAN_TIMEOUT_SECS` (default 1800)
   bounds one conversion (the org's settings field overrides it).
 - **Onshape import** — project Settings → "Import from Onshape (Dutchman)"
