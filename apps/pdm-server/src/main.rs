@@ -98,7 +98,10 @@ async fn main() -> Result<(), MainError> {
         update: std::sync::Arc::new(tokio::sync::RwLock::new(pdm_update::UpdateState::default())),
         design_links,
         sessions,
+        events: pdm_api::EventHub::default(),
     };
+    // Live updates: pass audit hints (also from a separate worker process) to open streams.
+    pdm_api::spawn_event_listener(pool.clone(), state.events.clone());
     let app = pdm_api::build_router(state.clone());
 
     // Background release check: at most once every 24 h (marker file next to

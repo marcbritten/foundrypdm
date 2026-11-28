@@ -213,7 +213,36 @@ async fn run_job_kind(
     }
 }
 
+/// Record a job's start or end in the audit log, so open pages update as it happens (live
+/// updates). Kept out of the activity feeds; best effort: the job's own status is what counts.
+async fn record_job_event(pool: &PgPool, job: &Job, action: &str, extra: serde_json::Value) {
+    let mut detail = serde_json::json!({ "kind": job.kind });
+    for key in ["item_id", "version_id", "nest_id"] {
+        if let Some(v) = job.payload.get(key).filter(|v| v.is_string()) {
+            detail[key] = v.clone();
+        }
+    }
+    if let (Some(d), serde_json::Value::Object(extra)) = (detail.as_object_mut(), extra) {
+        d.extend(extra);
+    }
+    if let Err(e) = pdm_db::record_audit(
+        pool,
+        job.org_id,
+        None,
+        "",
+        action,
+        "job",
+        Some(job.id),
+        Some(detail),
+    )
+    .await
+    {
+        warn!(job = %job.id, error = %e, "job event not recorded");
+    }
+}
+
 async fn run_job(pool: &PgPool, store: &Arc<BlobStore>, cfg: &WorkerConfig, job: &Job) {
+    record_job_event(pool, job, "job.started", serde_json::json!({})).await;
     let result = match run_job_kind(pool, store, cfg, job).await {
         Ok(Outcome::Measurements(m)) => persist_measurements(pool, job, m).await,
         Ok(Outcome::Thumbnail { sha256, size_bytes }) => {
@@ -263,6 +292,20 @@ async fn run_job(pool: &PgPool, store: &Arc<BlobStore>, cfg: &WorkerConfig, job:
             let _ = pdm_db::set_laser_nest_status(pool, job.org_id, nest_id, "failed", Some(&err))
                 .await;
         }
+    }
+    // Last, so a page that refetches on this event sees the job's new status.
+    if ok {
+        record_job_event(pool, job, "job.finished", serde_json::json!({})).await;
+    } else {
+        let retrying = job.attempts + 1 < job.max_attempts;
+        let error: String = err.chars().take(300).collect();
+        record_job_event(
+            pool,
+            job,
+            "job.failed",
+            serde_json::json!({ "error": error, "retrying": retrying }),
+        )
+        .await;
     }
 }
 

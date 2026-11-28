@@ -6,6 +6,7 @@ use pdm_update::UpdateState;
 use sqlx::PgPool;
 
 use crate::design_link::DesignLinks;
+use crate::events::EventHub;
 use crate::session::SessionLimits;
 
 /// Shared application state, cloned into each handler.
@@ -25,4 +26,6 @@ pub struct AppState {
     pub design_links: DesignLinks,
     /// How long a web sign-in lasts.
     pub sessions: SessionLimits,
+    /// Passes live change hints to `GET /events/stream` (see `events::spawn_listener`).
+    pub events: EventHub,
 }

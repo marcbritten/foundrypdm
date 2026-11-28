@@ -257,6 +257,14 @@ button.tab:focus-visible { outline-offset:-2px; }
 .banner { border:1px solid var(--warn); background:color-mix(in srgb, var(--warn) 12%, var(--panel));
   border-radius:8px; padding:10px 12px; margin:8px 0; font-size:13px; display:flex;
   gap:10px; align-items:center; flex-wrap:wrap; }
+/* Live updates: "Updated by … — Refresh" under the top bar. The region stays (empty) on the page
+   so screen readers announce the bar; app.js sets its top to the top bar's height. */
+#livebar { position:sticky; z-index:19; }
+.livebar { display:flex; align-items:center; gap:var(--sp-2, 8px); flex-wrap:wrap;
+  margin:var(--sp-3, 12px) var(--sp-4, 16px) 0; padding:var(--sp-2, 8px) var(--sp-3, 12px);
+  background:var(--panel2); border:1px solid var(--line); border-radius:8px;
+  font-size:var(--fs-base, 14px); box-shadow:var(--shadow); }
+.livebar .livemsg { flex:1 1 9rem; }
 .toast-stack, .toast-stack > [role] { display:flex; flex-direction:column; align-items:flex-end; gap:8px; }
 .toast-stack { position:fixed; bottom:18px; right:18px; z-index:200; max-width:calc(100vw - 36px); }
 .toast { background:var(--panel);

@@ -1138,6 +1138,7 @@ async function enterWorkspace(){
   if (r){ ROUTE = r; syncNav(); render(true); }
   else go("dashboard");
   refreshApprovalsBadge();
+  liveConnect();
 }
 
 // ── routing / rendering ─────────────────────────────────────────────────
@@ -7540,18 +7541,33 @@ function tabPermissions(box){
 // Full view renders replace controls, previews and scroll state. Keep timer-
 // driven renders opt-in; explicit refresh and updates after an action still work.
 function refreshModeLabel(){
+  if (LIVE.state === "live") return AUTO_REFRESH ? "Live: lists update as things change"
+    : "Live: a bar offers Refresh when something changes";
+  if (LIVE.state === "signedout") return "Live updates paused: sign in again to resume";
   return AUTO_REFRESH ? "Auto-refresh every " + POLL_MS / 1000 + "s" : "Manual refresh";
 }
+// Whether a timer or a live update may rebuild the view now. Editing pages, and anything the user
+// is in the middle of (a dialog or menu, a focused field, selected rows, the nest panel or an
+// expanded nest), are left alone: a field may hold a draft after it loses focus.
+function canRerender(){
+  if (!ME || document.hidden || AUTH_BUSY) return false;
+  if (LIVE_EDIT_PAGES.includes(ROUTE.name)) return false;
+  if (document.querySelector(".modal-backdrop, dialog[open], .ctxmenu:not(.hidden), .kebabmenu:not(.hidden)")) return false;
+  const ae = document.activeElement;
+  if (ae && ae !== document.body &&
+    (ae.isContentEditable || ["INPUT", "TEXTAREA", "SELECT", "IFRAME"].includes(ae.tagName))) return false;
+  if (document.querySelector("#view .bulkbar")) return false;
+  if (ROUTE.name === "laser-nests" && (NC.active ||
+    [...document.querySelectorAll("#view .ln-detail")].some(b => b.dataset.loaded === "1" && b.style.display !== "none")))
+    return false;
+  return true;
+}
 function startPolling(){
+  // Opted-in list views refresh on a timer while live updates are not connected, and always on
+  // pages that live updates do not cover. Not while signed out: that waits for the user.
   setInterval(() => {
-    if (!AUTO_REFRESH || !ME || document.hidden || AUTH_BUSY) return;
-    // Even when opted in, do not rebuild editing/settings pages or an open
-    // editor, menu or dialog. A field may contain a draft after it loses focus.
-    if (["detail", "settings", "admin"].includes(ROUTE.name)) return;
-    if (document.querySelector(".modal-backdrop, dialog[open], .ctxmenu:not(.hidden), .kebabmenu:not(.hidden)")) return;
-    const ae = document.activeElement;
-    if (ae && ae !== document.body &&
-      (ae.isContentEditable || ["INPUT", "TEXTAREA", "SELECT", "IFRAME"].includes(ae.tagName))) return;
+    if (!AUTO_REFRESH || LIVE.state === "signedout" || !canRerender()) return;
+    if (LIVE.state === "live" && LIVE_ROUTES.includes(ROUTE.name)) return;
     if (CUR_RELOAD) Promise.resolve(CUR_RELOAD()).catch(() => {});
     refreshApprovalsBadge();
   }, POLL_MS);
@@ -7562,6 +7578,254 @@ function startPolling(){
     if (!ME || !TOKEN || document.hidden || !document.querySelector("dialog.web-editor[open]")) return;
     fetch("/me", { headers: { "Authorization": "Bearer " + TOKEN } }).catch(() => {});
   }, 30000);
+}
+
+// ── live updates ────────────────────────────────────────────────────────
+// GET /events/stream pushes a short hint whenever something is recorded in the organization's
+// activity log, including background jobs. It is read with fetch() so the sign-in's bearer header
+// goes along (an EventSource cannot send it). With Auto-refresh on, list views refresh when a hint
+// concerns them; otherwise, and on editing pages or while the user is busy (canRerender), a bar
+// says who changed what and offers Refresh. A dropped stream reconnects with a growing pause and
+// catches up from the last audit id it saw; meanwhile Auto-refresh falls back to the timer.
+const LIVE_FIRST_MS = 15000;   // no first event by then: a proxy is holding the stream back
+const LIVE_STALL_MS = 60000;   // silence longer than two heartbeats: the connection is gone
+const LIVE_BATCH_MS = 500;     // one check-in brings several hints; refresh once
+const LIVE_HIDDEN_MS = 30000;
+const LIVE_GAP_MS = 3000;      // at most one live refresh this often, never two at once
+const LIVE_EDIT_PAGES = ["detail", "settings", "admin", "tool"];
+// Pages whose changes are in the activity log (liveConcerns); the rest keep the timed refresh.
+const LIVE_ROUTES = ["detail", "admin", "jobs", "laser-nests", "approvals", "activity", "dashboard",
+  "projects", "explorer", "items", "search", "mfg"];
+const LIVE = { state:"off", ctl:null, lastId:null, backoff:0, retryTimer:null, hideTimer:null,
+  authTimer:null, pending:[], batchTimer:null, deferTimer:null, barRoute:null, barTimer:null,
+  refreshing:false, lastRefresh:0, refreshTimer:null, news:null };
+
+// Server-Sent Events framing: complete events ("\n\n"-terminated) out of `buf`, and the rest.
+// Comment lines (the heartbeat) carry no event.
+function sseParse(buf){
+  buf = buf.replace(/\r\n/g, "\n");
+  const events = [];
+  let i;
+  while ((i = buf.indexOf("\n\n")) >= 0){
+    const block = buf.slice(0, i); buf = buf.slice(i + 2);
+    const ev = { event:"message", data:"", id:null }, data = [];
+    let any = false;
+    for (const line of block.split("\n")){
+      if (!line || line[0] === ":") continue;
+      const c = line.indexOf(":");
+      const field = c < 0 ? line : line.slice(0, c);
+      let value = c < 0 ? "" : line.slice(c + 1);
+      if (value[0] === " ") value = value.slice(1);
+      if (field === "event") ev.event = value;
+      else if (field === "data") data.push(value);
+      else if (field === "id") ev.id = value;
+      else continue;
+      any = true;
+    }
+    if (any){ ev.data = data.join("\n"); events.push(ev); }
+  }
+  return { events, rest: buf };
+}
+function liveJson(s){ try { return JSON.parse(s); } catch(e){ return null; } }
+function liveStatus(){ const el = $("refreshstatus"); if (el) el.textContent = refreshModeLabel(); }
+
+async function liveConnect(){
+  liveStop();
+  clearInterval(LIVE.authTimer);
+  if (!ME || !TOKEN || document.hidden) return;
+  const ctl = new AbortController(), token = TOKEN;
+  LIVE.ctl = ctl; LIVE.state = "connecting";
+  let ready = false, heard = Date.now();
+  const watchdog = setInterval(() => {
+    const quiet = Date.now() - heard;
+    if ((!ready && quiet > LIVE_FIRST_MS) || quiet > LIVE_STALL_MS) ctl.abort();
+  }, 2000);
+  try {
+    const url = "/events/stream" + (LIVE.lastId != null ? "?since=" + encodeURIComponent(LIVE.lastId) : "");
+    const r = await fetch(url, { headers: { "Authorization": "Bearer " + token, "Accept": "text/event-stream" },
+      cache: "no-store", signal: ctl.signal });
+    if (r.status === 401) return liveSignedOut(ctl, token);
+    if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;){
+      const { value, done } = await reader.read();
+      if (done) break;
+      heard = Date.now();
+      const p = sseParse(buf + dec.decode(value, { stream:true }));
+      buf = p.rest;
+      for (const ev of p.events){
+        const d = liveJson(ev.data) || {};
+        if (ev.event === "change") liveQueue(d);
+        else if (ev.event === "reset") liveQueue({ object_type:"*" });
+        else if (ev.event === "ready"){
+          ready = true; LIVE.backoff = 0; LIVE.state = "live"; liveStatus();
+          LIVE.lastId = Math.max(LIVE.lastId || 0, Number(d.last_id) || 0);
+        } else if (ev.event === "resync"){
+          // Hints were dropped on the way: reconnect at once and catch up from lastId.
+          LIVE.ctl = null; ctl.abort(); setTimeout(liveConnect, 0); return;
+        } else if (ev.event === "expired") return liveSignedOut(ctl, token);
+      }
+    }
+  } catch(e){ /* aborted, or the network went away */ }
+  finally { clearInterval(watchdog); }
+  if (LIVE.ctl === ctl) liveRetry();
+}
+// Stop this tab's stream (hidden tab, or a new connection replacing it). A paused stream keeps
+// watching for a new sign-in.
+function liveStop(){
+  clearTimeout(LIVE.retryTimer);
+  const c = LIVE.ctl; LIVE.ctl = null;
+  if (c) c.abort();
+  if (LIVE.state !== "signedout"){ LIVE.state = "off"; liveStatus(); }
+}
+function liveRetry(){
+  LIVE.ctl = null; LIVE.state = "down"; liveStatus();
+  const wait = Math.min(60000, 2000 * 2 ** LIVE.backoff) * (0.75 + Math.random() / 2);
+  LIVE.backoff = Math.min(LIVE.backoff + 1, 5);
+  clearTimeout(LIVE.retryTimer);
+  LIVE.retryTimer = setTimeout(liveConnect, wait);
+}
+// The sign-in behind the stream ended. Nothing is asked here: the next request the user makes
+// meets the usual in-place sign-in, and once a new sign-in is in place the stream resumes.
+function liveSignedOut(ctl, token){
+  if (LIVE.ctl === ctl) LIVE.ctl = null;
+  ctl.abort();
+  // Already signed in again (a request met the sign-in dialog first): carry on with the new one.
+  if (TOKEN && TOKEN !== token){ LIVE.state = "off"; setTimeout(liveConnect, 0); return; }
+  LIVE.state = "signedout"; liveStatus();
+  // A message with a Sign in button, not the sign-in dialog: the user may not be at the desk. None
+  // while the sign-in dialog is already open.
+  if (ME && ME.user && !REAUTH) signedOutNotice();
+  clearInterval(LIVE.authTimer);
+  LIVE.authTimer = setInterval(() => {
+    if (!TOKEN || TOKEN === token) return;
+    clearInterval(LIVE.authTimer); LIVE.state = "off"; liveConnect();
+  }, 2000);
+}
+
+function liveQueue(h){
+  if (h.audit_id != null) LIVE.lastId = Math.max(LIVE.lastId || 0, Number(h.audit_id) || 0);
+  LIVE.pending.push(h);
+  if (!LIVE.batchTimer) LIVE.batchTimer = setTimeout(liveFlush, LIVE_BATCH_MS);
+}
+// Does this hint change what the current page shows? ("*": not known, so yes.)
+function liveConcerns(h){
+  const t = h.object_type || "", a = h.action || "";
+  if (t === "*") return true;
+  if (/^user\.(login|token_created|password_changed)$/.test(a)) return false;
+  switch (ROUTE.name){
+    case "detail": {
+      const id = DETAIL.id, vs = (DETAIL.data && DETAIL.data.versions) || [];
+      return !!id && (h.object_id === id || h.item_id === id ||
+        (t === "version" && vs.some(v => v.id === h.object_id)));
+    }
+    case "admin": return t === "user";
+    case "jobs": return t === "job";
+    case "laser-nests": return t === "laser_nest" || (t === "job" && !!h.nest_id);
+    case "approvals": return t === "approval_request" || /^item\.(release|lifecycle)/.test(a);
+    case "activity": return t !== "job";
+    case "dashboard": return true;
+    case "projects": case "explorer": case "items": case "search": case "mfg":
+      return ["item", "project", "folder", "version"].includes(t) ||
+        (t === "job" && a !== "job.started" && !!h.item_id);
+    default: return false;   // settings, tools, machines…: nothing there is recorded yet
+  }
+}
+function liveFlush(){
+  LIVE.batchTimer = null;
+  const hints = LIVE.pending; LIVE.pending = [];
+  if (!ME) return;
+  if (AUTO_REFRESH && hints.some(h => h.object_type === "*" || h.object_type === "approval_request" ||
+    /^item\.(release|lifecycle)/.test(h.action || ""))) refreshApprovalsBadge();
+  const mine = hints.filter(liveConcerns);
+  if (!mine.length) return;
+  // Any change refreshes an opted-in list, the user's own too: a desktop client or agent acting as
+  // them changes it from elsewhere (the gap keeps an action's own refresh from doubling up).
+  if (AUTO_REFRESH && canRerender()) return liveRefresh();
+  // The bar is for other people's changes: the user's own are on the page they made them on. A
+  // job starting is news only where jobs are listed.
+  const news = mine.filter(h => !(h.actor_id && h.actor_id === myId()) &&
+    (h.action !== "job.started" || ROUTE.name === "jobs" || ROUTE.name === "dashboard"));
+  if (!news.length) return;
+  LIVE.news = news[news.length - 1];
+  liveBar(LIVE.news);
+  // A list view that was busy refreshes by itself once the user is done.
+  if (AUTO_REFRESH && !LIVE_EDIT_PAGES.includes(ROUTE.name)) liveDefer(ROUTE);
+}
+// Refresh the list now, or once the last refresh is LIVE_GAP_MS old and finished, so a burst of
+// changes (an import, a run of jobs) costs one refresh every few seconds, not two a second.
+function liveRefresh(){
+  liveBarHide();
+  clearTimeout(LIVE.refreshTimer); LIVE.refreshTimer = null;
+  const wait = LIVE.lastRefresh + LIVE_GAP_MS - Date.now();
+  if (LIVE.refreshing || wait > 0){
+    const route = ROUTE;
+    LIVE.refreshTimer = setTimeout(() => {
+      LIVE.refreshTimer = null;
+      if (ROUTE !== route) return;   // navigated: that view loaded fresh
+      if (canRerender()) liveRefresh();
+      else { liveBar(LIVE.news || {}); liveDefer(route); }
+    }, Math.max(wait, 250));
+    return;
+  }
+  if (!CUR_RELOAD) return;
+  LIVE.refreshing = true; LIVE.lastRefresh = Date.now();
+  Promise.resolve().then(CUR_RELOAD).catch(() => {}).finally(() => { LIVE.refreshing = false; });
+}
+function liveDefer(route){
+  clearInterval(LIVE.deferTimer);
+  LIVE.deferTimer = setInterval(() => {
+    if (ROUTE !== route || !LIVE.barRoute){ clearInterval(LIVE.deferTimer); return; }
+    if (canRerender()){ clearInterval(LIVE.deferTimer); liveRefresh(); }
+  }, 1000);
+}
+function liveWho(h){
+  if (h.object_type === "*") return "Updated while this page was not connected";
+  if (h.actor_id){
+    const u = UMAP[h.actor_id];
+    return "Updated by " + (u ? (u.display_name || u.email) : "another user");
+  }
+  if (h.object_type === "job")
+    return h.action === "job.failed" ? "A background job failed" :
+      h.action === "job.started" ? "A background job started" : "A background job finished";
+  return "Updated";
+}
+// The bar sits in a polite live region that is always on the page, so screen readers announce
+// it; it never takes focus, and it goes away on navigation.
+function liveBar(h){
+  const region = $("livebar");
+  if (!region) return;
+  region.style.top = ($("topbar") ? $("topbar").offsetHeight : 0) + "px";
+  let bar = region.querySelector(".livebar");
+  if (!bar){
+    bar = document.createElement("div"); bar.className = "livebar";
+    const msg = document.createElement("span"); msg.className = "livemsg";
+    const again = document.createElement("button"); again.type = "button"; again.className = "small";
+    again.textContent = "Refresh";
+    again.onclick = () => { liveBarHide(); if (CUR_RELOAD) CUR_RELOAD(); else render(true); };
+    const x = document.createElement("button"); x.type = "button"; x.className = "small";
+    x.textContent = "Dismiss"; x.onclick = liveBarHide;
+    bar.append(msg, again, x);
+    region.appendChild(bar);
+  }
+  // Rewritten only when it says something new, so a screen reader is not told the same twice.
+  const msg = bar.querySelector(".livemsg"), text = liveWho(h) + ".";
+  if (msg.textContent !== text) msg.textContent = text;
+  LIVE.barRoute = ROUTE;
+  clearInterval(LIVE.barTimer);
+  LIVE.barTimer = setInterval(() => { if (ROUTE !== LIVE.barRoute) liveBarHide(); }, 500);
+}
+function liveBarHide(){
+  clearInterval(LIVE.barTimer); clearInterval(LIVE.deferTimer);
+  LIVE.barRoute = null;
+  const region = $("livebar");
+  if (!region) return;
+  // Pressed from the keyboard: keep focus on the page (the view's heading), not lost to <body>.
+  const hadFocus = region.contains(document.activeElement);
+  region.textContent = "";
+  const v = $("view"), h = hadFocus && v ? v.querySelector("h2, h3") || v : null;
+  if (h){ if (!h.hasAttribute("tabindex")) h.tabIndex = -1; h.focus({ preventScroll:true }); }
 }
 
 // ── init ────────────────────────────────────────────────────────────────
@@ -7603,10 +7867,12 @@ function startPolling(){
   }
   $("menubtn").onclick = () => $("sidebar").classList.toggle("open");
   $("refreshbtn").onclick = () => (CUR_RELOAD ? CUR_RELOAD() : render(true));
+  $("refreshbtn").addEventListener("click", () => liveBarHide());
   const autoRefresh = document.createElement("button");
   autoRefresh.id = "autorefreshbtn";
   autoRefresh.className = "small";
-  autoRefresh.title = "Automatically refresh list views every six seconds. Editing pages refresh manually.";
+  autoRefresh.title = "Refresh list views as soon as something changes (every six seconds when live updates are " +
+    "not available). Editing pages, and pages you are busy on, show a Refresh bar instead.";
   const updateRefreshMode = () => {
     autoRefresh.textContent = "Auto-refresh: " + (AUTO_REFRESH ? "On" : "Off");
     autoRefresh.setAttribute("aria-pressed", String(AUTO_REFRESH));
@@ -7620,6 +7886,16 @@ function startPolling(){
   };
   $("refreshbtn").after(autoRefresh);
   updateRefreshMode();
+  const liveRegion = document.createElement("div");
+  liveRegion.id = "livebar"; liveRegion.setAttribute("role", "status");
+  $("topbar").after(liveRegion);
+  // Live updates follow the tab: a hidden tab lets its stream go (browsers allow only a few open
+  // connections per server) and catches up when it is shown again.
+  document.addEventListener("visibilitychange", () => {
+    clearTimeout(LIVE.hideTimer);
+    if (document.hidden) LIVE.hideTimer = setTimeout(liveStop, LIVE_HIDDEN_MS);
+    else if (ME && !LIVE.ctl && LIVE.state !== "signedout") liveConnect();
+  });
   $("signout").onclick = signout;
   $("userkebab").onclick = showUserMenu;
   $("signin-form").onsubmit = e => { e.preventDefault(); signin(); };

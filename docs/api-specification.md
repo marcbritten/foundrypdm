@@ -56,7 +56,20 @@ Base URL in the dev image: `http://<host>:8080`.
 
 ### Search / audit
 - `GET /search?q=&project?` → `{ results: [ItemSummary] }`.
-- `GET /audit?item?` → `{ events: [ {id, action, object_type, actor_id, at, ...} ] }`.
+- `GET /audit?item?` → `{ events: [ {id, action, object_type, actor_id, at, ...} ] }` (newest first; background-job
+  rows are left out).
+- `GET /audit?since=<id>&limit?` → `{ events, last_id, has_more }`: the rows recorded after audit id `since`, oldest
+  first, background-job rows (`job.started`, `job.finished`, `job.failed`, object type `job`) included. `limit`
+  defaults to 100, at most 200. While `has_more` is true, continue from the last returned row's id; `last_id` is the
+  organization's highest audit id.
+- `GET /events/stream?since?` — live change hints for the caller's organization as Server-Sent Events, with the usual
+  `Authorization: Bearer` header (read it with `fetch()`; an `EventSource` cannot send the header). Events:
+  `change` (`id:` is the audit id; data `{audit_id, actor_id, action, object_type, object_id, item_id?, nest_id?}`,
+  no detail), `ready` (`{last_id}`), `resync` (hints may have been missed: reconnect with `?since=`), `reset` (too
+  many missed to replay: refresh everything) and `expired` (the sign-in ended; the stream closes). A comment line
+  comes every 25 s. `503` (`live_unavailable`) while the server's database listener is not connected. With `?since=<id>`, the rows recorded after that id come first as `change` events. Opening the
+  stream does not count as use of a web sign-in. Behind a proxy, see the Live updates section of
+  `docker-server.md`.
 
 ### Admin (Phase-1)
 - `POST /users` — create a user. `POST /users/{id}/tokens` — issue a token.
