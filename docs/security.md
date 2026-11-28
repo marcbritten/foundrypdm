@@ -16,7 +16,17 @@
 - **OIDC** is a later hardening item (provider TBD; keep Argon2id as fallback).
 
 ## Authorization
-- **RBAC** via `users.role` (`viewer` | `editor` | `admin`) in Phase 1. The full
+- **RBAC** via `users.role` in Phase 1. Roles rank `viewer` < `operator` < `editor` < `admin`;
+  each can also do everything the roles before it can:
+
+  | Role | Adds |
+  |---|---|
+  | `viewer` | Reads the organization's projects, items, files and records; comments; opens versions through design links; frees a lock they hold; decides an approval request that names them. |
+  | `operator` | Records what happens on the shop floor: production job status (`POST /production-jobs/{id}/status`), print job status (`POST /print-jobs/{id}/status`) and inspections (`POST /inspections`). |
+  | `editor` | Changes the vault (projects, items, check-out and check-in, uploads, properties, release, lifecycle, archive, delete; Onshape imports, CAD conversions, previews), tools, machines, post-processors and manufacturing records (setups, CAM projects, NC programs and their release, production and print jobs, sheet metal, nests); raises approval requests and decides any of them. |
+  | `admin` | Manages users, API tokens and the organization's settings. |
+
+  Set a role with `pdm-cli create-user --role <role>` or in **Administration → Users**. The full
   `roles`/`permissions`/`groups`/`memberships` model is in the schema for the later phase.
 - **Org isolation** is enforced in **every** query (`org_id` in the WHERE clause), not by convention —
   a user of one org cannot read another org's items/blobs/versions.

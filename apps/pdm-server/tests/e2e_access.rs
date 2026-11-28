@@ -499,3 +499,202 @@ async fn e2e_other_org_cannot_write_to_this_orgs_records() {
     }
     eprintln!("PASS: another organization's ids are refused on every write checked");
 }
+
+/// The id of the one record a create route returns (`{"tool": {"id": …}}` and the like).
+async fn create(c: &Client, token: &str, path: &str, body: Value, kind: &str) -> String {
+    let (s, v) = send(c, Method::POST, path, token, Some(body)).await;
+    assert!(s.is_success(), "create {kind}: {s} {v}");
+    v[kind]["id"].as_str().expect("id").to_string()
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_operator_records_floor_work_and_nothing_else() {
+    if std::env::var("PDM_E2E").ok().as_deref() != Some("1") {
+        eprintln!("PDM_E2E not set; skipping");
+        return;
+    }
+    let c = client();
+    let key = uuid::Uuid::new_v4().to_string();
+    let (_, editor) = user_with_role(&c, &key, "editor").await;
+    let (_, viewer) = user_with_role(&c, &key, "viewer").await;
+    let (operator_id, operator) = user_with_role(&c, &key, "operator").await;
+
+    let project = create(
+        &c,
+        &editor,
+        "/projects",
+        json!({ "name": format!("operator-{key}") }),
+        "project",
+    )
+    .await;
+    let item = create(
+        &c,
+        &editor,
+        &format!("/projects/{project}/items"),
+        json!({ "description": "operator test" }),
+        "item",
+    )
+    .await;
+    let tool = create(
+        &c,
+        &editor,
+        "/tools",
+        json!({ "name": format!("tool-{key}") }),
+        "tool",
+    )
+    .await;
+    let nc = create(
+        &c,
+        &editor,
+        "/nc-programs",
+        json!({ "item_id": item }),
+        "nc_program",
+    )
+    .await;
+    let mut jobs = Vec::new();
+    for _ in 0..3 {
+        let job = json!({ "nc_program_id": nc });
+        jobs.push(create(&c, &editor, "/production-jobs", job, "production_job").await);
+    }
+    let mut prints = Vec::new();
+    for _ in 0..2 {
+        let print = json!({ "item_id": item });
+        prints.push(create(&c, &editor, "/print-jobs", print, "print_job").await);
+    }
+    let floor = |job: &str, print: &str| {
+        vec![
+            (
+                format!("/production-jobs/{job}/status"),
+                json!({ "status": "in_progress" }),
+            ),
+            (
+                format!("/print-jobs/{print}/status"),
+                json!({ "status": "printing" }),
+            ),
+            (
+                "/inspections".to_string(),
+                json!({ "production_job_id": job, "passed": true }),
+            ),
+        ]
+    };
+
+    // A viewer still may not record floor work.
+    for (path, body) in floor(&jobs[0], &prints[0]) {
+        let (s, _) = send(&c, Method::POST, &path, &viewer, Some(body)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "viewer POST {path}");
+    }
+    // An operator may.
+    for (path, body) in floor(&jobs[1], &prints[1]) {
+        let (s, _) = send(&c, Method::POST, &path, &operator, Some(body)).await;
+        assert_eq!(s, StatusCode::OK, "operator POST {path}");
+    }
+    let (s, _) = send(
+        &c,
+        Method::POST,
+        &format!("/production-jobs/{}/status", jobs[1]),
+        &operator,
+        Some(json!({ "status": "done" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "operator marks the job done");
+
+    // Everything else stays editor or admin.
+    let refused: Vec<(Method, String, Option<Value>)> = vec![
+        (Method::POST, format!("/nc-programs/{nc}/release"), None),
+        (
+            Method::POST,
+            "/tools".into(),
+            Some(json!({ "name": format!("operator-{key}") })),
+        ),
+        (Method::DELETE, format!("/tools/{tool}"), None),
+        (
+            Method::POST,
+            "/machines".into(),
+            Some(json!({ "name": "operator machine" })),
+        ),
+        (
+            Method::POST,
+            "/production-jobs".into(),
+            Some(json!({ "nc_program_id": nc })),
+        ),
+        (
+            Method::POST,
+            "/print-jobs".into(),
+            Some(json!({ "item_id": item })),
+        ),
+        (
+            Method::POST,
+            "/nc-programs".into(),
+            Some(json!({ "item_id": item })),
+        ),
+        (
+            Method::PUT,
+            format!("/items/{item}/properties/finish"),
+            Some(json!({ "value": "operator" })),
+        ),
+        (
+            Method::POST,
+            format!("/items/{item}/checkout"),
+            Some(json!({ "workstation": "operator" })),
+        ),
+        (Method::PATCH, format!("/items/{item}/archive"), None),
+        (
+            Method::POST,
+            format!("/projects/{project}/items"),
+            Some(json!({ "description": "operator" })),
+        ),
+        (
+            Method::POST,
+            "/users".into(),
+            Some(json!({ "email": format!("made-{key}@test.invalid"), "role": "admin" })),
+        ),
+        (
+            Method::PUT,
+            format!("/users/{operator_id}"),
+            Some(json!({ "role": "admin" })),
+        ),
+        (
+            Method::POST,
+            format!("/users/{operator_id}/tokens"),
+            Some(json!({ "name": "operator" })),
+        ),
+        (
+            Method::POST,
+            format!("/users/{operator_id}/password"),
+            Some(json!({ "password": "operator-pass" })),
+        ),
+        (
+            Method::PUT,
+            "/settings/mail".into(),
+            Some(json!({ "host": "mail.invalid" })),
+        ),
+    ];
+    for (method, path, body) in refused {
+        let (s, _) = send(&c, method.clone(), &path, &operator, body).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "operator {method} {path}");
+    }
+
+    let (_, v) = send(&c, Method::GET, "/production-jobs", &editor, None).await;
+    let status = |id: &str| {
+        v["production_jobs"]
+            .as_array()
+            .and_then(|a| a.iter().find(|j| j["id"] == id))
+            .map(|j| j["status"].as_str().unwrap_or("").to_string())
+    };
+    assert_eq!(status(&jobs[0]).as_deref(), Some("pending"), "viewer's job");
+    assert_eq!(status(&jobs[1]).as_deref(), Some("done"), "operator's job");
+    let (s, _) = send(&c, Method::GET, &format!("/tools/{tool}"), &editor, None).await;
+    assert_eq!(s, StatusCode::OK, "the tool is still there");
+
+    // An editor keeps floor work and NC release.
+    for (path, body) in floor(&jobs[2], &prints[0])
+        .into_iter()
+        .chain([(format!("/nc-programs/{nc}/release"), Value::Null)])
+    {
+        let body = (!body.is_null()).then_some(body);
+        let (s, _) = send(&c, Method::POST, &path, &editor, body).await;
+        assert!(s.is_success(), "editor POST {path}: {s}");
+    }
+    eprintln!("PASS: an operator records floor work and is refused everything else");
+}

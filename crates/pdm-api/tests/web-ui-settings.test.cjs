@@ -256,7 +256,7 @@ test("reset password shows the new password after it is set", async () => {
 
 function inviteHarness(apiImpl, users){
   const dialogs = [], notes = [], resets = [];
-  const c = loadFunctions(["inviteUser", "findUserByEmail", "inviteMailFailed"], {
+  const c = loadFunctions(["roleOptions", "inviteUser", "findUserByEmail", "inviteMailFailed"], {
     USERS: users || [], esc: s => String(s), render(){}, toast: m => notes.push(m), resetPassword: async u => resets.push(u.id),
     api: apiImpl,
     openModal: async (title, fields, submit, extra) => {

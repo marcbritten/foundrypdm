@@ -32,7 +32,7 @@ function hostLock(u){ return u && u.is_host_admin && !isHostAdmin()
 function myId(){ return ME && ME.user ? ME.user.id : null; }
 function myName(){ return ME && ME.user ? (ME.user.display_name || ME.user.email) : ""; }
 function isRole(min){ const r = ME && ME.user ? ME.user.role : "viewer";
-  const L = {viewer:0, editor:1, admin:2}; return (L[r]??0) >= (L[min]??0); }
+  const L = {viewer:0, operator:1, editor:2, admin:3}; return (L[r]??0) >= (L[min]??0); }
 
 // ── state ────────────────────────────────────────────────────────────────
 let TOKEN = localStorage.getItem("pdm_token") || "";
@@ -5015,12 +5015,21 @@ function genPassword(){
   for (let i = 0; i < 12; i++) s += c[Math.floor(Math.random() * c.length)];
   return s;
 }
+// Role picker options, lowest rank first; each role can also do everything the ones before it can.
+function roleOptions(){
+  return [
+    { value:"viewer", label:"Viewer — reads and comments" },
+    { value:"operator", label:"Operator — also records shop-floor job status and inspections" },
+    { value:"editor", label:"Editor — also changes items, files, tools and manufacturing records" },
+    { value:"admin", label:"Admin — also manages users and settings" }
+  ];
+}
 async function addUser(){
   const f = await openModal("Add user", [
     { id:"email", label:"Email", required:true, placeholder:"name@company.com", type:"text" },
     { id:"display_name", label:"Display name", placeholder:"e.g. Jane" },
     { id:"role", label:"Role", type:"select",
-      options:[{value:"editor",label:"Editor"},{value:"viewer",label:"Viewer"},{value:"admin",label:"Admin"}], value:"editor" },
+      options:roleOptions(), value:"editor" },
     { id:"password", label:"Password (min 4 characters)", required:true, type:"password" }
   ], "Add user");
   if (!f) return;
@@ -5037,20 +5046,20 @@ async function inviteUser(){
   const r = await openModal("Invite user", [
     { id:"email", label:"Email", required:true, placeholder:"name@company.com", type:"text" },
     { id:"display_name", label:"Display name", placeholder:"e.g. Jane" },
-    { id:"role", label:"Role", type:"select",
-      options:[{value:"editor",label:"Editor"},{value:"viewer",label:"Viewer"},{value:"admin",label:"Admin"}], value:"editor" }
-  ], { label:"Send invite", busyLabel:"Sending…", onSubmit: async f => {
-    const email = f.email.trim();
-    try {
-      await api("POST", "/users/invite", { email, display_name: f.display_name || null, role: f.role });
-      return { email };
-    } catch(e){
-      // The email step comes last: a failed send can leave a new account nobody can use.
-      const made = known.has(email.toLowerCase()) ? null : await findUserByEmail(email);
-      if (!made) throw e;
-      return { email, made, err: e };
-    }
-  } });
+     { id:"role", label:"Role", type:"select",
+       options:roleOptions(), value:"editor" }
+   ], { label:"Send invite", busyLabel:"Sending…", onSubmit: async f => {
+     const email = f.email.trim();
+     try {
+       await api("POST", "/users/invite", { email, display_name: f.display_name || null, role: f.role });
+       return { email };
+     } catch(e){
+       // The email step comes last: a failed send can leave a new account nobody can use.
+       const made = known.has(email.toLowerCase()) ? null : await findUserByEmail(email);
+       if (!made) throw e;
+       return { email, made, err: e };
+     }
+   } });
   if (!r) return;
   render(false);
   if (r.made) await inviteMailFailed(r.email, r.err, r.made);
@@ -5074,7 +5083,7 @@ async function editUser(u){
   const f = await openModal("Edit user — " + u.email, [
     { id:"display_name", label:"Display name", value:u.display_name || "" },
     { id:"role", label:"Role", type:"select",
-      options:[{value:"editor",label:"Editor"},{value:"viewer",label:"Viewer"},{value:"admin",label:"Admin"}], value:u.role },
+      options:roleOptions(), value:u.role },
     { id:"active", label:"Account status", type:"select",
       options:[{value:"true",label:"Active"},{value:"false",label:"Disabled"}], value:String(u.active) }
   ], "Save");

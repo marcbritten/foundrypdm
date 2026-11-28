@@ -58,7 +58,7 @@ enum Command {
         email: String,
         #[arg(long, default_value = "")]
         display_name: String,
-        /// 'viewer' | 'editor' | 'admin'
+        /// 'viewer' | 'operator' | 'editor' | 'admin'
         #[arg(long, default_value = "editor")]
         role: String,
         /// Initial password (Argon2id-hashed before storage)
