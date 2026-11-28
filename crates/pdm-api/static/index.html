@@ -77,6 +77,13 @@ try { if (/[?&]nobrand(?:[=&]|$)/.test(location.search)) document.getElementById
   <symbol id="ic-ftype-txt" viewBox="0 0 16 16"><path d="M4 1h6l3 3v11H4z M10 1v3h3 M6.5 7h3.5 M6.5 10h3.5 M6.5 13h2"/></symbol>
   <symbol id="ic-check" viewBox="0 0 16 16"><path d="M3 8.5l3.2 3.2L13 4.5"/></symbol>
   <symbol id="ic-ban" viewBox="0 0 16 16"><path d="M8 2a6 6 0 1 0 0 12a6 6 0 1 0 0-12z M3.8 3.8l8.4 8.4"/></symbol>
+  <symbol id="ic-menu" viewBox="0 0 16 16"><path d="M2 4h12 M2 8h12 M2 12h12"/></symbol>
+  <symbol id="ic-grid" viewBox="0 0 16 16"><path d="M2 2h5v5H2z M9 2h5v5H9z M2 9h5v5H2z M9 9h5v5H9z"/></symbol>
+  <symbol id="ic-data" viewBox="0 0 16 16"><path d="M3 4c0-1.1 2.2-2 5-2s5 .9 5 2-2.2 2-5 2-5-.9-5-2z M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4 M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/></symbol>
+  <symbol id="ic-factory" viewBox="0 0 16 16"><path d="M2 14V7l4 2.5V7l4 2.5V3h4v11z"/></symbol>
+  <symbol id="ic-inbox" viewBox="0 0 16 16"><path d="M2 9l2-6h8l2 6v4H2z M2 9h3.5l1 2h3l1-2H14"/></symbol>
+  <symbol id="ic-shield" viewBox="0 0 16 16"><path d="M8 2l5 2v4c0 3-2.2 5.2-5 6-2.8-.8-5-3-5-6V4z"/></symbol>
+  <symbol id="ic-user" viewBox="0 0 16 16"><path d="M8 8a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z M3 14c0-2.8 2.2-4.5 5-4.5s5 1.7 5 4.5"/></symbol>
 </svg>
 <div id="login-view" class="hidden">
   <div class="auth-card">
@@ -102,42 +109,58 @@ try { if (/[?&]nobrand(?:[=&]|$)/.test(location.search)) document.getElementById
 <div id="ws" class="hidden">
   <nav id="sidebar" aria-label="Sections">
     <div class="sb-brand"><span class="mark" data-brand-mark>⬢</span> <span data-brand-name>Foundry PDM</span></div>
-    <div class="sb-section"><span class="sb-label">Workspace</span>
+    <div class="sb-nav">
+    <div class="sb-section" data-group="workspace">
+      <button type="button" class="sb-head" aria-expanded="true" aria-controls="sbg-workspace"><span class="sb-ic"><svg class="icon"><use href="#ic-grid"/></svg></span><span class="sb-tx">Workspace</span><svg class="icon sb-chev"><use href="#ic-chevron"/></svg></button>
+      <div class="sb-items" id="sbg-workspace">
       <a class="sb-link" href="#/dashboard" data-nav="dashboard"><span class="sb-ic"><svg class="icon"><use href="#ic-home"/></svg></span><span class="sb-tx">Dashboard</span></a>
       <a class="sb-link" href="#/projects" data-nav="projects"><span class="sb-ic"><svg class="icon"><use href="#ic-project"/></svg></span><span class="sb-tx">Projects</span></a>
+      </div>
     </div>
-    <div class="sb-section"><span class="sb-label">Data</span>
+    <div class="sb-section" data-group="data">
+      <button type="button" class="sb-head" aria-expanded="true" aria-controls="sbg-data"><span class="sb-ic"><svg class="icon"><use href="#ic-data"/></svg></span><span class="sb-tx">Data</span><svg class="icon sb-chev"><use href="#ic-chevron"/></svg></button>
+      <div class="sb-items" id="sbg-data">
       <a class="sb-link" href="#/items" data-nav="items"><span class="sb-ic"><svg class="icon"><use href="#ic-items"/></svg></span><span class="sb-tx">Items</span></a>
       <a class="sb-link" href="#/search" data-nav="search"><span class="sb-ic"><svg class="icon"><use href="#ic-search"/></svg></span><span class="sb-tx">Search</span></a>
+      </div>
     </div>
-    <div class="sb-section"><span class="sb-label">Manufacturing</span>
+    <div class="sb-section" data-group="mfg">
+      <button type="button" class="sb-head" aria-expanded="true" aria-controls="sbg-mfg"><span class="sb-ic"><svg class="icon"><use href="#ic-factory"/></svg></span><span class="sb-tx">Manufacturing</span><svg class="icon sb-chev"><use href="#ic-chevron"/></svg></button>
+      <div class="sb-items" id="sbg-mfg">
       <a class="sb-link" href="#/mfg" data-nav="mfg"><span class="sb-ic"><svg class="icon"><use href="#ic-manufacturing"/></svg></span><span class="sb-tx">Manufacturing hub</span></a>
       <a class="sb-link" href="#/machines" data-nav="machines"><span class="sb-ic"><svg class="icon"><use href="#ic-machine"/></svg></span><span class="sb-tx">Machines &amp; Tools</span></a>
       <a class="sb-link" href="#/tools" data-nav="tools"><span class="sb-ic"><svg class="icon"><use href="#ic-tool"/></svg></span><span class="sb-tx">Tool library</span></a>
       <a class="sb-link" href="#/post-processors" data-nav="post-processors"><span class="sb-ic"><svg class="icon"><use href="#ic-tool"/></svg></span><span class="sb-tx">Post-processors</span></a>
       <a class="sb-link" href="#/sheet-metal" data-nav="sheet-metal"><span class="sb-ic"><svg class="icon"><use href="#ic-sheet-metal"/></svg></span><span class="sb-tx">Sheet Metal Standards</span></a>
       <a class="sb-link" href="#/laser-nests" data-nav="laser-nests"><span class="sb-ic"><svg class="icon"><use href="#ic-sheet-metal"/></svg></span><span class="sb-tx">Laser Nests</span></a>
+      </div>
     </div>
-    <div class="sb-section"><span class="sb-label">Action</span>
+    <div class="sb-section" data-group="actions">
+      <button type="button" class="sb-head" aria-expanded="true" aria-controls="sbg-actions"><span class="sb-ic"><svg class="icon"><use href="#ic-inbox"/></svg></span><span class="sb-tx">Actions</span><svg class="icon sb-chev"><use href="#ic-chevron"/></svg></button>
+      <div class="sb-items" id="sbg-actions">
       <a class="sb-link" href="#/approvals" data-nav="approvals"><span class="sb-ic"><svg class="icon"><use href="#ic-approval"/></svg></span><span class="sb-tx">Approvals</span><span class="sb-count" id="nb-approvals">0</span></a>
       <a class="sb-link" href="#/activity" data-nav="activity"><span class="sb-ic"><svg class="icon"><use href="#ic-activity"/></svg></span><span class="sb-tx">Activity</span></a>
       <a class="sb-link" href="#/jobs" data-nav="jobs"><span class="sb-ic"><svg class="icon"><use href="#ic-gcode"/></svg></span><span class="sb-tx">Jobs</span></a>
+      </div>
     </div>
-    <div class="sb-section"><span class="sb-label">Admin</span>
+    <div class="sb-section" data-group="admin">
+      <button type="button" class="sb-head" aria-expanded="true" aria-controls="sbg-admin"><span class="sb-ic"><svg class="icon"><use href="#ic-shield"/></svg></span><span class="sb-tx">Admin</span><svg class="icon sb-chev"><use href="#ic-chevron"/></svg></button>
+      <div class="sb-items" id="sbg-admin">
       <a class="sb-link" href="#/system" data-nav="system"><span class="sb-ic"><svg class="icon"><use href="#ic-system"/></svg></span><span class="sb-tx">System</span></a>
       <a class="sb-link sb-admin" href="#/admin" data-nav="admin" hidden><span class="sb-ic"><svg class="icon"><use href="#ic-settings"/></svg></span><span class="sb-tx">Administration</span></a>
       <a class="sb-link" href="#/settings" data-nav="settings"><span class="sb-ic"><svg class="icon"><use href="#ic-settings"/></svg></span><span class="sb-tx">Settings</span></a>
+      </div>
     </div>
-    <div class="sb-gap"></div>
+    </div>
     <div class="sb-foot">
-      <div id="sb-user" class="sb-user"></div>
-      <button id="signout" class="sb-signout">Sign out</button>
+      <button type="button" id="sbuserbtn" class="sb-userbtn" aria-haspopup="menu"><span id="sb-user" class="sb-user"></span><svg class="icon sb-chev"><use href="#ic-chevron"/></svg></button>
     </div>
   </nav>
+  <div id="sb-backdrop" class="sb-backdrop" hidden></div>
 
   <div id="main">
     <header id="topbar">
-      <button id="menubtn" class="menubtn" title="Menu">≡</button>
+      <button type="button" id="menubtn" class="menubtn" aria-label="Main menu" aria-controls="sidebar" aria-expanded="true"><svg class="icon"><use href="#ic-menu"/></svg></button>
       <span id="crumb" class="crumb"></span>
       <div class="top-search">
         <input id="globsearch" placeholder="Search part number, description…  ( / )" spellcheck="false">

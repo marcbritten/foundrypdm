@@ -154,7 +154,7 @@ td.mono, td.dim { font-size:var(--fs-base); }
 
 /* ── Workspace shell ── */
 #ws { display:flex; min-height:100vh; }
-#sidebar { width:236px; flex:0 0 auto; background:var(--panel); border-right:1px solid var(--line);
+#sidebar { width:15rem; flex:0 0 auto; background:var(--panel); border-right:1px solid var(--line);
   display:flex; flex-direction:column; position:sticky; top:0; height:100vh; }
 .sb-brand { font-weight:700; font-size:var(--fs-lg); padding:16px 18px 12px; letter-spacing:.02em; }
 .sb-brand .mark { color:var(--acc); margin-right:6px; }
@@ -182,31 +182,71 @@ td.mono, td.dim { font-size:var(--fs-base); }
 .brand-nowrap { white-space:nowrap; }
 .brand-warn-h { font-weight:600; margin:var(--sp-2) 0 0; }
 .brand-warn { margin:var(--sp-1) 0 var(--sp-2); padding-left:var(--sp-5); }
-.sb-link { display:flex; align-items:center; gap:10px; padding:8px 18px; color:var(--fg);
-  font-size:var(--fs-base); border-left:3px solid transparent; cursor:pointer; user-select:none; }
-.sb-link:hover { background:var(--hover); }
-.sb-link.on { background:var(--active); border-left-color:var(--acc); color:var(--fg); font-weight:600; }
-.sb-ic { width:20px; text-align:center; color:var(--dim); font-size:var(--fs-base); }
-.sb-link.on .sb-ic { color:var(--acc); }
-.sb-section { margin:10px 18px 4px; }
-.sb-label { display:block; font-size:var(--fs-sm); font-weight:700; letter-spacing:.12em;
-  text-transform:uppercase; color:var(--text-3); margin-bottom:6px; }
+/* Sidebar groups: a header button (icon, label, chevron) folds the group's links, and a guide line
+   runs along their left. The current page is accent text, bold and underlined, with no fill.
+   Pointer and keyboard focus underline a label; the focus ring is the shared one. */
+.sb-nav { flex:1; min-height:0; overflow-y:auto; padding:0 var(--sp-3) var(--sp-3); }
+.sb-section + .sb-section { margin-top:var(--sp-3); }
+.sb-head, .sb-link { display:flex; align-items:center; gap:var(--sp-2); min-height:var(--sp-6);
+  padding:var(--sp-1) var(--sp-2); font-size:var(--fs-base); line-height:var(--lh-tight); border-radius:var(--r-s); }
+.sb-head { width:100%; background:none; border:none; color:var(--acc); font-weight:700; text-align:left; cursor:pointer; }
+.sb-head:hover { background:none; }
+.sb-chev { margin-left:auto; flex:0 0 auto; color:var(--dim); transition:transform .15s ease; }
+.sb-section.folded .sb-head .sb-chev { transform:rotate(90deg); }
+.sb-items { margin-left:var(--sp-4); padding-left:var(--sp-1); border-left:1px solid var(--line); }
+.sb-link { color:var(--fg); text-decoration:none; cursor:pointer; user-select:none; }
+.sb-link[hidden] { display:none; }
+.sb-head:hover .sb-tx, .sb-head:focus-visible .sb-tx, .sb-link:hover .sb-tx, .sb-link:focus-visible .sb-tx,
+.sb-link.on .sb-tx { text-decoration:underline; text-underline-offset:.2em; }
+.sb-link.on { color:var(--acc); font-weight:700; }
+.sb-ic { flex:0 0 auto; width:var(--sp-4); display:inline-flex; justify-content:center; color:var(--dim); }
+.sb-head .sb-ic, .sb-link.on .sb-ic { color:var(--acc); }
+.sb-tx { min-width:0; overflow-wrap:anywhere; }
+/* A folded group still shows the current page and a link with a count (such as approvals waiting). */
+.sb-section.folded .sb-link:not(.on):not(:has(.sb-count:not(:empty))) { display:none; }
+@media (pointer: coarse) { .sb-head, .sb-link, .sb-userbtn { min-height:44px; } }
 .sb-count { margin-left:auto; font-size:var(--fs-xs); font-weight:700; color:var(--acc);
   background:color-mix(in srgb, var(--acc) 18%, var(--panel));
   border:1px solid color-mix(in srgb, var(--acc) 35%, var(--line));
   border-radius:999px; padding:0 7px; min-width:18px; text-align:center; }
-.sb-gap { flex:1; }
-.sb-admin { margin-bottom:8px; }
-.sb-foot { padding:12px 18px; border-top:1px solid var(--line); }
-.sb-user { font-size:var(--fs-sm); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.sb-signout { width:100%; margin-top:8px; font-size:var(--fs-sm); }
+/* The signed-in account at the foot: avatar, name and role. It opens the account menu above it. */
+.sb-foot { flex-shrink:0; padding:var(--sp-2) var(--sp-3); border-top:1px solid var(--line); }
+.sb-userbtn { display:flex; align-items:center; gap:var(--sp-2); width:100%; min-height:var(--sp-6);
+  padding:var(--sp-1) var(--sp-2); background:none; border:none; color:var(--fg); text-align:left; }
+.sb-userbtn:hover { background:none; }
+.sb-userbtn:hover .sb-tx, .sb-userbtn:focus-visible .sb-tx { text-decoration:underline; text-underline-offset:.2em; }
+.sb-userbtn .sb-chev { transform:rotate(180deg); }
+.sb-user { display:flex; align-items:center; gap:var(--sp-2); min-width:0; font-size:var(--fs-base); font-weight:600; }
+.sb-user .sb-tx { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.sb-user .dim { font-weight:400; font-size:var(--fs-sm); }
+/* Wide screens: the menu button folds the sidebar to an icon rail. Labels are hidden from sight
+   only (screen readers still read them) and show as tooltips. A folded group opens in the rail,
+   so every page stays one click away. The account button in the sidebar replaces the top bar's. */
+@media (min-width: 901px) {
+  #sidebar.rail { width:calc(var(--sp-6) + var(--sp-5)); }
+  #sidebar.rail .sb-brand { padding-inline:0; text-align:center; }
+  #sidebar.rail .sb-brand [data-brand-name] { display:none; }
+  #sidebar.rail .sb-brand .mark { margin-right:0; }
+  #sidebar.rail .sb-brand .brand-logo { max-width:var(--sp-6); }
+  #sidebar.rail .sb-nav, #sidebar.rail .sb-foot { padding-inline:var(--sp-1); }
+  #sidebar.rail .sb-head { display:none; }
+  #sidebar.rail .sb-section + .sb-section { margin-top:var(--sp-2); padding-top:var(--sp-2); border-top:1px solid var(--line); }
+  #sidebar.rail .sb-items { margin-left:0; padding-left:0; border-left:none; }
+  #sidebar.rail .sb-section .sb-link:not([hidden]) { display:flex; justify-content:center; position:relative; }
+  #sidebar.rail .sb-tx { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+  #sidebar.rail .sb-link.on .sb-ic { box-shadow:0 2px 0 var(--acc); }
+  #sidebar.rail .sb-count { position:absolute; top:0; right:0; margin:0; }
+  #sidebar.rail .sb-userbtn { justify-content:center; position:relative; }
+  #sidebar.rail .sb-userbtn .sb-chev { display:none; }
+  .userchip, .userchip-kebab { display:none; }
+}
 #main { flex:1; min-width:0; display:flex; flex-direction:column; }
 #topbar { display:flex; align-items:center; gap:10px; padding:10px 16px;
   background:var(--panel); border-bottom:1px solid var(--line);
   position:sticky; top:0; z-index:20; flex-wrap:wrap; }
 .crumb { font-size:var(--fs-base); font-weight:600; white-space:nowrap; overflow:hidden;
   text-overflow:ellipsis; max-width:260px; }
-.menubtn { display:none; font-size:var(--fs-lg); padding:4px 10px; }
+.menubtn { display:inline-flex; align-items:center; padding:var(--sp-1) var(--sp-2); }
 .top-search { flex:1; min-width:140px; max-width:480px; }
 .top-search input { width:100%; }
 .buildinfo { font-size:var(--fs-sm); white-space:nowrap; }
@@ -519,9 +559,9 @@ dialog.modal-backdrop::backdrop { background:transparent; }
 .bottomBar { display:none; }
 @media (max-width: 900px) {
   #sidebar { position:fixed; left:0; top:0; bottom:0; z-index:60; transform:translateX(-100%);
-    transition:transform .18s ease; box-shadow:var(--shadow); }
-  #sidebar.open { transform:none; }
-  .menubtn { display:inline-block; }
+    visibility:hidden; transition:transform .18s ease, visibility 0s linear .18s; box-shadow:var(--shadow); }
+  #sidebar.open { transform:none; visibility:visible; transition:transform .18s ease; }
+  .sb-backdrop:not([hidden]) { position:fixed; inset:0; z-index:55; background:var(--backdrop); }
   .grid2, .grid3 { grid-template-columns:1fr; }
   .explorer { grid-template-columns:1fr; }
   .tree { max-height:260px; }

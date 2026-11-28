@@ -1123,8 +1123,9 @@ async function enterWorkspace(){
   const u = ME.user;
   $("userchip").textContent = u ? (u.display_name || u.email) : "service account";
   $("sb-user").innerHTML = u
-    ? userAv(u, false) + " " + esc(u.display_name || u.email) + " <span class='dim' style='margin-left:4px'>" + esc(u.role) + "</span>"
-    : "service account";
+    ? userAv(u, false) + "<span class='sb-tx'>" + esc(u.display_name || u.email) + " <span class='dim'>" + esc(u.role) + "</span></span>"
+    : "<svg class='icon' aria-hidden='true'><use href='#ic-user'/></svg><span class='sb-tx'>service account</span>";
+  if ($("sidebar").classList.contains("rail")) setNavRail(true, document, null);   // the tooltip follows the name
   $("userkebab").hidden = !u;
   document.querySelectorAll(".sb-admin").forEach(a => a.hidden = !(u && u.role === "admin"));
   refreshOrgFont();
@@ -1286,6 +1287,90 @@ function syncNav(){
   if (ROUTE.name === "tool" && TOOL.data) c = TOOL.data.name;
   $("crumb").textContent = c;
   $("crumb").title = c;
+}
+// ── sidebar: folding groups, icon rail and phone drawer ──
+// Each group folds on its own. A folded group still shows the current page and a link with a
+// count. The menu button folds the whole sidebar to an icon rail on wide screens and opens it as a
+// drawer on narrow ones (901px is the same break as the bottom bar). This browser keeps the
+// folded groups and the rail in localStorage.
+function navFoldedGroups(store){
+  try { const v = JSON.parse(store.getItem("pdm_nav_folded") || "[]"); return Array.isArray(v) ? v : []; }
+  catch(e){ return []; }
+}
+function setNavGroupFolded(sec, folded, store){
+  sec.classList.toggle("folded", folded);
+  const head = sec.querySelector(".sb-head");
+  if (head) head.setAttribute("aria-expanded", String(!folded));
+  if (!store) return;
+  const id = sec.dataset.group, list = navFoldedGroups(store).filter(g => g !== id);
+  if (folded) list.push(id);
+  try { store.setItem("pdm_nav_folded", JSON.stringify(list)); } catch(e){}
+}
+function wireNavGroups(root, store){
+  const folded = navFoldedGroups(store);
+  root.querySelectorAll(".sb-section[data-group]").forEach(sec => {
+    setNavGroupFolded(sec, folded.includes(sec.dataset.group), null);
+    const head = sec.querySelector(".sb-head");
+    if (head) head.onclick = () => setNavGroupFolded(sec, !sec.classList.contains("folded"), store);
+  });
+}
+function navIsDrawer(){ return window.matchMedia("(max-width: 900px)").matches; }
+function syncMenuBtn(root){
+  const b = root.getElementById("menubtn"), sb = root.getElementById("sidebar");
+  if (!b || !sb) return;
+  const drawer = navIsDrawer();
+  const open = drawer ? sb.classList.contains("open") : !sb.classList.contains("rail");
+  b.setAttribute("aria-expanded", String(open));
+  b.title = drawer ? (open ? "Close the menu" : "Open the menu")
+    : (open ? "Show only icons in the sidebar" : "Show the full sidebar");
+}
+// The rail hides the labels: each link and the account button keep their name and get it as a tooltip.
+function setNavRail(on, root, store){
+  const sb = root.getElementById("sidebar");
+  sb.classList.toggle("rail", on);
+  sb.querySelectorAll(".sb-link, .sb-userbtn").forEach(a => {
+    const t = a.querySelector(".sb-tx");
+    a.title = on && t ? t.textContent.trim() : "";
+  });
+  if (store) try { if (on) store.setItem("pdm_nav_rail", "1"); else store.removeItem("pdm_nav_rail"); } catch(e){}
+  syncMenuBtn(root);
+}
+// Opening the drawer moves focus into it; closing it with Escape returns focus to the menu button.
+function setNavDrawer(open, root, refocus){
+  const sb = root.getElementById("sidebar"), shade = root.getElementById("sb-backdrop");
+  sb.classList.toggle("open", open);
+  if (shade) shade.hidden = !open;
+  syncMenuBtn(root);
+  if (open){ const f = sb.querySelector("button, a[href]"); if (f) f.focus(); }
+  else if (refocus){ const b = root.getElementById("menubtn"); if (b) b.focus(); }
+}
+function toggleNav(root, store){
+  const sb = root.getElementById("sidebar");
+  if (navIsDrawer()) setNavDrawer(!sb.classList.contains("open"), root, false);
+  else setNavRail(!sb.classList.contains("rail"), root, store);
+}
+function wireSidebar(root, store){
+  wireNavGroups(root, store);
+  let rail = false;
+  try { rail = store.getItem("pdm_nav_rail") === "1"; } catch(e){}
+  setNavRail(rail, root, null);
+  root.getElementById("menubtn").onclick = () => toggleNav(root, store);
+  root.getElementById("sb-backdrop").onclick = () => setNavDrawer(false, root, true);
+  root.addEventListener("keydown", e => {
+    if (e.key !== "Escape" || !root.getElementById("sidebar").classList.contains("open")) return;
+    if (root.querySelector(".modal-backdrop, dialog[open], .ctxmenu:not(.hidden), .kebabmenu:not(.hidden)")) return;
+    setNavDrawer(false, root, true);
+  });
+  // Tab past the end of the open drawer closes it, so focus never sits behind the backdrop.
+  root.addEventListener("focusin", e => {
+    const sb = root.getElementById("sidebar");
+    if (sb.classList.contains("open") && !sb.contains(e.target) && e.target !== root.getElementById("menubtn")
+      && !e.target.closest(".kebabmenu")) setNavDrawer(false, root, false);
+  });
+  window.addEventListener("resize", () => {
+    if (!navIsDrawer() && root.getElementById("sidebar").classList.contains("open")) setNavDrawer(false, root, false);
+    syncMenuBtn(root);
+  });
 }
 const DETAIL = { id:null, tab:"overview", data:null, revs:[], comments:[], props:[], cmp:new Set(),
   pvSeq:null, folderCache:null };
@@ -5319,30 +5404,29 @@ async function giveToken(u){
 }
 
 // ── account: user menu + password change / reset ────────────────────────
+// Opened from the account button at the foot of the sidebar (and the account button in the top bar
+// on narrow screens). A token session has no password or settings of its own: it gets Sign out only.
 function showUserMenu(ev){
   ev.stopPropagation();
-  if (!ME.user) return;
-  const entries = [
+  const trigger = ev.currentTarget, m = $("kebabmenu");
+  if (!m.classList.contains("hidden") && m._trigger === trigger){ hideKebab(); return; }
+  hideCtx();
+  const entries = ME && ME.user ? [
     { label: "Change password", act: () => changePassword() },
+    { label: "Change appearance", act: () => {
+      if ($("sidebar").classList.contains("open")) setNavDrawer(false, document, false);
+      go("settings"); } },
     "sep",
     { label: "Sign out", danger: true, act: () => signout() },
-  ];
-  const m = $("kebabmenu");
-  m.innerHTML = entries.map((en, i) => en === "sep" ? "<div class='sep'></div>" :
-    "<div class='ki" + (en.danger ? " danger" : "") + "' data-i='" + i + "'><span>" +
-    esc(en.label) + "</span></div>").join("");
-  m.classList.remove("hidden");
-  const r = ev.currentTarget.getBoundingClientRect();
-  let left = Math.max(6, Math.min(r.right - m.offsetWidth, innerWidth - m.offsetWidth - 6));
-  let top = r.bottom + 4;
-  if (top + m.offsetHeight > innerHeight - 6) top = Math.max(6, r.top - m.offsetHeight - 4);
-  m.style.left = left + "px";
-  m.style.top = top + "px";
-  m.onclick = e => {
-    const ki = e.target.closest(".ki"); if (!ki) return;
-    const en = entries[+ki.dataset.i];
-    hideKebab(); if (en && en.act) en.act();
-  };
+  ] : [{ label: "Sign out", danger: true, act: () => signout() }];
+  showMenu(m, entries, trigger, menu => {
+    const r = trigger.getBoundingClientRect();
+    const left = Math.max(6, Math.min(r.left, innerWidth - menu.offsetWidth - 6));
+    let top = r.bottom + 4;
+    if (top + menu.offsetHeight > innerHeight - 6) top = Math.max(6, r.top - menu.offsetHeight - 4);
+    menu.style.left = left + "px";
+    menu.style.top = top + "px";
+  });
 }
 
 async function changePassword(){
@@ -8031,7 +8115,7 @@ function liveBarHide(){
     a.addEventListener("click", e => {
       if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
       e.preventDefault();
-      $("sidebar").classList.remove("open");
+      if ($("sidebar").classList.contains("open")) setNavDrawer(false, document, false);
       go(a.dataset.nav);
     }));
   window.addEventListener("popstate", onHashNav);
@@ -8055,7 +8139,7 @@ function liveBarHide(){
       densityBtn.textContent = on ? "Compact" : "Comfortable";
     };
   }
-  $("menubtn").onclick = () => $("sidebar").classList.toggle("open");
+  wireSidebar(document, localStorage);
   $("refreshbtn").onclick = () => (CUR_RELOAD ? CUR_RELOAD() : render(true));
   $("refreshbtn").addEventListener("click", () => liveBarHide());
   const autoRefresh = document.createElement("button");
@@ -8086,7 +8170,7 @@ function liveBarHide(){
     if (document.hidden) LIVE.hideTimer = setTimeout(liveStop, LIVE_HIDDEN_MS);
     else if (ME && !LIVE.ctl && LIVE.state !== "signedout") liveConnect();
   });
-  $("signout").onclick = signout;
+  $("sbuserbtn").onclick = showUserMenu;
   $("userkebab").onclick = showUserMenu;
   $("signin-form").onsubmit = e => { e.preventDefault(); signin(); };
   $("token-form").onsubmit = e => { e.preventDefault(); connectFromToken(); };
