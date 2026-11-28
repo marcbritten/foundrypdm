@@ -462,14 +462,32 @@ async function signin(){
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username: email, password: pw, ...(org ? { org } : {}) }) });
     const d = await r.json().catch(()=>({}));
-    if (!r.ok) throw new Error((d.error && d.error.message) || ("HTTP " + r.status));
+    if (!r.ok){
+      if (signinNeedsOrg(r.status, d, org)){ authBusy(false); showOrgField(); return; }
+      throw new Error(r.status === 401 ? (org ? "the email, password or organization is not right" : "the email or password is not right") :
+        (d.error && d.error.message) || ("HTTP " + r.status));
+    }
     TOKEN = d.token; localStorage.setItem("pdm_token", TOKEN);
     $("login_password").value = "";
-    $("tokval").textContent = TOKEN;
-    $("tokshow").classList.remove("hidden");
     ME = { org_id: d.org && d.org.id, user: d.user, scopes: "full" };
     enterWorkspace();
   } catch(e){ authBusy(false); toast("Sign in failed: " + e.message, "err"); }
+}
+
+// /auth/login answers 400 bad_request when the email exists in several organizations
+// and none was named (its only 400 for a well-formed request); ask for the organization.
+function signinNeedsOrg(status, d, org){
+  return status === 400 && !org && !!(d && d.error && d.error.code === "bad_request");
+}
+function showOrgField(){
+  const f = $("login_org_f");
+  f.hidden = false;
+  $("login_org").required = true;
+  $("login_org").focus();
+  // A different email may belong to one organization only: ask again if it does not.
+  $("login_email").addEventListener("input", () => {
+    f.hidden = true; $("login_org").required = false; $("login_org").value = "";
+  }, { once: true });
 }
 
 async function signout(){
@@ -3015,7 +3033,7 @@ async function viewDashboard(v){
   if (!PROJECTS.length || !USERS.length) await loadCommon();
   const home = await api("GET", "/home").catch(() => null);
   const k = home && home.kpis ? home.kpis : null;
-  const firstRun = k && !k.items && !PROJECTS.length;
+  const guide = await gettingStartedHTML(k);
   const recent = await api("GET", "/items?limit=5&sort=modified_at&dir=desc")
     .then(d => (d.items || []).map(it => Object.assign({}, it,
       { _project: PMAP[it.project_id] ? PMAP[it.project_id].name : "—" })))
@@ -3027,17 +3045,7 @@ async function viewDashboard(v){
   v.innerHTML =
     "<div class='head'><h2>Dashboard</h2>" +
     "<span class='dim muted' id='refreshstatus'>" + refreshModeLabel() + "</span></div>" +
-    (firstRun ?
-      "<div class='card' style='margin-bottom:14px'>" +
-      "<h2 class='sec'>Get started</h2>" +
-      "<p class='dim' style='margin:0 0 10px'>Three steps and the workspace is live:</p>" +
-      "<div class='row' style='margin-bottom:6px'><b>1.</b> Create a project " +
-      "<button class='small' id='onb1'>Open projects</button></div>" +
-      "<div class='row' style='margin-bottom:6px'><b>2.</b> Upload a file into it " +
-      "<button class='small' id='onb2'>How?</button></div>" +
-      "<div class='row'><b>3.</b> Invite a teammate " +
-      "<button class='small' id='onb3'>Administration</button></div>" +
-      "</div>" : "") +
+    guide +
     kpiStrip(k) +
     "<div class='grid2'>" +
       "<div><h2 class='sec'>Activity</h2>" +
@@ -3068,10 +3076,7 @@ async function viewDashboard(v){
     c.addEventListener("click", () => go(c.dataset.knav)));
   const g = v.querySelector("[data-go='projects']");
   if (g) g.onclick = () => go("projects");
-  const o1 = $("onb1"), o2 = $("onb2"), o3 = $("onb3");
-  if (o1) o1.onclick = () => go("projects");
-  if (o2) o2.onclick = () => go("projects");
-  if (o3) o3.onclick = () => go("admin");
+  wireGettingStarted(v);
   const da = $("dallact");
   if (da) da.onclick = () => go("activity");
   v.querySelectorAll("[data-ap]").forEach(b =>
@@ -3462,6 +3467,8 @@ async function viewToolDetail(v){
   const id = ROUTE.toolid;
   const d = await api("GET", "/tools/" + id);
   TOOL.id = id; TOOL.data = d.tool; TOOL.cutting = d.cutting_data || []; TOOL.docs = d.documents || [];
+  // A draft with no edits is redrawn from the record just loaded, so others' changes show.
+  if (TOOL.draft && TOOL.draft.id === id && !TOOL.draft.dirty) TOOL.draft = null;
   const t = TOOL.data;
   const tabCount = k => k === "cutting" ? TOOL.cutting.length : k === "general" ? TOOL.docs.length : 0;
   v.innerHTML =
@@ -3470,7 +3477,8 @@ async function viewToolDetail(v){
     "<span class='dim muted'>" + esc(kindLabel(t.kind)) + " · " + esc(t.units || "mm") +
     (t.tool_number != null ? " · T" + t.tool_number : "") + "</span>" +
     "<div class='grow'></div>" +
-    "<button id='tsave' class='primary small'>Save</button>" +
+    "<span class='sec-state dim' role='status' id='tool-state'></span>" +
+    "<button id='tsave' class='primary small'>Save tool</button>" +
     "<button id='tdel' class='small'>Delete</button></div>" +
     "<div class='tabs'>" +
     [["general","General"],["cutter","Cutter"],["cutting","Cutting data"],["post","Post processor"]]
@@ -3485,12 +3493,60 @@ async function viewToolDetail(v){
     pushHash(); renderToolTab();
   }));
   $("tsave").onclick = saveTool;
+  // Typed values go into the tool's draft, so they survive a tab switch or a re-render.
+  const onEdit = e => {
+    const id = e.target && e.target.id || "";
+    if (!TOOL_FIELDS.some(f => f[0] === id) && !id.startsWith("geom-")) return; // e.g. the document file picker
+    if (captureToolInputs().touched.size){ TOOL.draft.dirty = true; toolStateText(); }
+  };
+  $("ttab").addEventListener("input", onEdit);
+  $("ttab").addEventListener("change", onEdit);
+  guardUnsavedEdits();
+  toolStateText();
   $("tdel").onclick = async () => {
     if (!confirm("Delete tool \"" + t.name + "\"? Its cutting data and documents are removed too.")) return;
     try { await api("DELETE", "/tools/" + id); toast("Tool deleted", "ok"); go("tools"); }
     catch(e){ toast("Delete tool: " + e.message, "err"); }
   };
   renderToolTab();
+}
+// One draft per tool: every tab renders from it and Save tool sends it whole. It is
+// dropped only when the tool is saved or another tool is opened.
+const TOOL_FIELDS = [["g-desc","description"],["g-vendor","vendor"],["g-pn","part_number"],["g-link","link"],
+  ["c-kind","kind"],["c-units","units"],["c-rotation","rotation"],["c-flutes","flutes"],
+  ["c-material","tool_material"],["p-tnum","tool_number"]];
+function toolDraft(){
+  if (!TOOL.draft || TOOL.draft.id !== TOOL.id){
+    const t = Object.assign({}, TOOL.data || {});
+    t.dimensions = Object.assign({}, t.dimensions || {});
+    TOOL.draft = { id: TOOL.id, t, dirty: false, touched: new Set() };
+  }
+  return TOOL.draft;
+}
+// Copy whichever editor fields are on screen into the draft, noting the ones that changed:
+// only those are sent, so a save never writes back values someone else changed meanwhile.
+function captureToolInputs(){
+  const d = toolDraft();
+  const shown = v => String(v ?? "");
+  for (const [id, key] of TOOL_FIELDS){
+    const el = $(id);
+    if (el && el.value !== shown(d.t[key])){ d.t[key] = el.value; d.touched.add(key); }
+  }
+  const tab = $("ttab");
+  if (tab) tab.querySelectorAll("[id^='geom-']").forEach(el => {
+    const k = el.id.slice(5);
+    if (el.value !== shown(d.t.dimensions[k])){ d.t.dimensions[k] = el.value; d.touched.add("dimensions"); }
+  });
+  return d;
+}
+
+function toolStateText(text){
+  const s = $("tool-state");
+  if (!s) return;
+  const dirty = !!(TOOL.draft && TOOL.draft.id === TOOL.id && TOOL.draft.dirty);
+  const next = text || (dirty ? "Unsaved changes" : "");
+  if (s.textContent !== next) s.textContent = next; // live region: only on a change
+  s.classList.toggle("unsaved", dirty && !text);
 }
 function renderToolTab(){
   const v = $("ttab");
@@ -3504,7 +3560,7 @@ function tf(label, inputHtml){
   return "<div class='tfield'><label>" + label + "</label>" + inputHtml + "</div>";
 }
 function renderToolGeneral(v){
-  const t = TOOL.data;
+  const t = toolDraft().t;
   v.innerHTML =
     "<div class='card'>" +
     tf("Description", "<textarea id='g-desc' rows='3'>" + esc(t.description || "") + "</textarea>") +
@@ -3513,7 +3569,7 @@ function renderToolGeneral(v){
     tf("Part number", "<input id='g-pn' class='mono' value='" + esc(t.part_number || "") + "' placeholder='optional'>") +
     tf("Link", "<input id='g-link' value='" + esc(t.link || "") + "' placeholder='https://…'>") +
     "</div>" +
-    "<div style='margin-top:14px'><button id='tsave2' class='primary small'>Save general</button></div></div>" +
+    "<div style='margin-top:14px'><button id='tsave2' class='small'>Save tool</button></div></div>" +
     "<div class='card' style='margin-top:12px'><h2 class='sec'>Documents (" + TOOL.docs.length + ")</h2>" +
     (TOOL.docs.length ?
       "<table><thead><tr><th>Name</th><th>Size</th><th>Added</th><th></th></tr></thead><tbody>" +
@@ -3543,7 +3599,7 @@ function renderToolGeneral(v){
     });
 }
 function renderToolCutter(v){
-  const t = TOOL.data;
+  const t = toolDraft().t;
   const dims = t.dimensions || {};
   const geoms = TOOL_GEOMETRY[t.kind] || [];
   v.innerHTML =
@@ -3576,8 +3632,8 @@ function renderToolCutter(v){
         "<input id='geom-" + g[0] + "' type='number' step='any' value='" +
         (dims[g[0]] != null ? esc(String(dims[g[0]])) : "") + "'></div>").join("") +
       "</div></div>" : "") +
-    "<div style='margin-top:14px'><button id='tsave3' class='primary small'>Save cutter</button></div></div>";
-  $("c-kind").onchange = () => renderToolTab();
+    "<div style='margin-top:14px'><button id='tsave3' class='small'>Save tool</button></div></div>";
+  $("c-kind").onchange = () => { captureToolInputs(); renderToolTab(); };
   $("tsave3").onclick = saveTool;
 }
 function renderToolCutting(v){
@@ -3670,7 +3726,7 @@ async function addOrEditCutting(existing){
   } catch(e){ toast("Cutting data: " + e.message, "err"); }
 }
 function renderToolPost(v){
-  const t = TOOL.data;
+  const t = toolDraft().t;
   v.innerHTML =
     "<div class='card'><h2 class='sec'>Post processor</h2>" +
     "<div class='dim muted' style='margin-bottom:10px'>The tool number this cutter is loaded at on the machine, " +
@@ -3679,53 +3735,58 @@ function renderToolPost(v){
     tf("Tool number in machine", "<input id='p-tnum' type='number' min='0' step='1' value='" +
       (t.tool_number != null ? t.tool_number : "") + "' placeholder='e.g. 10'>") +
     "</div>" +
-    (t.tool_number != null ?
-      "<div class='dim' style='margin-top:8px'>Currently T" + t.tool_number + ".</div>" : "") +
-    "<div style='margin-top:14px'><button id='tsave4' class='primary small'>Save post processor</button></div></div>";
+    (TOOL.data.tool_number != null ?
+      "<div class='dim' style='margin-top:8px'>Currently T" + TOOL.data.tool_number + ".</div>" : "") +
+    "<div style='margin-top:14px'><button id='tsave4' class='small'>Save tool</button></div></div>";
   $("tsave4").onclick = saveTool;
 }
+// The body for PUT /tools/{id}: the fields edited in the draft. Geometry goes with a type
+// change or a geometry edit, holding only the keys of the draft's type.
 function collectToolEdits(){
-  const txt = id => { const el = $(id); return el ? (el.value.trim() || null) : undefined; };
-  const num = id => { const el = $(id); if (!el) return undefined;
-    const s = el.value.trim(); if (s === "") return null;
-    const v = Number(s); return isNaN(v) ? null : v; };
+  const d = toolDraft(), t = d.t;
+  const txt = v => { const s = String(v ?? "").trim(); return s === "" ? null : s; };
+  const num = v => { const s = String(v ?? "").trim(); if (s === "") return null;
+    const n = Number(s); return isNaN(n) ? null : n; };
   const edits = {};
-  const set = (k, val) => { if (val !== undefined) edits[k] = val; };
-  set("description", txt("g-desc"));
-  set("vendor", txt("g-vendor"));
-  set("part_number", txt("g-pn"));
-  set("link", txt("g-link"));
-  set("kind", txt("c-kind"));
-  set("units", txt("c-units"));
-  set("rotation", txt("c-rotation"));
-  set("flutes", num("c-flutes"));
-  set("tool_material", txt("c-material"));
-  set("tool_number", num("p-tnum"));
-  if ($("c-kind")) {
-    const dims = TOOL.data.dimensions || {};
-    for (const [k] of TOOL_GEOMETRY[TOOL.data.kind] || []) {
-      const el = $("geom-" + k);
-      if (!el) continue;
-      const s = el.value.trim();
-      if (s === "") delete dims[k];
-      else { const val = Number(s); dims[k] = isNaN(val) ? s : val; }
+  for (const [, key] of TOOL_FIELDS){
+    if (!d.touched.has(key)) continue;
+    edits[key] = key === "flutes" || key === "tool_number" ? num(t[key]) : txt(t[key]);
+  }
+  if (d.touched.has("dimensions") || d.touched.has("kind")){
+    const dims = {};
+    for (const [k] of TOOL_GEOMETRY[t.kind] || []){
+      const s = String(t.dimensions[k] ?? "").trim();
+      if (s !== ""){ const n = Number(s); dims[k] = isNaN(n) ? s : n; }
     }
-    for (const k of Object.keys(dims)) {
-      if (!(TOOL_GEOMETRY[TOOL.data.kind] || []).some(x => x[0] === k)) delete dims[k];
-    }
-    set("dimensions", Object.keys(dims).length ? dims : null);
+    edits.dimensions = Object.keys(dims).length ? dims : null;
   }
   return edits;
 }
 async function saveTool(){
+  if (TOOL.saving) return;
+  captureToolInputs();
+  const edits = collectToolEdits();
+  if (!Object.keys(edits).length){ toolStateText("No changes to save"); return; }
+  TOOL.saving = true;
+  // Fields stay locked while the request runs, so nothing typed meanwhile is lost.
+  const locked = [...document.querySelectorAll("#view .head button, #ttab input, #ttab select, #ttab textarea, #ttab button")]
+    .filter(el => !el.disabled);
+  locked.forEach(el => { el.disabled = true; });
+  toolStateText("Saving…");
   try {
-    const edits = collectToolEdits();
-    if (!Object.keys(edits).length){ toast("Nothing to save", "ok"); return; }
     TOOL.data = (await api("PUT", "/tools/" + TOOL.id, edits)).tool;
-    toast("Tool saved", "ok");
-    render(false);
-  } catch(e){ toast("Save tool: " + e.message, "err"); }
+    TOOL.draft = null;
+    await render(false);
+    toolStateText("Saved");
+  } catch(e){
+    toolStateText();
+    toast("Tool not saved: " + e.message, "err");
+  } finally {
+    TOOL.saving = false;
+    locked.forEach(el => { if (el.isConnected) el.disabled = false; });
+  }
 }
+
 async function uploadToolDoc(file){
   if (!file) return;
   try {
@@ -4211,19 +4272,28 @@ function applyTheme(id){
 function themePickerHTML(){
   const cur = currentTheme();
   return "<div class='theme-grid'>" + THEMES.map(t =>
-    "<button type='button' class='theme-card" + (t.id === cur ? " on" : "") + "' data-theme-id='" + t.id + "'>" +
+    "<button type='button' class='theme-card" + (t.id === cur ? " on" : "") + "' data-theme-id='" + t.id + "' aria-pressed='" + (t.id === cur) + "'>" +
     "<div class='theme-swatches'>" + t.swatches.map(c => "<span style='background:" + c + "'></span>").join("") + "</div>" +
     "<strong>" + esc(t.name) + "</strong><span class='dim'>" + esc(t.desc) + "</span></button>"
   ).join("") + "</div>";
 }
+// Mark the picked card in place; re-rendering the page would wipe unsaved edits.
+function markPicked(root, attr, id){
+  root.querySelectorAll("[" + attr + "]").forEach(b => {
+    const on = b.getAttribute(attr) === id;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", String(on));
+  });
+}
 function wireThemePicker(root){
-  (root || document).querySelectorAll("[data-theme-id]").forEach(b => {
-    b.onclick = () => { applyTheme(b.dataset.themeId); toast("Theme: " + (THEMES.find(t => t.id === b.dataset.themeId) || {}).name, "ok"); if (ROUTE.name === "admin" || ROUTE.name === "settings") render(false); };
+  root = root || document;
+  root.querySelectorAll("[data-theme-id]").forEach(b => {
+    b.onclick = () => { applyTheme(b.dataset.themeId); markPicked(root, "data-theme-id", currentTheme()); };
   });
 }
 
 const GPU_POLICIES = [
-  { id:"auto", name:"Auto", desc:"GPU if present, else CPU" },
+  { id:"auto", name:"Auto", desc:"GPU if present, else CPU (default)" },
   { id:"hardware", name:"GPU", desc:"Require the machine GPU" },
   { id:"software", name:"GPU software", desc:"Driver on CPU (llvmpipe)" },
   { id:"cpu", name:"CPU", desc:"SolidCraft CPU rasterizer" }
@@ -4231,19 +4301,23 @@ const GPU_POLICIES = [
 function gpuPickerHTML(cur, canEdit){
   return "<div class='theme-grid'>" + GPU_POLICIES.map(t =>
     "<button type='button' class='theme-card" + (t.id === cur ? " on" : "") + "' data-gpu-id='" + t.id + "'" +
-    (canEdit ? "" : " disabled") + ">" +
+    " aria-pressed='" + (t.id === cur) + "'" + (canEdit ? "" : " disabled") + ">" +
     "<strong>" + esc(t.name) + "</strong><span class='dim'>" + esc(t.desc) + "</span></button>"
   ).join("") + "</div>";
 }
 function wireGpuPicker(root, canEdit){
   if (!canEdit) return;
-  (root || document).querySelectorAll("[data-gpu-id]").forEach(b => {
+  root = root || document;
+  const cards = [...root.querySelectorAll("[data-gpu-id]")];
+  cards.forEach(b => {
     b.onclick = async () => {
+      if (b.classList.contains("on") || b.disabled) return;
+      cards.forEach(x => x.disabled = true);
       try {
-        await api("PUT", "/settings/gpu-policy", { gpu_policy: b.dataset.gpuId });
-        toast("Preview renderer: " + ((GPU_POLICIES.find(t => t.id === b.dataset.gpuId) || {}).name || b.dataset.gpuId), "ok");
-        render(false);
-      } catch(e){ toast("GPU policy: " + e.message, "err"); }
+        const d = await api("PUT", "/settings/gpu-policy", { gpu_policy: b.dataset.gpuId });
+        markPicked(root, "data-gpu-id", d.gpu_policy || b.dataset.gpuId);
+      } catch(e){ toast("GPU policy not saved: " + e.message, "err"); }
+      finally { cards.forEach(x => x.disabled = false); }
     };
   });
 }
@@ -4304,21 +4378,43 @@ async function addUser(){
   } catch(e){ toast("Add user: " + e.message, "err"); }
 }
 async function inviteUser(){
-  const f = await openModal("Invite user", [
+  const known = new Set(USERS.map(u => String(u.email).toLowerCase()));
+  const r = await openModal("Invite user", [
     { id:"email", label:"Email", required:true, placeholder:"name@company.com", type:"text" },
     { id:"display_name", label:"Display name", placeholder:"e.g. Jane" },
     { id:"role", label:"Role", type:"select",
       options:[{value:"editor",label:"Editor"},{value:"viewer",label:"Viewer"},{value:"admin",label:"Admin"}], value:"editor" }
-  ], "Send invite");
-  if (!f) return;
-  try {
-    await api("POST", "/users/invite", {
-      email: f.email, display_name: f.display_name || null, role: f.role
-    });
-    toast("Invite emailed to " + f.email, "ok");
-    render(false);
-  } catch(e){ toast("Invite: " + e.message, "err"); }
+  ], { label:"Send invite", busyLabel:"Sending…", onSubmit: async f => {
+    const email = f.email.trim();
+    try {
+      await api("POST", "/users/invite", { email, display_name: f.display_name || null, role: f.role });
+      return { email };
+    } catch(e){
+      // The email step comes last: a failed send can leave a new account nobody can use.
+      const made = known.has(email.toLowerCase()) ? null : await findUserByEmail(email);
+      if (!made) throw e;
+      return { email, made, err: e };
+    }
+  } });
+  if (!r) return;
+  render(false);
+  if (r.made) await inviteMailFailed(r.email, r.err, r.made);
+  else toast("Invite emailed to " + r.email, "ok");
 }
+// Read the user list rather than the error text to learn whether the account exists.
+async function findUserByEmail(email){
+  return api("GET", "/users")
+    .then(d => (d.users || []).find(u => String(u.email).toLowerCase() === email.toLowerCase()) || null)
+    .catch(() => null);
+}
+async function inviteMailFailed(email, err, user){
+  const ok = await openModal("Invite email not sent", [], "Reset password",
+    "<p><b>" + esc(email) + "</b> was added, but the invite email failed: " + esc(err.detail || err.message) + "</p>" +
+    "<p>They cannot sign in yet. Reset their password and share it with them, or fix the mail settings " +
+    "and reset it later.</p>");
+  if (ok) await resetPassword(user);
+}
+
 async function editUser(u){
   const f = await openModal("Edit user — " + u.email, [
     { id:"display_name", label:"Display name", value:u.display_name || "" },
@@ -4419,19 +4515,66 @@ async function changePassword(){
   } catch(e){ toast("Change password: " + e.message, "err"); }
 }
 
-// Admin: set a brand-new password for any user (no current password needed).
+// Copy text to the clipboard; falls back to selecting the field where the Clipboard API
+// is missing (plain-http hosts). Resolves true when the text was copied.
+async function copyText(text, field){
+  try { await navigator.clipboard.writeText(text); return true; }
+  catch(e){
+    if (!field) return false;
+    field.focus(); field.select();
+    try { return document.execCommand("copy"); } catch(_){ return false; }
+  }
+}
+// Show / Hide and Copy buttons for a password field in a dialog.
+function wireSecretField(field, showBtn, copyBtn){
+  if (!field) return;
+  if (showBtn) showBtn.onclick = () => {
+    const hide = field.type === "text";
+    field.type = hide ? "password" : "text";
+    showBtn.textContent = hide ? "Show" : "Hide";
+    showBtn.setAttribute("aria-pressed", String(!hide));
+  };
+  if (copyBtn) copyBtn.onclick = async () => {
+    // The fallback selects the text, which a password field does not allow: show it first.
+    const viaApi = await copyText(field.value, null);
+    if (!viaApi && field.type === "password" && showBtn) showBtn.onclick();
+    const ok = viaApi || await copyText(field.value, field);
+    copyBtn.textContent = ok ? "Copied" : "Copy";
+    if (!ok) toast("Not copied. The password is selected: copy it with Ctrl+C (Cmd+C on a Mac).", "err");
+    else setTimeout(() => { copyBtn.textContent = "Copy"; }, 2000);
+  };
+}
+function secretFieldHTML(id, label, value, editable){
+  return "<div class='modal-field'><label for='" + id + "'>" + esc(label) + "</label>" +
+    "<div class='row' style='margin:0;flex-wrap:nowrap'><input id='" + id + "' type='text' class='mono' spellcheck='false' autocomplete='off'" +
+    (editable ? " required minlength='4'" : " readonly") + " value='" + esc(value) + "' style='flex:1'>" +
+    "<button type='button' class='small' id='" + id + "-show' aria-pressed='true'>Hide</button>" +
+    "<button type='button' class='small' id='" + id + "-copy'>Copy</button></div></div>";
+}
+
+// Admin: set a brand-new password for any user (no current password needed). The
+// generated password is shown so it can be shared; the admin may type another instead.
 async function resetPassword(u){
-  const pw = genPassword();
-  const f = await openModal("Reset password — " + (u.display_name || u.email), [
-    { id:"new", label:"New password (min 4 characters)", required:true, type:"password", value: pw },
-    { id:"confirm", label:"Confirm new password", required:true, type:"password", value: pw }
-  ], "Reset password");
-  if (!f) return;
-  if (f.new !== f.confirm){ toast("Passwords do not match", "err"); return; }
-  try {
-    await api("POST", "/users/" + u.id + "/password", { password: f.new });
-    toast("Password reset for " + (u.display_name || u.email), "ok");
-  } catch(e){ toast("Reset password: " + e.message, "err"); }
+  const who = u.display_name || u.email;
+  let field = null;
+  const pending = openModal("Reset password for " + who, [],
+    { label:"Reset password", busyLabel:"Resetting…", onSubmit: async () => {
+      const pw = field.value;
+      await api("POST", "/users/" + u.id + "/password", { password: pw });
+      return { pw };
+    } },
+    secretFieldHTML("rp-new", "New password (at least 4 characters)", genPassword(), true) +
+    "<p class='dim'>A password was generated for you. You can type your own instead.</p>");
+  field = $("rp-new");
+  wireSecretField(field, $("rp-new-show"), $("rp-new-copy"));
+  const r = await pending;
+  if (!r || !r.pw) return;
+  const pw = r.pw;
+  const done = openModal("New password for " + who, [], "Done",
+    "<p>Share it with " + esc(who) + " securely. It is not shown again.</p>" +
+    secretFieldHTML("rp-done", "New password", pw, false));
+  wireSecretField($("rp-done"), $("rp-done-show"), $("rp-done-copy"));
+  await done;
 }
 // ── system (server + bundled SolidCraft CLI + infrastructure) ────────────
 function fmtUptime(sec){
@@ -4628,6 +4771,129 @@ function viewSystem(v){
 }
 
 // ── settings (org part-number prefixes) ─────────────────────────────────
+// ── settings sections ───────────────────────────────────────────────────
+// Each Settings section saves on its own. Typing in a section marks it "Unsaved
+// changes"; saving updates only that section, so edits elsewhere on the page stay.
+function setSectionState(sec, state){
+  if (!sec) return;
+  sec.classList.toggle("dirty", state === "unsaved");
+  const s = sec.querySelector(".sec-state");
+  if (!s) return;
+  // A live region: write only on a change, so a screen reader does not repeat it per key.
+  const text = state === "unsaved" ? "Unsaved changes" : state === "saved" ? "Saved" : "";
+  if (s.textContent !== text) s.textContent = text;
+  s.classList.toggle("unsaved", state === "unsaved");
+}
+function wireDirty(root){
+  root.querySelectorAll("[data-section]").forEach(sec => {
+    const touch = () => { sec.dataset.rev = String((Number(sec.dataset.rev) || 0) + 1); setSectionState(sec, "unsaved"); };
+    sec.addEventListener("input", touch);
+    sec.addEventListener("change", touch);
+  });
+}
+function unsavedEdits(){
+  return !!document.querySelector("#view [data-section].dirty") ||
+    (ROUTE.name === "tool" && !!(TOOL.draft && TOOL.draft.dirty));
+}
+let UNSAVED_GUARD = false;
+function guardUnsavedEdits(){
+  if (UNSAVED_GUARD) return;
+  UNSAVED_GUARD = true;
+  window.addEventListener("beforeunload", e => { if (unsavedEdits()){ e.preventDefault(); e.returnValue = ""; } });
+}
+// Run one section's save with a busy button; say "Saved" only when nothing was typed
+// while the request ran. Resolves to the server's answer, or null on failure.
+async function saveSection(btn, busyLabel, what, send){
+  if (!btn || btn.disabled) return null;
+  const sec = btn.closest("[data-section]");
+  const rev = sec ? sec.dataset.rev : undefined;
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = busyLabel;
+  try {
+    const d = await send();
+    if (sec && sec.dataset.rev === rev) setSectionState(sec, "saved");
+    return d;
+  } catch(e){ toast(what + " not saved: " + e.message, "err"); return null; }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+function unsavedHTML(){ return "<span class='sec-state dim' role='status'></span>"; }
+function setHint(id, text){ return text ? "<div class='set-hint dim' id='" + id + "-hint'>" + text + "</div>" : ""; }
+// A labelled text input for a Settings card; hint (HTML) sits under it.
+function setInput(id, label, value, o){
+  o = o || {};
+  return "<div class='modal-field'" + (o.wide ? " style='grid-column:1/-1'" : "") + ">" +
+    "<label for='" + id + "'>" + label + "</label>" +
+    "<input id='" + id + "'" + (o.type ? " type='" + o.type + "'" : "") +
+    (o.cls ? " class='" + o.cls + "'" : "") +
+    (o.inputmode ? " inputmode='" + o.inputmode + "'" : "") +
+    (o.placeholder ? " placeholder='" + esc(o.placeholder) + "'" : "") +
+    (o.hint ? " aria-describedby='" + id + "-hint'" : "") +
+    " value='" + esc(value == null ? "" : String(value)) + "'" + (o.canEdit === false ? " disabled" : "") + ">" +
+    setHint(id, o.hint) + "</div>";
+}
+function setSelect(id, label, options, cur, o){
+  o = o || {};
+  return "<div class='modal-field'><label for='" + id + "'>" + label + "</label>" +
+    "<select id='" + id + "'" + (o.hint ? " aria-describedby='" + id + "-hint'" : "") + (o.canEdit === false ? " disabled" : "") + ">" +
+    options.map(([v, l]) => "<option value='" + v + "'" + (v === cur ? " selected" : "") + ">" + esc(l) + "</option>").join("") +
+    "</select>" + setHint(id, o.hint) + "</div>";
+}
+// Say what is wrong with a field in its hint line, until the field is edited again.
+function fieldProblem(id, msg){
+  const el = $(id), h = $(id + "-hint");
+  if (!el) return;
+  el.setAttribute("aria-invalid", "true");
+  if (!h){ toast(msg, "err"); return; }
+  if (h.dataset.hint === undefined) h.dataset.hint = h.textContent;
+  h.textContent = msg; h.classList.add("set-err");
+  el.addEventListener("input", () => {
+    el.removeAttribute("aria-invalid");
+    h.textContent = h.dataset.hint; h.classList.remove("set-err");
+  }, { once: true });
+}
+function secretHint(isSet){
+  return isSet ? "Set. Leave blank to keep the current one." : "Not set.";
+}
+
+// Laser-nest defaults. Keys follow pdm_core::NestDefaults (serde camelCase): the
+// server silently drops any other key, which is how "Part source unit" never saved.
+const NEST_LEN_FIELDS = [["nd-width","width","Sheet width"],["nd-length","length","Sheet length"],
+  ["nd-margin","margin","Sheet margin"],["nd-spx","spacingX","Part spacing (H)"],["nd-spy","spacingY","Part spacing (V)"]];
+function nestDefaultsBody(f){
+  const body = { units: f.units, partUnit: f.partUnit, grainDirection: f.grainDirection,
+    nestingCorner: f.nestingCorner, guillotine: !!f.guillotine, addPartLabels: !!f.addPartLabels };
+  const bad = [];
+  for (const [, key, label] of NEST_LEN_FIELDS){
+    const s = String(f[key] ?? "").trim();
+    const n = Number(s);
+    if (s === "") body[key] = null;
+    else if (isFinite(n) && n >= 0) body[key] = n;
+    else bad.push(label);
+  }
+  return { body, bad };
+}
+// Switching units re-expresses each length from its exact size, so in → mm → in gives
+// back what was typed. null = blank or not a number (left as typed).
+function lengthToMm(s, unit){
+  s = String(s ?? "").trim();
+  const v = Number(s);
+  return s === "" || !isFinite(v) ? null : (unit === "in" ? v * 25.4 : v);
+}
+function mmToText(mm, unit){
+  return String(Number((unit === "in" ? mm / 25.4 : mm).toFixed(unit === "in" ? 4 : 3)));
+}
+// What the New laser nest panel uses for a blank length: its built-in value (ncDefaultState),
+// said in the unit shown, with the built-in figure when that differs. "" when unknown.
+function nestBlankHint(key, unit){
+  const d = typeof ncDefaultState === "function" ? ncDefaultState() : null;
+  if (!d || (d.units !== "in" && d.units !== "mm")) return "";
+  const s0 = d.sheets && d.sheets[0] || {};
+  const v = { width: s0.width, length: s0.length, margin: d.margin, spacingX: d.spacingX, spacingY: d.spacingY }[key];
+  if (typeof v !== "number") return "";
+  if (unit === d.units) return "Blank: " + v + " " + unit + ".";
+  return "Blank: " + mmToText(lengthToMm(v, d.units), unit) + " " + unit + " (" + v + " " + d.units + ").";
+}
+
 async function viewSettings(v){
   const canEdit = isRole("admin");
   const [d, gp, mail, osh, proj, preview, nestDef] = await Promise.all([
@@ -4642,6 +4908,8 @@ async function viewSettings(v){
   const nd = nestDef.defaults || {};
   const prefixes = d.prefixes || [];
   const gpuPolicy = gp.gpu_policy || "auto";
+  const ro = { canEdit };
+  const ndUnits = nd.units === "mm" ? "mm" : "in";
   v.innerHTML =
     "<div class='head'><h2>Settings</h2>" +
     "<span class='dim muted'>organization settings · shared by the web workspace and the desktop app</span>" +
@@ -4652,77 +4920,71 @@ async function viewSettings(v){
     "<h2 class='sec'>Preview renderer</h2>" +
     "<div class='card'><p class='dim'>Transparent product renders use the CPU product-image renderer, with no grid or axes. " +
     "Viewport snapshots retain the original background and use the GPU policy below. Regenerate an existing preview to apply a new style.</p>" +
-    "<div class='row'><label for='preview-style'>Preview style</label><select id='preview-style'" + (canEdit ? "" : " disabled") + ">" +
+    "<div class='row' data-section='preview-style'><label for='preview-style'>Preview style</label><select id='preview-style' aria-describedby='preview-style-hint'" + (canEdit ? "" : " disabled") + ">" +
     "<option value='transparent'" + (preview.preview_style !== "viewport" ? " selected" : "") + ">Transparent product render</option>" +
     "<option value='viewport'" + (preview.preview_style === "viewport" ? " selected" : "") + ">Viewport snapshot (background, grid and axes)</option></select>" +
-    (canEdit ? "<button id='preview-style-save'>Save preview style</button>" : "") + "</div>" +
+    (canEdit ? "<button id='preview-style-save'>Save preview style</button>" + unsavedHTML() : "") + "</div>" +
+    "<p class='dim' id='preview-style-hint'>Default: Transparent product render.</p>" +
     gpuPickerHTML(gpuPolicy, canEdit) + "</div>" +
     "<h2 class='sec'>Mail server</h2>" +
-    "<div class='card'><p class='dim'>SMTP used when you invite a user. Leave password blank to keep the current one.</p>" +
+    "<div class='card' data-section='mail'><p class='dim'>SMTP used when you invite a user.</p>" +
     "<div class='grid2'>" +
-      "<div class='modal-field'><label>Host</label><input id='mail-host' value='" + esc(mail.host || "") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Port</label><input id='mail-port' value='" + esc(String(mail.port || 587)) + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Username</label><input id='mail-user' value='" + esc(mail.username || "") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Password</label><input id='mail-pass' type='password' placeholder='" + (mail.password_set ? "unchanged" : "") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>From address</label><input id='mail-from' placeholder='Foundry PDM &lt;pdm@example.com&gt;' value='" + esc(mail.from || "") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Encryption</label><select id='mail-tls'" + (canEdit?"":" disabled") + ">" +
-        ["starttls","tls","none"].map(t => "<option value='" + t + "'" + (mail.tls === t ? " selected" : "") + ">" +
-          (t === "starttls" ? "STARTTLS (587)" : t === "tls" ? "TLS (465)" : "None") + "</option>").join("") +
-      "</select></div>" +
-      "<div class='modal-field' style='grid-column:1/-1'><label>Sign-in URL (optional)</label><input id='mail-url' placeholder='https://pdm.example.com' value='" + esc(mail.login_url || "") + "'" + (canEdit?"":" disabled") + "></div>" +
+      setInput("mail-host", "Host", mail.host, ro) +
+      setInput("mail-port", "Port", mail.port || 587, Object.assign({ inputmode:"numeric", hint:"Default: 587." }, ro)) +
+      setInput("mail-user", "Username", mail.username, ro) +
+      setInput("mail-pass", "Password", "", Object.assign({ type:"password", hint: secretHint(mail.password_set) }, ro)) +
+      setInput("mail-from", "From address", mail.from, Object.assign({ placeholder:"Foundry PDM <pdm@example.com>" }, ro)) +
+      setSelect("mail-tls", "Encryption", [["starttls","STARTTLS (587)"],["tls","TLS (465)"],["none","None"]],
+        mail.tls || "starttls", Object.assign({ hint:"Default: STARTTLS." }, ro)) +
+      setInput("mail-url", "Sign-in URL (optional)", mail.login_url, Object.assign({ wide:true, placeholder:"https://pdm.example.com" }, ro)) +
     "</div>" +
-    (canEdit ? "<div class='row' style='margin-top:10px'><button id='mail-save' class='primary'>Save mail</button><button id='mail-test'>Send test</button>" +
-      "<span class='dim'>" + (mail.configured ? "configured" : "not configured") + "</span></div>" : "") +
+    (canEdit ? "<div class='row' style='margin-top:10px'><button id='mail-save'>Save mail</button><button id='mail-test'>Send test</button>" +
+      "<span class='dim' id='mail-stat'>" + (mail.configured ? "Status: configured" : "Status: not configured") + "</span>" + unsavedHTML() + "</div>" : "") +
     "</div>" +
     "<h2 class='sec'>Onshape</h2>" +
-    "<div class='card'><p class='dim'>Register an Onshape OAuth app, then an <b>Element right panel</b> extension (Part Studio and Assembly) whose Action URL is:</p>" +
+    "<div class='card' data-section='os'><p class='dim'>Register an Onshape OAuth app, then an <b>Element right panel</b> extension (Part Studio and Assembly) whose Action URL is:</p>" +
     "<p class='mono' style='word-break:break-all'>" + esc(location.origin) + "/static/onshape.html?documentId={$documentId}&amp;workspaceId={$workspaceOrVersionId}&amp;elementId={$elementId}&amp;server=https://cad.onshape.com</p>" +
     "<p class='dim'>Subscribe the company to the app. CAD users open the panel in Onshape and click Send — PDM exports STEP on the server (Onshape does not allow API calls from the browser).</p>" +
     "<div class='grid2'>" +
-      "<div class='modal-field'><label>Base URL</label><input id='os-base' value='" + esc(osh.base_url || "https://cad.onshape.com") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Access key</label><input id='os-key' value='" + esc(osh.access_key || "") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field' style='grid-column:1/-1'><label>Secret</label><input id='os-secret' type='password' placeholder='" + (osh.secret_set ? "unchanged" : "") + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field' style='grid-column:1/-1'><label>Default PDM project</label><select id='os-proj'" + (canEdit?"":" disabled") + ">" +
+      setInput("os-base", "Base URL", osh.base_url || "https://cad.onshape.com", Object.assign({ hint:"Default: https://cad.onshape.com" }, ro)) +
+      setInput("os-key", "Access key", osh.access_key, ro) +
+      setInput("os-secret", "Secret", "", Object.assign({ type:"password", wide:true, hint: secretHint(osh.secret_set) }, ro)) +
+      "<div class='modal-field' style='grid-column:1/-1'><label for='os-proj'>Default PDM project</label><select id='os-proj'" + (canEdit?"":" disabled") + ">" +
         "<option value=''>—</option>" +
         (proj.projects||[]).map(p => "<option value='"+p.id+"'" + (String(osh.default_project_id||"")===String(p.id)?" selected":"") + ">"+esc(p.name)+"</option>").join("") +
       "</select></div>" +
-      "<div class='modal-field' style='grid-column:1/-1'><label><input id='os-folder-sync' type='checkbox'" + (osh.folder_sync_enabled ? " checked" : "") + (canEdit ? "" : " disabled") + "> Enable Onshape folder sync</label></div>" +
+      "<div class='modal-field' style='grid-column:1/-1'><label><input id='os-folder-sync' type='checkbox' style='width:auto'" + (osh.folder_sync_enabled ? " checked" : "") + (canEdit ? "" : " disabled") + "> Enable Onshape folder sync</label>" +
+      setHint("os-folder-sync", "Default: off.") + "</div>" +
     "</div>" +
-    (canEdit ? "<div class='row' style='margin-top:10px'><button id='os-save' class='primary'>Save Onshape</button>" +
-      "<span class='dim'>" + (osh.configured ? "configured" : "not configured") + "</span></div>" : "") +
+    (canEdit ? "<div class='row' style='margin-top:10px'><button id='os-save'>Save Onshape</button>" +
+      "<span class='dim' id='os-stat'>" + (osh.configured ? "Status: configured" : "Status: not configured") + "</span>" + unsavedHTML() + "</div>" : "") +
     "</div>" +
     "<h2 class='sec'>Laser nesting defaults</h2>" +
-    "<div class='card'><p class='dim'>Pre-fills the New laser nest panel. Blank fields keep the panel's built-in default. " +
-    "Units of measure applies to the sheet/part dimensional fields.</p>" +
+    "<div class='card' data-section='nd'><p class='dim'>Pre-fills the New laser nest panel. A blank field keeps the panel's built-in value, shown under it. " +
+    "Units of measure applies to the sheet and spacing fields; changing it converts the values shown.</p>" +
     "<div class='grid2'>" +
-      "<div class='modal-field'><label>Units of measure</label><select id='nd-units'" + (canEdit?"":" disabled") + ">" +
-        ["in","mm"].map(u => "<option value='"+u+"' " + (nd.units===u?"selected":"") + ">" + (u==="in"?"Inches":"Millimetres") + "</option>").join("") + "</select></div>" +
-      "<div class='modal-field'><label>Part source unit</label><select id='nd-punit'" + (canEdit?"":" disabled") + ">" +
-        ["auto","in","mm"].map(u => "<option value='"+u+"' " + (nd.partUnit===u?"selected":"") + ">" + (u==="auto"?"Auto (file units)":u==="in"?"Inches":"Millimetres") + "</option>").join("") + "</select></div>" +
-      "<div class='modal-field'><label>Sheet width</label><input id='nd-width' value='" + esc(String(nd.width ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Sheet length</label><input id='nd-length' value='" + esc(String(nd.length ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Sheet margin</label><input id='nd-margin' value='" + esc(String(nd.margin ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Part spacing (H)</label><input id='nd-spx' value='" + esc(String(nd.spacingX ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Part spacing (V)</label><input id='nd-spy' value='" + esc(String(nd.spacingY ?? "")) + "'" + (canEdit?"":" disabled") + "></div>" +
-      "<div class='modal-field'><label>Grain direction</label><select id='nd-grain'" + (canEdit?"":" disabled") + ">" +
-        [["along_length","Vertical"],["along_width","Horizontal"],["any","Ignore"]].map(([u,l]) =>
-          "<option value='"+u+"' " + (nd.grainDirection===u?"selected":"") + ">" + l + "</option>").join("") + "</select></div>" +
-      "<div class='modal-field'><label>Nesting corner</label><select id='nd-corner'" + (canEdit?"":" disabled") + ">" +
-        [["lower_left","Lower Left"],["lower_right","Lower Right"],["upper_left","Upper Left"],["upper_right","Upper Right"]].map(([u,l]) =>
-          "<option value='"+u+"' " + (nd.nestingCorner===u?"selected":"") + ">" + l + "</option>").join("") + "</select></div>" +
-      "<div class='modal-field'><label><input id='nd-gull' type='checkbox'" + (nd.guillotine?" checked":"") + (canEdit?"":" disabled") + "> Guillotine cut</label></div>" +
-      "<div class='modal-field'><label><input id='nd-labels' type='checkbox'" + (nd.addPartLabels?" checked":"") + (canEdit?"":" disabled") + "> Add part labels</label></div>" +
+      setSelect("nd-units", "Units of measure", [["in","Inches"],["mm","Millimetres"]], ndUnits, Object.assign({ hint:"Default: Inches." }, ro)) +
+      setSelect("nd-punit", "Part source unit", [["auto","Auto (file units)"],["in","Inches"],["mm","Millimetres"]],
+        nd.partUnit || "auto", Object.assign({ hint:"Default: Auto (file units)." }, ro)) +
+      NEST_LEN_FIELDS.map(([id, key, label]) => setInput(id, label + " (<span class='nd-u'>" + ndUnits + "</span>)", nd[key],
+        Object.assign({ inputmode:"decimal", hint: nestBlankHint(key, ndUnits) }, ro))).join("") +
+      setSelect("nd-grain", "Grain direction", [["along_length","Vertical"],["along_width","Horizontal"],["any","Ignore"]],
+        nd.grainDirection || "along_length", Object.assign({ hint:"Default: Vertical." }, ro)) +
+      setSelect("nd-corner", "Nesting corner", [["lower_left","Lower Left"],["lower_right","Lower Right"],["upper_left","Upper Left"],["upper_right","Upper Right"]],
+        nd.nestingCorner || "lower_left", Object.assign({ hint:"Default: Lower Left." }, ro)) +
+      "<div class='modal-field'><label><input id='nd-gull' type='checkbox' style='width:auto'" + (nd.guillotine?" checked":"") + (canEdit?"":" disabled") + "> Guillotine cut</label>" + setHint("nd-gull", "Default: off.") + "</div>" +
+      "<div class='modal-field'><label><input id='nd-labels' type='checkbox' style='width:auto'" + (nd.addPartLabels?" checked":"") + (canEdit?"":" disabled") + "> Add part labels</label>" + setHint("nd-labels", "Default: off.") + "</div>" +
     "</div>" +
-    (canEdit ? "<div class='row' style='margin-top:10px'><button id='nd-save' class='primary'>Save nesting defaults</button></div>" : "") +
+    (canEdit ? "<div class='row' style='margin-top:10px'><button id='nd-save'>Save nesting defaults</button>" + unsavedHTML() + "</div>" : "") +
     "</div>" +
     "<div class='head'><h2 class='sec' style='margin:0'>Part-number prefixes</h2>" +
     "<div class='grow'></div>" +
-    (canEdit ? "<button id='pn-add' class='primary'>＋ Add prefix</button>" : "") +
+    (canEdit ? "<button id='pn-add'><svg class='icon'><use href='#ic-plus'/></svg> Add prefix</button>" : "") +
     "</div>" +
     "<div class='card'><p class='dim'>When a part number is left blank on upload or create, the server auto-assigns one as " +
     "<b class='mono'>PREFIX-000001</b>, <b class='mono'>PREFIX-000002</b>, … The prefix is looked up from the item's " +
     "<b>category</b> below. Categories with no configured prefix fall back to the category name itself.</p>" +
-    prefixTable(prefixes, canEdit) +
+    "<div id='pn-table'>" + prefixTable(prefixes, canEdit) + "</div>" +
     "<p class='dim muted' style='margin-top:10px'>Existing items keep their part numbers; changing a prefix only affects newly auto-assigned ones.</p></div>" +
     "<h2 class='sec'>My account</h2>" +
     "<div class='card'><p class='dim'>Password for your account (" + esc(myName()) + "). " +
@@ -4734,68 +4996,91 @@ async function viewSettings(v){
   if (cpBtn) cpBtn.onclick = () => changePassword();
   wireThemePicker(v);
   wireGpuPicker(v, canEdit);
-  if ($("preview-style-save")) $("preview-style-save").onclick = async () => {
-    try { await api("PUT", "/settings/preview-style", {preview_style:$("preview-style").value}); toast("Preview style saved", "ok"); }
-    catch(e){ toast("Preview style: " + e.message, "err"); }
-  };
+  wirePrefixTable(v);
+  wireDirty(v);
+  guardUnsavedEdits();
+  if ($("preview-style-save")) $("preview-style-save").onclick = () =>
+    saveSection($("preview-style-save"), "Saving…", "Preview style",
+      () => api("PUT", "/settings/preview-style", { preview_style: $("preview-style").value }));
   const mailSave = $("mail-save");
   if (mailSave) mailSave.onclick = async () => {
-    const port = Number($("mail-port").value);
-    try {
-      await api("PUT", "/settings/mail", {
-        host: $("mail-host").value.trim(),
-        port: Number.isFinite(port) && port > 0 ? port : 587,
-        username: $("mail-user").value.trim(),
-        password: $("mail-pass").value,
-        from: $("mail-from").value.trim(),
-        tls: $("mail-tls").value,
-        login_url: $("mail-url").value.trim()
-      });
-      toast("Mail server saved", "ok");
-      render(false);
-    } catch(e){ toast("Mail: " + e.message, "err"); }
+    const ps = $("mail-port").value.trim();
+    const port = ps === "" ? 587 : Number(ps);
+    if (!Number.isInteger(port) || port < 1 || port > 65535){
+      fieldProblem("mail-port", "Enter a whole number from 1 to 65535, or leave it blank for 587.");
+      $("mail-port").focus();
+      return;
+    }
+    const sentPass = $("mail-pass").value;
+    const d = await saveSection(mailSave, "Saving…", "Mail settings", () => api("PUT", "/settings/mail", {
+      host: $("mail-host").value.trim(), port,
+      username: $("mail-user").value.trim(),
+      password: $("mail-pass").value,
+      from: $("mail-from").value.trim(),
+      tls: $("mail-tls").value,
+      login_url: $("mail-url").value.trim()
+    }));
+    if (!d) return;
+    GS_ADMIN = null; // the dashboard guide reads mail status again
+    if ($("mail-pass").value === sentPass) $("mail-pass").value = "";
+    if ($("mail-pass-hint")) $("mail-pass-hint").textContent = secretHint(d.password_set);
+    if ($("mail-port").value.trim() === ps) $("mail-port").value = String(d.port || port);
+    if ($("mail-stat")) $("mail-stat").textContent = d.configured ? "Status: configured" : "Status: not configured";
   };
   const mailTest = $("mail-test");
   if (mailTest) mailTest.onclick = async () => {
+    if (mailTest.disabled) return;
+    mailTest.disabled = true; mailTest.textContent = "Sending…";
     try {
       const d = await api("POST", "/settings/mail/test", {});
       toast("Test message sent to " + (d.to || "you"), "ok");
-    } catch(e){ toast("Mail test: " + e.message, "err"); }
+    } catch(e){ toast("Test message not sent: " + e.message, "err"); }
+    finally { mailTest.disabled = false; mailTest.textContent = "Send test"; }
   };
   const osSave = $("os-save");
   if (osSave) osSave.onclick = async () => {
-    try {
-      await api("PUT", "/settings/onshape", {
-        base_url: $("os-base").value.trim(),
-        access_key: $("os-key").value.trim(),
-        secret: $("os-secret").value,
-        default_project_id: $("os-proj").value || null,
-        folder_sync_enabled: $("os-folder-sync").checked
-      });
-      toast("Onshape API saved", "ok");
-      render(false);
-    } catch(e){ toast("Onshape: " + e.message, "err"); }
+    const sentSecret = $("os-secret").value;
+    const d = await saveSection(osSave, "Saving…", "Onshape settings", () => api("PUT", "/settings/onshape", {
+      base_url: $("os-base").value.trim(),
+      access_key: $("os-key").value.trim(),
+      secret: $("os-secret").value,
+      default_project_id: $("os-proj").value || null,
+      folder_sync_enabled: $("os-folder-sync").checked
+    }));
+    if (!d) return;
+    if ($("os-secret").value === sentSecret) $("os-secret").value = "";
+    if ($("os-secret-hint")) $("os-secret-hint").textContent = secretHint(d.secret_set);
+    if ($("os-stat")) $("os-stat").textContent = d.configured ? "Status: configured" : "Status: not configured";
   };
+  const ndUnitSel = $("nd-units");
+  if (ndUnitSel){
+    let shown = ndUnitSel.value;
+    const exact = {};
+    for (const [id] of NEST_LEN_FIELDS){
+      exact[id] = lengthToMm($(id).value, shown);
+      $(id).addEventListener("input", () => { exact[id] = lengthToMm($(id).value, shown); });
+    }
+    ndUnitSel.addEventListener("change", () => {
+      shown = ndUnitSel.value;
+      for (const [id] of NEST_LEN_FIELDS) if (exact[id] != null) $(id).value = mmToText(exact[id], shown);
+      v.querySelectorAll(".nd-u").forEach(s => s.textContent = shown);
+      for (const [id, key] of NEST_LEN_FIELDS){ const h = $(id + "-hint"); if (h) h.textContent = nestBlankHint(key, shown); }
+    });
+  }
   const ndSave = $("nd-save");
   if (ndSave) ndSave.onclick = async () => {
-    const numOr = id => { const n = num($(id).value); return isFinite(n) ? n : null; };
-    try {
-      await api("PUT", "/settings/nest-defaults", {
-        units: $("nd-units").value,
-        part_unit: $("nd-punit").value,
-        width: numOr("nd-width"),
-        length: numOr("nd-length"),
-        margin: numOr("nd-margin"),
-        spacingX: numOr("nd-spx"),
-        spacingY: numOr("nd-spy"),
-        grainDirection: $("nd-grain").value,
-        nestingCorner: $("nd-corner").value,
-        guillotine: $("nd-gull").checked,
-        addPartLabels: $("nd-labels").checked,
-      });
-      toast("Nesting defaults saved", "ok");
-      render(false);
-    } catch(e){ toast("Nesting defaults: " + e.message, "err"); }
+    const f = { units: $("nd-units").value, partUnit: $("nd-punit").value,
+      grainDirection: $("nd-grain").value, nestingCorner: $("nd-corner").value,
+      guillotine: $("nd-gull").checked, addPartLabels: $("nd-labels").checked };
+    for (const [id, key] of NEST_LEN_FIELDS) f[key] = $(id).value;
+    const { body, bad } = nestDefaultsBody(f);
+    if (bad.length){
+      const ids = NEST_LEN_FIELDS.filter(x => bad.includes(x[2])).map(x => x[0]);
+      ids.forEach(id => fieldProblem(id, "Enter a number of 0 or more, or leave it blank."));
+      $(ids[0]).focus();
+      return;
+    }
+    await saveSection(ndSave, "Saving…", "Nesting defaults", () => api("PUT", "/settings/nest-defaults", body));
   };
 }
 function prefixTable(prefixes, canEdit){
@@ -4806,56 +5091,106 @@ function prefixTable(prefixes, canEdit){
     "<td>" + esc(p.category) + "</td>" +
     (canEdit ? "<td style='white-space:nowrap'>" +
       "<button class='small' data-edit='" + esc(p.category) + "'>Edit</button> " +
-      "<button class='small danger' data-del='" + esc(p.category) + "'>Delete</button></td>" : "") +
+      "<button class='small danger' data-del='" + esc(p.category) + "' data-prefix='" + esc(p.prefix) + "'>Delete</button></td>" : "") +
     "</tr>").join("");
-  const onEdit = canEdit
-    ? (v) => v.querySelectorAll("[data-edit]").forEach(b =>
-        b.addEventListener("click", () => editPrefix(b.dataset.edit)))
-    : () => {};
-  const onDel = canEdit
-    ? (v) => v.querySelectorAll("[data-del]").forEach(b =>
-        b.addEventListener("click", () => deletePrefix(b.dataset.del)))
-    : () => {};
-  const wrap = document.createElement("div");
-  wrap.innerHTML = "<table><thead><tr><th>Prefix</th><th>Category</th>" +
+  return "<table><thead><tr><th>Prefix</th><th>Category</th>" +
     (canEdit ? "<th></th>" : "") + "</tr></thead><tbody>" + rows + "</tbody></table>";
-  onEdit(wrap); onDel(wrap);
-  return wrap.innerHTML;
+}
+// Wire the prefix table's buttons once it is in the page (it used to be wired on a
+// detached copy, so Edit and Delete did nothing).
+function wirePrefixTable(root){
+  root.querySelectorAll("[data-edit]").forEach(b => b.onclick = () => editPrefix(b.dataset.edit));
+  root.querySelectorAll("[data-del]").forEach(b => b.onclick = () => deletePrefix(b.dataset.del, b.dataset.prefix));
+}
+// Redraw only the prefix table, leaving unsaved edits in other sections alone.
+async function refreshPrefixes(){
+  const box = $("pn-table");
+  if (!box) return;
+  GS_ADMIN = null; // the dashboard guide reads prefixes again
+  try {
+    const d = await api("GET", "/settings/part-number-prefixes");
+    box.innerHTML = prefixTable(d.prefixes || [], isRole("admin"));
+    wirePrefixTable(box);
+  } catch(e){ toast("Prefix list not refreshed: " + e.message, "err"); }
 }
 async function addPrefix(){
   const f = await openModal("Add part-number prefix", [
     { id:"category", label:"Category", required:true, placeholder:"e.g. Drain Tray" },
     { id:"prefix", label:"Prefix", required:true, placeholder:"e.g. DT" }
-  ], "Add prefix");
-  if (!f) return;
-  try {
-    await api("POST", "/settings/part-number-prefixes",
-      { category: f.category.trim(), prefix: f.prefix.trim() });
-    toast("Prefix added", "ok");
-    render(false);
-  } catch(e){ toast("Add prefix: " + e.message, "err"); }
+  ], { label:"Add prefix", busyLabel:"Adding…", onSubmit: f => api("POST", "/settings/part-number-prefixes",
+    { category: f.category.trim(), prefix: f.prefix.trim() }) });
+  if (f) await refreshPrefixes();
 }
 async function editPrefix(category){
-  const d = await api("GET", "/settings/part-number-prefixes");
-  const p = (d.prefixes || []).find(x => x.category === category);
-  const f = await openModal("Edit prefix — " + category, [
-    { id:"prefix", label:"New prefix", required:true, value: p ? p.prefix : "" }
-  ], "Save");
-  if (!f) return;
+  let p = null;
   try {
-    await api("POST", "/settings/part-number-prefixes",
-      { category: category, prefix: f.prefix.trim() });
-    toast("Prefix updated", "ok");
-    render(false);
-  } catch(e){ toast("Edit prefix: " + e.message, "err"); }
+    const d = await api("GET", "/settings/part-number-prefixes");
+    p = (d.prefixes || []).find(x => x.category === category) || null;
+  } catch(e){ toast("Prefix not loaded: " + e.message, "err"); return; }
+  const f = await openModal("Edit prefix for " + category, [
+    { id:"prefix", label:"Prefix", required:true, value: p ? p.prefix : "" }
+  ], { label:"Save prefix", busyLabel:"Saving…", onSubmit: f => api("POST", "/settings/part-number-prefixes",
+    { category: category, prefix: f.prefix.trim() }) });
+  if (f) await refreshPrefixes();
 }
-async function deletePrefix(category){
-  if (!confirm("Delete the prefix for \"" + category + "\"? New items in this category will fall back to the category name.")) return;
-  try {
-    await api("DELETE", "/settings/part-number-prefixes/" + encodeURIComponent(category));
-    toast("Prefix deleted", "ok");
-    render(false);
-  } catch(e){ toast("Delete prefix: " + e.message, "err"); }
+async function deletePrefix(category, prefix){
+  const ok = await openModal("Delete prefix " + (prefix || "") + " for " + category + "?", [],
+    { label:"Delete prefix", busyLabel:"Deleting…", danger:true, onSubmit: async () => {
+      await api("DELETE", "/settings/part-number-prefixes/" + encodeURIComponent(category));
+      return true;
+    } },
+    "<p>New items in <b>" + esc(category) + "</b> will then be numbered with the category name as their prefix. " +
+    "Existing part numbers do not change.</p>");
+  if (ok) await refreshPrefixes();
+}
+// ── getting started (dashboard) ─────────────────────────────────────────
+// Stays until every step is done or the user hides it (per browser). Admin-only steps
+// are shown to admins only. Mail and prefix status are re-read at most once a minute.
+let GS_ADMIN = null, GS_ADMIN_AT = 0;
+
+function gettingStartedSteps(s){
+  const steps = [
+    { key:"project", text:"Create a project", done: s.projects > 0, go:"projects", btn:"Open projects" },
+    { key:"upload", text:"Upload a file: open a project and choose Upload, or drop files on it",
+      done: s.items > 0, go:"projects", btn:"Open projects" },
+  ];
+  if (s.admin) steps.push(
+    { key:"mail", text:"Set up the mail server (needed to send invites)", done: !!s.mail, go:"settings", btn:"Open Settings" },
+    { key:"invite", text:"Invite a teammate", done: s.users > 1, go:"admin", btn:"Open Administration" },
+    { key:"prefix", text:"Set part-number prefixes (optional)", done: s.prefixes > 0, go:"settings", btn:"Open Settings", optional:true });
+  return steps;
+}
+async function gettingStartedHTML(k){
+  let hidden = false;
+  try { hidden = localStorage.getItem("pdm_getting_started") === "hidden"; } catch(e){}
+  if (hidden || !k) return "";
+  const admin = isRole("admin");
+  if (admin && (!GS_ADMIN || Date.now() - GS_ADMIN_AT > 60000)){
+    const [mail, pn] = await Promise.all([
+      api("GET", "/settings/mail").catch(() => null),
+      api("GET", "/settings/part-number-prefixes").catch(() => null)]);
+    GS_ADMIN = { mail: mail ? !!mail.configured : null, prefixes: pn ? (pn.prefixes || []).length : null };
+    GS_ADMIN_AT = Date.now();
+  }
+  const steps = gettingStartedSteps({ admin, projects: PROJECTS.length, items: k.items || 0,
+    users: USERS.length, mail: admin && GS_ADMIN.mail !== false, prefixes: admin ? (GS_ADMIN.prefixes ?? 1) : 0 });
+  if (steps.every(s => s.done || s.optional)) return "";
+  return "<div class='card' id='getting-started' style='margin-bottom:14px'>" +
+    "<div class='head'><h2 class='sec' style='margin:0'>Get started</h2><div class='grow'></div>" +
+    "<button class='small' id='gs-hide'>Hide this guide</button></div>" +
+    "<ol class='gs-steps'>" + steps.map(s => "<li>" +
+      (s.done ? "<span class='dim'>" + esc(s.text) + " (done)</span>" :
+        esc(s.text) + " <button class='small' data-gs='" + s.go + "'>" + esc(s.btn) + "</button>") +
+      "</li>").join("") + "</ol></div>";
+}
+function wireGettingStarted(v){
+  v.querySelectorAll("[data-gs]").forEach(b => b.onclick = () => go(b.dataset.gs));
+  const hide = $("gs-hide");
+  if (hide) hide.onclick = () => {
+    try { localStorage.setItem("pdm_getting_started", "hidden"); } catch(e){}
+    const card = $("getting-started");
+    if (card) card.remove();
+  };
 }
 
 async function viewAdmin(v){
@@ -4865,18 +5200,23 @@ async function viewAdmin(v){
       "<b>" + esc(myName()) + "</b> with role <b>" + esc(ME && ME.user ? ME.user.role : "?") + "</b>.</p></div>";
     return;
   }
-  const [us, aud, vs] = await Promise.all([
+  const [us, aud, vs, mail] = await Promise.all([
     api("GET", "/users"),
     api("GET", "/audit?limit=100").catch(() => ({ events: [] })),
-    api("GET", "/version").catch(() => ({}))
+    api("GET", "/version").catch(() => ({})),
+    api("GET", "/settings/mail").catch(() => null)
   ]);
   USERS = us.users || [];
   UMAP = {};
   for (const u of USERS) UMAP[u.id] = u;
+  // Invites are emailed: without a mail server the server refuses them, so say so here.
+  const noMail = !!mail && !mail.configured;
   v.innerHTML =
     "<div class='head'><h2>Administration</h2><div class='grow'></div>" +
-    "<button id='adduser' class='primary'>＋ Add user</button>" +
-    "<button id='invbtn'>＋ Invite user</button></div>" +
+    "<button id='adduser' class='primary'><svg class='icon'><use href='#ic-plus'/></svg> Add user</button>" +
+    "<button id='invbtn'" + (noMail ? " disabled aria-describedby='inv-why'" : "") + "><svg class='icon'><use href='#ic-plus'/></svg> Invite user</button></div>" +
+    (noMail ? "<p class='dim' id='inv-why'>Invite user needs a mail server. " +
+      "<a href='#/settings' id='inv-setup'>Set up the mail server in Settings</a>, or use Add user and share the password yourself.</p>" : "") +
     "<h2 class='sec'>Appearance</h2>" +
     "<div class='card'><p class='dim'>Colour theme for the web workspace. Stored in this browser.</p>" +
     themePickerHTML() + "</div>" +
@@ -4892,6 +5232,7 @@ async function viewAdmin(v){
     "<div style='margin-top:10px'><button class='small' id='syslink'>System status →</button></div></div>";
   $("adduser").onclick = addUser;
   $("invbtn").onclick = inviteUser;
+  if ($("inv-setup")) $("inv-setup").onclick = e => { e.preventDefault(); go("settings"); };
   $("syslink").onclick = () => go("system");
   wireThemePicker(v);
   v.querySelectorAll("[data-tok]").forEach(b => b.addEventListener("click", () => giveToken(UMAP[b.dataset.tok])));
@@ -6608,14 +6949,8 @@ function startPolling(){
   updateRefreshMode();
   $("signout").onclick = signout;
   $("userkebab").onclick = showUserMenu;
-  $("signin").onclick = signin;
-  $("connect").onclick = connectFromToken;
-  $("tokcopy").onclick = async () => {
-    try { await navigator.clipboard.writeText(TOKEN); toast("Token copied", "ok"); }
-    catch(e){ toast("Copy failed", "err"); }
-  };
-  $("login_password").addEventListener("keydown", e => { if (e.key === "Enter") signin(); });
-  $("token").addEventListener("keydown", e => { if (e.key === "Enter") connectFromToken(); });
+  $("signin-form").onsubmit = e => { e.preventDefault(); signin(); };
+  $("token-form").onsubmit = e => { e.preventDefault(); connectFromToken(); };
   $("globsearch").addEventListener("keydown", e => {
     if (e.key === "Enter"){
       const q = e.target.value.trim();

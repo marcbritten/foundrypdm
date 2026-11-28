@@ -132,10 +132,17 @@ input:focus, select:focus, textarea:focus { outline:none; border-color:var(--acc
 .auth-card .f { margin-bottom:10px; }
 .auth-card input, .auth-card button { width:100%; }
 .auth-build { font-size:11px; margin-top:12px; }
-.tokshow { margin-top:10px; }
+.auth-card label { display:block; margin-bottom:var(--sp-1, 4px); color:var(--dim); }
+.auth-note { margin-top:var(--sp-1, 4px); }
 .divider { display:flex; align-items:center; gap:10px; color:var(--dim); font-size:11px;
   margin:16px 0; text-transform:uppercase; letter-spacing:.08em; }
 .divider:before, .divider:after { content:""; flex:1; height:1px; background:var(--line); }
+/* Settings: the default under a field, and a section's "Unsaved changes" / "Saved" state */
+.set-hint { margin-top:var(--sp-1, 4px); }
+.set-hint.set-err { color:var(--err); }
+.sec-state.unsaved { color:var(--fg); font-weight:600; }
+.gs-steps { margin:var(--sp-2, 8px) 0 0; padding-left:var(--sp-5, 24px); }
+.gs-steps li { margin-bottom:var(--sp-2, 8px); }
 
 /* ── Workspace shell ── */
 #ws { display:flex; min-height:100vh; }
