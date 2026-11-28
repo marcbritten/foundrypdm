@@ -252,16 +252,25 @@ button.tab:focus-visible { outline-offset:-2px; }
 .rev { display:inline-block; padding:1px 6px; margin-left:6px; border:1px solid var(--acc);
   color:var(--acc); border-radius:4px; font:11px ui-monospace,monospace; vertical-align:middle; }
 .rev.wip { border-color:var(--line); color:var(--dim); }
-.state { display:inline-block; padding:1px 7px; border-radius:999px; font-size:11px;
-  border:1px solid var(--line); color:var(--dim); vertical-align:middle; }
-.state.released { color:var(--ok); border-color:var(--ok); }
-.state.wip { color:var(--dim); }
-.state.draft { color:var(--warn); border-color:var(--warn); }
+.state { display:inline-flex; align-items:center; gap:3px; padding:1px 7px; border-radius:999px; font-size:11px;
+  border:1px solid var(--line); color:var(--dim); vertical-align:middle; white-space:nowrap; }
+.state .icon { width:1em; height:1em; vertical-align:0; }
+.state.wip { color:var(--life-wip, var(--dim)); }
+.state.in-review { color:var(--life-in-review, var(--acc)); border-color:var(--life-in-review, var(--acc)); }
+.state.released { color:var(--life-released, var(--ok)); border-color:var(--life-released, var(--ok)); }
+.state.obsolete { color:var(--life-obsolete, var(--dim)); border:1px dashed var(--life-obsolete, var(--dim)); }
+.state.draft { color:var(--life-draft, var(--warn)); border-color:var(--life-draft, var(--warn)); }
+.state.failed, .state.rejected { color:var(--err); border-color:var(--err); }
+.state.outdated { color:var(--warn); border-color:var(--warn); }
 .jobstat { font-size:12px; }
 .jobstat.pending { color:var(--warn); }
 .jobstat.done { color:var(--ok); }
 .jobstat.failed { color:var(--err); }
 .jobstat.active { color:var(--acc); }
+.errtext, .dim.errtext { color:var(--err); }
+.rawev pre { margin:4px 0 0; white-space:pre-wrap; word-break:break-word; }
+.rawev summary { cursor:pointer; }
+.rawev summary:focus-visible { outline:2px solid var(--acc); outline-offset:1px; }
 
 /* ── Thumbnails / items table ── */
 .thumb { width:40px; height:40px; border-radius:4px; border:1px solid var(--line);
@@ -601,11 +610,11 @@ table.dense th, html.dense table th { font-size:10.5px; }
 .stepper .s { display:inline-flex; align-items:center; gap:6px; padding:3px 9px;
   border-radius:999px; border:1px solid var(--line); font-size:11.5px; }
 .stepper .s.done { color:var(--ok); border-color:var(--ok); background:color-mix(in srgb, var(--ok) 12%, var(--panel)); }
-.stepper .s.active { color:var(--acc); border-color:var(--acc);
-  background:color-mix(in srgb, var(--acc) 14%, var(--panel)); animation:pulse 2s infinite; }
-.stepper .s.queued, .stepper .s.scheduled { color:var(--warn); border-color:var(--warn); }
+.stepper .s.active { color:var(--acc); border-color:var(--acc); font-weight:600;
+  background:color-mix(in srgb, var(--acc) 14%, var(--panel)); }
+.stepper .s.queued, .stepper .s.scheduled { color:var(--dim); }
 .stepper .s.failed { color:var(--err); border-color:var(--err); }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.55} }
+.stepper .s .icon { width:1em; height:1em; vertical-align:0; }
 
 /* ── Tool library editor ── */
 .tfield { margin-bottom:12px; }

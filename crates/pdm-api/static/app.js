@@ -253,9 +253,27 @@ function kindInfo(mime, filename){
 function kindBadge(mime, filename){ const k = kindInfo(mime, filename);
   return "<span class='badge " + k.cls + "' title='" + esc((mime || "") + (filename ? " · " + filename : "")) + "'>" +
     k.icon + esc(k.label) + "</span>"; }
-function stateBadge(s){ const v = String(s || "wip");
-  const cls = (v === "released" || v === "release") ? "released" : (v === "draft" ? "draft" : "wip");
-  return "<span class='state " + cls + "'>" + esc(v.toUpperCase()) + "</span>"; }
+// Lifecycle states as a word, a class and, for the two that decide whether a part
+// may be used, an icon: a state never depends on its color alone.
+const LIFECYCLE = {
+  wip:       { label:"WIP",       cls:"wip" },
+  in_review: { label:"In review", cls:"in-review" },
+  released:  { label:"Released",  cls:"released", icon:"ic-check" },
+  release:   { label:"Released",  cls:"released", icon:"ic-check" },
+  obsolete:  { label:"Obsolete",  cls:"obsolete", icon:"ic-ban" },
+  draft:     { label:"Draft",     cls:"draft" },
+};
+function ownEntry(map, key){ return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null; }
+function humanize(code){ const s = String(code ?? "").replace(/[._]+/g, " ").replace(/\s+/g, " ").trim();
+  return s ? s[0].toUpperCase() + s.slice(1) : ""; }
+function lifecycleLabel(s){ const k = String(s || "wip"); const st = ownEntry(LIFECYCLE, k);
+  return st ? st.label : humanize(k); }
+function statusBadge(label, cls, icon){
+  return "<span class='state " + cls + "'>" +
+    (icon ? "<svg class='icon' aria-hidden='true'><use href='#" + icon + "'/></svg>" : "") +
+    esc(label) + "</span>"; }
+function stateBadge(s){ const k = String(s || "wip"); const st = ownEntry(LIFECYCLE, k);
+  return st ? statusBadge(st.label, st.cls, st.icon) : statusBadge(humanize(k), "other"); }
 function archBadge(a){ return a ? "<span class='arch'>archived</span>" : ""; }
 function revBadge(l){ return l ? "<span class='rev'>" + esc(l) + "</span>" : ""; }
 function userAv(u, off){ const nm = (u && (u.display_name || u.email)) || "?";
@@ -839,6 +857,104 @@ function feedIcon(action){
   };
   return m[action] || "ic-activity";
 }
+// Plain-language phrases for audit event codes, one table for the feed, the item
+// Activity tab and the audit log. "{t}" is where the event's object goes; a phrase
+// without it names no object. Codes missing here are shown humanised (eventSentence).
+const EVENT_LABELS = {
+  "item.created":"created {t}", "item.updated":"updated {t}",
+  "item.checkin":"checked in {t}", "item.checkout":"checked out {t}",
+  "item.undo_checkout":"undid the checkout of {t}",
+  "item.release":"released {t}", "item.released":"released {t}",
+  "item.release_requested":"requested release of {t}",
+  "item.lifecycle_transitioned":"changed the state of {t}",
+  "item.comment":"commented on {t}",
+  "item.archived":"archived {t}", "item.unarchived":"unarchived {t}", "item.deleted":"deleted {t}",
+  "item.sheet_metal":"changed the sheet-metal settings of {t}",
+  "item.flat_pattern":"attached a flat pattern to {t}",
+  "item.flat_pattern_generate":"requested a flat pattern for {t}",
+  "approval.requested":"requested approval for {t}",
+  "approval.decided":"decided on the release of {t}",
+  "approval.approve":"approved the release of {t}",
+  "approval.reject":"rejected the release of {t}",
+  "folder.created":"created folder {t}",
+  "project.created":"created project {t}", "project.updated":"updated project {t}",
+  "project.archived":"archived project {t}", "project.unarchived":"unarchived project {t}",
+  "project.deleted":"deleted project {t}",
+  "project.main_assembly_set":"set the main assembly of {t}",
+  "project.main_assembly_cleared":"cleared the main assembly of {t}",
+  "project.onshape_import":"imported {t} from Onshape",
+  "onshape.send":"sent {t} from Onshape",
+  "user.created":"added user {t}", "user.invited":"invited {t}", "user.updated":"updated user {t}",
+  "user.login":"signed in", "user.password_changed":"changed their password",
+  "user.password_set":"set a new password for {t}",
+  "user.token_created":"created an access token for {t}",
+  "version.convert_solidcraft":"queued a design conversion of {t}",
+  "version.regenerate_preview":"queued a new preview of {t}",
+  "laser_nest.create":"queued a laser nest", "laser_nest.rerun":"re-ran a laser nest",
+  "laser_nest.cancel":"cancelled a laser nest",
+  "org.branding_updated":"changed the branding colors", "org.branding_reset":"reset the branding",
+  "org.branding_logo_set":"uploaded a new logo", "org.branding_logo_cleared":"removed the logo",
+};
+// The event as HTML: its phrase with the object linked, or the humanised code.
+function eventSentence(ev, targetHtml){
+  const code = String((ev && ev.action) || "");
+  const target = targetHtml != null ? targetHtml : feedTarget(ev);
+  const tpl = ownEntry(EVENT_LABELS, code);
+  if (tpl == null) return esc(humanize(code) || "Event") + (target ? " · " + target : "");
+  const i = tpl.indexOf("{t}");
+  return i < 0 ? esc(tpl) : esc(tpl.slice(0, i)) + (target || "it") + esc(tpl.slice(i + 3));
+}
+function capFirst(s){ return s ? s[0].toUpperCase() + s.slice(1) : s; }
+// Event detail as readable "Key: value" pairs. Ids and hashes are left out (the
+// admin audit log keeps the raw event); user ids become names.
+const DETAIL_LABELS = {
+  revision:"Revision", version_seq:"Version", commit_message:"Note", note:"Note", body:"Comment",
+  filename:"File", part_number:"Part number", name:"Name", project:"Project",
+  description:"Description", display_name:"Name", email:"Email", role:"Role", active:"Active",
+  token_name:"Token", workstation:"Workstation", assignees:"Assignees", owner_id:"Owner", url:"Link",
+  size_bytes:"Size",
+};
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function clipText(s, n){ s = String(s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+function formatDetail(ev){
+  const d = ev && ev.detail;
+  if (!d || typeof d !== "object" || Array.isArray(d)) return [];
+  const out = [];
+  if (d.from != null && d.to != null) out.push(["State", lifecycleLabel(d.from) + " to " + lifecycleLabel(d.to)]);
+  // The key feedTarget names the object by, and a project's own name, are already in the sentence.
+  const named = d.part_number ? "part_number" : d.name ? "name" : d.filename ? "filename" : "";
+  const userName = id => { const u = UMAP[id]; return u ? (u.display_name || u.email) : ""; };
+  for (const k of Object.keys(d)){
+    const v = d[k];
+    if (v == null || v === "" || (Array.isArray(v) && !v.length)) continue;
+    if ((k === "from" || k === "to") && d.from != null && d.to != null) continue;
+    if (k === named || (k === "project" && ev.object_type === "project")) continue;
+    // The decision is already in the sentence (approval.approve / approval.reject).
+    if (k === "sha256" || k === "version" || k === "decision" || k === "id") continue;
+    let val;
+    if (k === "project_id"){ if (!PMAP[v]) continue; out.push(["Project", clipText(PMAP[v].name, 120)]); continue; }
+    if (k === "from" || k === "to") val = lifecycleLabel(v);
+    else if (k === "owner_id"){ val = userName(v); if (!val) continue; }
+    else if (k === "assignees"){
+      const ids = Array.isArray(v) ? v : [v];
+      const names = ids.map(userName).filter(Boolean);
+      val = names.length === ids.length ? names.join(", ") : ids.length + (ids.length === 1 ? " person" : " people");
+    }
+    else if (k.endsWith("_id") || (typeof v === "string" && UUID_RE.test(v))) continue;
+    else if (k === "size_bytes" && typeof v === "number") val = bytes(v);
+    else if (k === "revision" && typeof v !== "string") continue;
+    else if (typeof v === "boolean") val = v ? "yes" : "no";
+    else if (Array.isArray(v)){
+      if (v.some(x => (x && typeof x === "object") || (typeof x === "string" && UUID_RE.test(x)))) continue;
+      val = v.join(", ");
+    }
+    else if (typeof v === "object") continue;
+    else val = String(v);
+    out.push([ownEntry(DETAIL_LABELS, k) || humanize(k), clipText(val, 120)]);
+  }
+  return out;
+}
+function detailText(pairs){ return pairs.map(p => esc(p[0]) + ": " + esc(p[1])).join(" · "); }
 function feedDayLabel(iso){
   const d = new Date(iso);
   if (isNaN(d.getTime())) return "Earlier";
@@ -851,19 +967,22 @@ function feedDayLabel(iso){
 }
 function feedTarget(ev){
   if (!ev || !ev.object_type) return "";
-  const d = ev.detail || {};
+  const d = (ev.detail && typeof ev.detail === "object" && !Array.isArray(ev.detail)) ? ev.detail : {};
   const label = d.part_number || d.name || d.filename || "";
-  if (ev.object_type === "item" && ev.object_id)
-    return label ? "<a href='#/items/" + ev.object_id + "'>" + esc(label) + "</a>" :
-      "<a href='#/items/" + ev.object_id + "'>an item</a>";
-  if ((ev.object_type === "approval" || ev.object_type === "approval_request") && d.item_id)
-    return "<a href='#/items/" + d.item_id + "'>an approval</a>";
-  if (ev.object_type === "approval" || ev.object_type === "approval_request") return "an approval";
+  const itemLink = (id, l) => "<a href='#/items/" + esc(id) + "'>" + (l ? esc(l) : "an item") + "</a>";
+  if (ev.object_type === "item" && ev.object_id) return itemLink(ev.object_id, label);
+  if (ev.object_type === "approval" || ev.object_type === "approval_request")
+    return d.item_id ? itemLink(d.item_id, d.part_number) : "an approval";
   if (ev.object_type === "project" && ev.object_id && PMAP[ev.object_id])
-    return "<a href='#/projects/" + ev.object_id + "'>" + esc(PMAP[ev.object_id].name) + "</a>";
-  if (ev.object_type === "project") return "a project";
+    return "<a href='#/projects/" + esc(ev.object_id) + "'>" + esc(PMAP[ev.object_id].name) + "</a>";
+  if (ev.object_type === "user"){
+    const u = ev.object_id ? UMAP[ev.object_id] : null;
+    const n = (u && (u.display_name || u.email)) || d.display_name || d.email || "";
+    return n ? esc(n) : "a user";
+  }
   if (label) return esc(label);
-  return ev.object_type;
+  const noun = humanize(ev.object_type).toLowerCase();
+  return (/^[aeiou]/.test(noun) ? "an " : "a ") + esc(noun);
 }
 function feed(events, max){
   const list = max ? (events || []).slice(0, max) : (events || []);
@@ -874,11 +993,12 @@ function feed(events, max){
   for (const ev of list){
     const lbl = feedDayLabel(ev.at);
     if (lbl !== last){ h += "<div class='day'>" + esc(lbl) + "</div>"; last = lbl; }
+    const pairs = formatDetail(ev);
     h += "<div class='event'>" +
       "<span class='ic'>" + kindSvg(feedIcon(ev.action)) + "</span>" +
       "<div class='body'><div class='who'>" + esc(actorName(ev)) + "</div>" +
-      "<div class='what'><span class='mono' style='font-size:12px'>" + esc(ev.action) + "</span> " +
-      feedTarget(ev) + "</div>" +
+      "<div class='what'>" + eventSentence(ev) +
+      (pairs.length ? " · " + detailText(pairs.slice(0, 3)) : "") + "</div>" +
       "<div class='when'>" + fmtTime(ev.at) + "</div></div></div>";
   }
   return h + "</div>";
@@ -3677,7 +3797,8 @@ function mfgStepper(status){
   const idx = MFG_STEPS.indexOf(status);
   if (idx < 0) return "<span class='dim'>" + esc(status || "—") + "</span>";
   return "<div class='stepper' style='flex-wrap:wrap'>" + MFG_STEPS.map((s, i) =>
-    "<span class='s " + (i < idx ? "done" : i === idx ? "active" : "queued") + "'>" +
+    (i < idx ? "<span class='s done'><svg class='icon' aria-hidden='true'><use href='#ic-check'/></svg>" :
+     i === idx ? "<span class='s active' aria-current='step'>" : "<span class='s queued'>") +
     MFG_STEP_LABEL[s] + "</span>").join("<span class='dim'>›</span>") + "</div>";
 }
 async function viewMfg(v){
@@ -3729,7 +3850,7 @@ async function viewMfg(v){
         "<td class='muted'>" + esc(machMap[p.machine_id] || "—") + "</td>" +
         "<td>" + (p.released ? "<span class='state released'>released</span>" :
           "<span class='dim'>draft</span>") +
-          (p.outdated ? " <span class='state wip' title='the source design changed after this program was created'>outdated</span>" : "") +
+          (p.outdated ? " <span class='state outdated' title='the source design changed after this program was created'>outdated</span>" : "") +
         "</td>" +
         "<td class='mono muted'>" + (p.gcode_sha256 ? shaShort(p.gcode_sha256) : "—") + "</td>" +
         "<td class='muted'>" + fmtTime(p.created_at) + "</td>" +
@@ -3777,7 +3898,7 @@ async function viewMfg(v){
         inSp.map(i => "<tr>" +
           "<td>" + (i.passed == null ? "<span class='dim'>pending</span>" :
             i.passed ? "<span class='state released'>passed</span>" :
-            "<span class='state wip'>failed</span>") + "</td>" +
+            "<span class='state failed'>failed</span>") + "</td>" +
           "<td class='mono muted'>" + String(i.production_job_id || "").slice(0, 8) + "</td>" +
           "<td class='dim muted'>" + esc(i.notes || "") + "</td>" +
           "<td class='muted'>" + fmtTime(i.created_at) + "</td>" +
@@ -3935,6 +4056,14 @@ async function viewSheetMetal(v){
   };
 }
 // ── approval center (P0-2): inbox, decisions, routing ───────────────────
+// A decided request stores the decision itself ("approve" / "reject") as its status.
+const APPROVAL_STATES = {
+  pending:  { label:"Pending",  cls:"draft" },
+  approve:  { label:"Approved", cls:"released", icon:"ic-check" },
+  approved: { label:"Approved", cls:"released", icon:"ic-check" },
+  reject:   { label:"Rejected", cls:"rejected" },
+  rejected: { label:"Rejected", cls:"rejected" },
+};
 function apprFullTable(list){
   const canDecide = a => a.status === "pending" && isRole("editor");
   return "<table><thead><tr><th>Item</th><th>Requester</th><th>Assignees</th>" +
@@ -3945,8 +4074,8 @@ function apprFullTable(list){
       const assignees = (a.assignees || [])
         .map(uid => UMAP[uid] ? (UMAP[uid].display_name || UMAP[uid].email) : "user")
         .join(", ") || "—";
-      const statusCls = a.status === "approved" ? "released" :
-        (a.status === "rejected" ? "wip" : "draft");
+      const st = ownEntry(APPROVAL_STATES, String(a.status || "")) ||
+        { label: humanize(a.status) || "Unknown", cls: "other" };
       const mine = myId() && (a.assignees || []).includes(myId());
       return "<tr class='clickable' data-aid='" + a.id + "'>" +
         "<td>" + (a.item_part_number ?
@@ -3955,7 +4084,7 @@ function apprFullTable(list){
         "<td class='muted'>" + esc(requester) + "</td>" +
         "<td class='muted'>" + esc(assignees) +
           (mine && a.status === "pending" ? " <span class='dim' style='font-size:11px'>(you)</span>" : "") + "</td>" +
-        "<td><span class='state " + statusCls + "'>" + esc(a.status).toUpperCase() + "</span></td>" +
+        "<td>" + statusBadge(st.label, st.cls, st.icon) + "</td>" +
         "<td class='muted'>" + fmtTime(a.created_at) + "</td>" +
         "<td style='white-space:nowrap'>" +
           (canDecide(a) ?
@@ -4138,14 +4267,17 @@ function usersTable(list){
 }
 function auditTable(list){
   if (!list.length) return "<div class='empty'>No audit events.</div>";
-  return "<table><thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Object</th><th>Detail</th></tr></thead><tbody>" +
+  return "<table><thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Detail</th></tr></thead><tbody>" +
     list.map(ev => {
-      const detail = ev.detail ? esc(JSON.stringify(ev.detail)).slice(0, 90) : "";
+      // Admins keep the stored event, code and ids included, behind a toggle.
+      const raw = JSON.stringify({ action: ev.action, object_type: ev.object_type,
+        object_id: ev.object_id, detail: ev.detail }, null, 2);
       return "<tr><td class='muted'>" + fmtDate(ev.at) + "</td>" +
         "<td class='muted'>" + esc(actorName(ev)) + "</td>" +
-        "<td class='mono'>" + esc(ev.action) + "</td>" +
-        "<td class='dim'>" + esc(ev.object_type || "") + "</td>" +
-        "<td class='dim' style='max-width:340px;overflow:hidden;text-overflow:ellipsis'>" + detail + "</td></tr>";
+        "<td>" + capFirst(eventSentence(ev)) + "</td>" +
+        "<td class='dim' style='max-width:340px'>" + detailText(formatDetail(ev)) +
+        "<details class='rawev'><summary>Raw event</summary><pre class='mono'>" + esc(raw) +
+        "</pre></details></td></tr>";
     }).join("") + "</tbody></table>";
 }
 function genPassword(){
@@ -4359,7 +4491,7 @@ function viewSystem(v){
           row("Binary path", cli.path) +
           row("GitHub latest", cad.latest || "—") +
           "</table>" +
-          (cli.error ? "<p class='dim' style='color:#d98'>" + esc(cli.error) + "</p>" : "") +
+          (cli.error ? "<p class='dim errtext'>" + esc(cli.error) + "</p>" : "") +
           "<p class='dim'><a href='https://github.com/tangency-labs/solidcraft/releases/latest' target='_blank' rel='noreferrer'>tangency-labs/solidcraft</a></p>" +
           "<div class='row'><button id='cli-upd' class='primary'>" +
             (cad.update_available ? "Update CLI" : "Check / reinstall CLI") + "</button></div>" +
@@ -4372,7 +4504,7 @@ function viewSystem(v){
           "</td></tr>" +
           row("Binary path", dm.path) +
           "</table>" +
-          (dm.error ? "<p class='dim' style='color:#d98'>" + esc(dm.error) + "</p>" : "") +
+          (dm.error ? "<p class='dim errtext'>" + esc(dm.error) + "</p>" : "") +
           "<p class='dim'>Decodes native CAD (Fusion, Inventor, SolidWorks, FreeCAD, CATIA, Rhino, " +
             "ACIS, STEP, Onshape bundles) into SolidCraft designs with editable feature history. " +
             (dm.auto_update
@@ -4414,7 +4546,7 @@ function viewSystem(v){
           "</td></tr>" +
           row("GitHub latest", scweb.latest) +
           "</table>" +
-          (scweb.error ? "<p class='dim' style='color:#d98'>" + esc(scweb.error) + "</p>" : "") +
+          (scweb.error ? "<p class='dim errtext'>" + esc(scweb.error) + "</p>" : "") +
           "<p class='dim'>Serves “Edit in SolidCraft web” from the portal origin. " +
             (scweb.auto_update
               ? "Tracks the newest release automatically (every 6 h; PDM_WEB_UPDATE=0 opts out)."
@@ -4429,7 +4561,7 @@ function viewSystem(v){
           row("Adapter", chosen.name || chosen.adapter || chosen.info || null) +
           row("Backends", Array.isArray(survey.backends) ? survey.backends.join(", ") : survey.backends) +
           "</table>" +
-          (gpu.error ? "<p class='dim' style='color:#d98'>" + esc(gpu.error) + "</p>" : "") + "</div>" +
+          (gpu.error ? "<p class='dim errtext'>" + esc(gpu.error) + "</p>" : "") + "</div>" +
         "<div class='card'><h2 class='sec'>Infrastructure</h2><table>" +
           row("PostgreSQL", pg.version ? pg.version + (pg.ok === false ? " (offline)" : "") : "—") +
           row("Object storage", st.kind || "—") +
@@ -6201,19 +6333,22 @@ function updateCompare(box, vs){
   if (ids.length !== 2){ cbox.innerHTML = ""; return; }
   const a = vs.find(x => x.id === ids[0]), b = vs.find(x => x.id === ids[1]);
   if (!a || !b){ cbox.innerHTML = ""; return; }
+  // A changed row is marked by a word and bold values, not only by its background.
+  const cmpRow = (name, ha, hb, diff) =>
+    "<tr" + (diff ? " style='background:var(--active)'" : "") + "><td class='dim'>" + name + "</td>" +
+    "<td>" + (diff ? "<b>" + ha + "</b>" : ha) + "</td><td>" + (diff ? "<b>" + hb + "</b>" : hb) + "</td>" +
+    "<td>" + (diff ? "<b>Changed</b>" : "") + "</td></tr>";
   const row = (name, va, vb) => {
-    const diff = String(va != null ? va : "") !== String(vb != null ? vb : "");
-    return "<tr" + (diff ? " style='background:var(--active)'" : "") + "><td class='dim'>" + name +
-      "</td><td>" + esc(String(va != null ? va : "")) + "</td><td>" +
-      esc(String(vb != null ? vb : "")) + "</td></tr>";
+    const sa = String(va != null ? va : ""), sb = String(vb != null ? vb : "");
+    return cmpRow(name, esc(sa), esc(sb), sa !== sb);
   };
   const ka = kindInfo(a.mime_type, ""), kb = kindInfo(b.mime_type, "");
-  const typeRow = "<tr" + (ka.label !== kb.label ? " style='background:var(--active)'" : "") + "><td class='dim'>type</td>" +
-    "<td>" + ka.icon + " " + esc(ka.label) + "</td><td>" + kb.icon + " " + esc(kb.label) + "</td></tr>";
+  const typeRow = cmpRow("type", ka.icon + " " + esc(ka.label), kb.icon + " " + esc(kb.label), ka.label !== kb.label);
   cbox.innerHTML =
     "<div class='card' style='margin-bottom:10px'>" +
     "<b style='font-size:13px'>Comparing v" + a.seq + " ↔ v" + b.seq + "</b>" +
-    "<table style='margin-top:8px'><thead><tr><th></th><th>v" + a.seq + "</th><th>v" + b.seq + "</th></tr></thead><tbody>" +
+    "<table style='margin-top:8px'><thead><tr><th></th><th>v" + a.seq + "</th><th>v" + b.seq + "</th>" +
+    "<th></th></tr></thead><tbody>" +
     typeRow +
     row("size", bytes(a.size_bytes), bytes(b.size_bytes)) +
     row("sha-256", a.sha256 || "", b.sha256 || "") +
@@ -6361,8 +6496,9 @@ async function tabActivity(box){
     evs.map(ev => "<tr>" +
       "<td class='muted' title='" + fmtDate(ev.at) + "'>" + fmtTime(ev.at) + "</td>" +
       "<td class='muted'>" + esc(actorName(ev)) + "</td>" +
-      "<td class='mono'>" + esc(ev.action) + "</td>" +
-      "<td class='dim'>" + (ev.detail ? esc(JSON.stringify(ev.detail)) : "") + "</td></tr>").join("") +
+      "<td>" + capFirst(eventSentence(ev,
+        ev.object_type === "item" || /^approval/.test(ev.object_type || "") ? "this item" : undefined)) + "</td>" +
+      "<td class='dim'>" + detailText(formatDetail(ev)) + "</td></tr>").join("") +
     "</tbody></table>" :
     "<div class='empty'>No activity recorded for this item yet.</div>";
 }
