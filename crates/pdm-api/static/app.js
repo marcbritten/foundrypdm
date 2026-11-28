@@ -1135,6 +1135,7 @@ async function enterWorkspace(){
     if (parts.length) $("buildinfo").textContent = parts.join(" · ");
   } catch(e){}
   loadOrgBranding();
+  loadNavMenu();
   syncNav();
   const r = routeFromHash();
   if (r){ ROUTE = r; syncNav(); render(true); }
@@ -1149,7 +1150,7 @@ async function enterWorkspace(){
 // tree nodes) is dropped on navigation and refetched.
 const LEGACY_NAME = { files:"items", parts:"items", tasks:"approvals" };
 const NAV_NAMES = ["dashboard","projects","explorer","items","search","mfg","machines","tools",
-  "post-processors","sheet-metal","laser-nests","jobs","approvals","activity","bom","system","settings","admin"];
+  "post-processors","sheet-metal","laser-nests","jobs","approvals","activity","bom","system","settings","admin","menu"];
 function go(name, extra){
   name = LEGACY_NAME[name] || name;
   ROUTE = { name, origin: name };
@@ -1264,7 +1265,7 @@ function navTarget(){
     "post-processors":"post-processors",
     "sheet-metal":"sheet-metal", "laser-nests":"laser-nests", jobs:"jobs",
     approvals:"approvals", tasks:"approvals",
-    activity:"activity", system:"system", settings:"settings", admin:"admin",
+    activity:"activity", system:"system", settings:"settings", admin:"admin", menu:"menu",
     detail: ROUTE.origin === "explorer" ? "projects" : "items" };
   return map[ROUTE.name] || "dashboard";
 }
@@ -1280,7 +1281,7 @@ function syncNav(){
     tools:"Tool library", "post-processors":"Post-processors", "sheet-metal":"Sheet Metal Standards",
     "laser-nests":"Laser Nests", jobs:"Jobs",
     approvals:"Approvals", activity:"Activity", bom:"Bills of Material",
-    system:"System", settings:"Settings", admin:"Administration", detail:"Item" };
+    system:"System", settings:"Settings", admin:"Administration", menu:"Arrange my menu", detail:"Item" };
   let c = names[ROUTE.name] || "";
   if (ROUTE.name === "explorer" && PMAP[ROUTE.pid]) c = PMAP[ROUTE.pid].name;
   if (ROUTE.name === "detail" && DETAIL.id && DETAIL.data) c = itemName(DETAIL.data.item);
@@ -1311,7 +1312,16 @@ function wireNavGroups(root, store){
   root.querySelectorAll(".sb-section[data-group]").forEach(sec => {
     setNavGroupFolded(sec, folded.includes(sec.dataset.group), null);
     const head = sec.querySelector(".sb-head");
-    if (head) head.onclick = () => setNavGroupFolded(sec, !sec.classList.contains("folded"), store);
+    if (head) head.onclick = () => {
+      const opening = sec.classList.contains("folded");
+      setNavGroupFolded(sec, !opening, store);
+      // "Close my other groups when I open a group": the groups that hold this one, and the ones
+      // inside it, stay as they are.
+      if (opening && typeof NAV_MENU !== "undefined" && NAV_MENU.close_others)
+        root.querySelectorAll(".sb-section[data-group]").forEach(o => {
+          if (o !== sec && !o.contains(sec) && !sec.contains(o) && !o.classList.contains("folded")) setNavGroupFolded(o, true, store);
+        });
+    };
   });
 }
 function navIsDrawer(){ return window.matchMedia("(max-width: 900px)").matches; }
@@ -1375,6 +1385,490 @@ function wireSidebar(root, store){
     syncMenuBtn(root);
   });
 }
+// ── each person's own menu (Arrange my menu) ──
+// The server keeps each person's menu (`/me/menu`): the order of the sidebar links, their own
+// groups (three levels at most), names, icons and hidden links. `items: null` is the default menu,
+// which is the sidebar in index.html. A link that a stored menu does not name (a screen added in a
+// later version) joins its default group, or the end of the menu. The menu changes only the
+// sidebar: every screen keeps its own role checks.
+function navBase(root){
+  if (root._navBase) return root._navBase;
+  const base = { groups: [], links: {}, icons: {} };
+  root.querySelectorAll("#sidebar .sb-section[data-group]").forEach(sec => {
+    const g = { key: sec.dataset.group, label: sec.querySelector(".sb-head .sb-tx").textContent.trim(),
+      icon: sec.querySelector(".sb-head .sb-ic").innerHTML, items: [] };
+    sec.querySelectorAll(".sb-link[data-nav]").forEach(a => {
+      base.links[a.dataset.nav] = a;
+      base.icons[a.dataset.nav] = a.querySelector(".sb-ic").innerHTML;
+      g.items.push(a.dataset.nav);
+    });
+    base.groups.push(g);
+  });
+  root._navBase = base;
+  return base;
+}
+function navDefaultItems(base){
+  return base.groups.map(g => ({ group: g.label, key: g.key, items: g.items.map(nav => ({ nav })) }));
+}
+function navFindGroup(list, key){
+  for (const n of list){
+    if (n.group === undefined) continue;
+    if (n.key === key) return n;
+    const f = navFindGroup(n.items || [], key);
+    if (f) return f;
+  }
+  return null;
+}
+// The menu to show: the stored one (or the default) with each link once and every link present.
+function navEffectiveItems(stored, base){
+  if (!Array.isArray(stored)) return navDefaultItems(base);
+  const seen = new Set();
+  const clean = list => (Array.isArray(list) ? list : []).flatMap(n => {
+    if (n && typeof n.nav === "string"){
+      if (!base.links[n.nav] || seen.has(n.nav)) return [];
+      seen.add(n.nav);
+      return [Object.assign({}, n)];
+    }
+    if (n && typeof n.group === "string") return [Object.assign({}, n, { items: clean(n.items) })];
+    return [];
+  });
+  const items = clean(stored);
+  for (const g of base.groups) for (const nav of g.items){
+    if (seen.has(nav)) continue;
+    const home = navFindGroup(items, g.key);
+    if (home) home.items.push({ nav }); else items.push({ nav });
+    seen.add(nav);
+  }
+  return items;
+}
+// An icon from the bundled Font Awesome sprites ("solid/house"), or "" when the name is not one.
+function faIconSvg(icon){
+  const m = /^(solid|regular)\/([a-z0-9-]+)$/.exec(String(icon || ""));
+  return m ? "<svg class='icon fa' aria-hidden='true'><use href='/static/icons/" + m[1] + ".svg#" + m[2] + "'/></svg>" : "";
+}
+function navNodeIcon(node, base){
+  const own = faIconSvg(node.icon);
+  if (own) return own;
+  if (node.group === undefined) return base.icons[node.nav] || "";
+  const g = node.key && base.groups.find(x => x.key === node.key);
+  return g ? g.icon : "<svg class='icon'><use href='#ic-folder'/></svg>";
+}
+function navNodeName(node, base){
+  if (node.group !== undefined) return node.group;
+  const a = base.links[node.nav];
+  return a ? a.querySelector(".sb-tx").textContent.trim() : node.nav;
+}
+// Builds the sidebar's groups from a menu. The links are the page's own elements, moved, so their
+// ids, counts and click handlers stay. A hidden link or group is left out.
+function renderNavMenu(root, items, base){
+  const nav = root.querySelector("#sidebar .sb-nav");
+  let n = 0;
+  const build = (list, path) => {
+    const out = [];
+    for (const node of list){
+      if (node.hidden) continue;
+      if (node.group === undefined){
+        const a = base.links[node.nav];
+        if (!a) continue;
+        a.querySelector(".sb-ic").innerHTML = navNodeIcon(node, base);
+        out.push(a);
+        continue;
+      }
+      const id = "sbg-m" + (++n);
+      const sec = root.createElement("div");
+      sec.className = "sb-section";
+      sec.dataset.group = node.key || "g:" + path.concat(node.group).join("/");
+      const head = root.createElement("button");
+      head.type = "button"; head.className = "sb-head";
+      head.setAttribute("aria-expanded", "true"); head.setAttribute("aria-controls", id);
+      head.innerHTML = "<span class='sb-ic'>" + navNodeIcon(node, base) + "</span><span class='sb-tx'></span>" +
+        "<svg class='icon sb-chev'><use href='#ic-chevron'/></svg>";
+      head.querySelector(".sb-tx").textContent = node.group;
+      const box = root.createElement("div");
+      box.className = "sb-items"; box.id = id;
+      for (const el of build(node.items || [], path.concat(node.group))) box.appendChild(el);
+      sec.appendChild(head); sec.appendChild(box);
+      out.push(sec);
+    }
+    return out;
+  };
+  const els = build(items, []);
+  nav.textContent = "";
+  for (const el of els) nav.appendChild(el);
+}
+function applyNavMenu(){
+  const base = navBase(document);
+  renderNavMenu(document, navEffectiveItems(NAV_MENU.items, base), base);
+  wireNavGroups(document, localStorage);
+  setNavRail($("sidebar").classList.contains("rail"), document, null);
+  syncNav();
+}
+async function loadNavMenu(){
+  if (!ME || !ME.user) return;
+  navBase(document);
+  try { Object.assign(NAV_MENU, await api("GET", "/me/menu"), { loaded: true }); }
+  catch(e){ return; }   // the default menu stays; Arrange my menu shows the error with Retry
+  if (NAV_MENU.items) applyNavMenu();
+}
+
+// Moves on the Arrange my menu page. A path is the list of indexes from the top of the menu.
+function amLevels(node){
+  return node.group === undefined ? 0 : 1 + Math.max(0, ...(node.items || []).map(amLevels));
+}
+function amList(items, path){
+  let list = items;
+  for (const i of path.slice(0, -1)) list = list[i].items;
+  return list;
+}
+function amCan(items, path, op){
+  const list = amList(items, path), i = path[path.length - 1], node = list[i];
+  if (!node) return false;
+  if (op === "up") return i > 0;
+  if (op === "down") return i < list.length - 1;
+  if (op === "out") return path.length > 1;
+  if (op === "into"){
+    const prev = list[i - 1];
+    return Boolean(prev) && prev.group !== undefined && path.length + amLevels(node) <= 3;
+  }
+  return false;
+}
+// Moves an entry and returns its new path, or null when the move is not possible.
+function amMove(items, path, op){
+  if (!amCan(items, path, op)) return null;
+  const list = amList(items, path), i = path[path.length - 1], parent = path.slice(0, -1);
+  if (op === "up" || op === "down"){
+    const j = op === "up" ? i - 1 : i + 1;
+    [list[i], list[j]] = [list[j], list[i]];
+    return parent.concat(j);
+  }
+  const [node] = list.splice(i, 1);
+  if (op === "into"){
+    const g = list[i - 1];
+    g.items = g.items || [];
+    g.items.push(node);
+    return parent.concat(i - 1, g.items.length - 1);
+  }
+  const outer = amList(items, parent), gi = parent[parent.length - 1];
+  outer.splice(gi + 1, 0, node);
+  return parent.slice(0, -1).concat(gi + 1);
+}
+function amPathOf(list, ref, path){
+  for (let i = 0; i < list.length; i++){
+    if (list[i] === ref) return (path || []).concat(i);
+    if (list[i].items){ const p = amPathOf(list[i].items, ref, (path || []).concat(i)); if (p) return p; }
+  }
+  return null;
+}
+// Drag and drop: puts the entry at `from` just before the entry at `to`. Null when not possible.
+function amMoveBefore(items, from, to){
+  if (to.length >= from.length && from.every((v, k) => to[k] === v)) return null;   // into itself
+  const node = amList(items, from)[from[from.length - 1]], target = amList(items, to)[to[to.length - 1]];
+  if (!node || !target || to.length - 1 + amLevels(node) > 3) return null;
+  amList(items, from).splice(from[from.length - 1], 1);
+  const p = amPathOf(items, target);
+  amList(items, p).splice(p[p.length - 1], 0, node);
+  return p;
+}
+// Remove group: its entries move up a level, to where the group was.
+function amRemoveGroup(items, path){
+  const list = amList(items, path), i = path[path.length - 1], node = list[i];
+  if (!node || node.group === undefined) return false;
+  list.splice(i, 1, ...(node.items || []));
+  return true;
+}
+function amGroups(list){
+  return list.flatMap(n => n.group !== undefined ? [n, ...amGroups(n.items || [])] : []);
+}
+// What is wrong with a group name, in words, or "" when it is good.
+function amNameProblem(name, items, except){
+  const t = String(name || "").trim();
+  if (!t) return "Type a name for the group.";
+  if ([...t].length > 60) return "Use 60 characters or fewer.";
+  if (/[<>\u0000-\u001f\u007f]/.test(t)) return "Leave out < and >.";
+  if (amGroups(items).some(g => g !== except && g.group.toLowerCase() === t.toLowerCase()))
+    return "You have a group with this name. Pick another name.";
+  return "";
+}
+// One row per entry. A group's entries sit in a nested list with a guide line along their left.
+function amRowsHtml(items, all, base, path){
+  return items.map((node, i) => {
+    const p = (path || []).concat(i), id = "am-n-" + p.join("-"), isG = node.group !== undefined;
+    const dis = op => amCan(all, p, op) ? "" : " disabled";
+    const btn = (act, label, extra, on) => "<button type='button' class='small" + (on ? " on" : "") + "' data-act='" + act +
+      "' aria-describedby='" + id + "'" + (extra || "") + ">" + label + "</button>";
+    const tags = [isG ? "Group" : "", node.hidden ? "Hidden" : "", node.nav === "admin" ? "Admins only" : ""].filter(Boolean);
+    return "<li class='am-item' data-path='" + p.join(".") + "'>" +
+      "<div class='am-row" + (isG ? " am-group" : "") + "' draggable='true'>" +
+      "<span class='am-grip' aria-hidden='true'><svg class='icon'><use href='#ic-grip'/></svg></span>" +
+      "<span class='am-ic'>" + navNodeIcon(node, base) + "</span>" +
+      "<span class='am-name' id='" + id + "'>" + esc(navNodeName(node, base)) + "</span>" +
+      tags.map(t => "<span class='am-tag'>" + t + "</span>").join("") +
+      "<span class='am-btns'>" + btn("up", "Up", dis("up")) + btn("down", "Down", dis("down")) +
+      btn("into", "Into group above", dis("into")) + (p.length > 1 ? btn("out", "Out of group", dis("out")) : "") +
+      "<span class='seg' role='group' aria-label='Show in the sidebar'>" +
+      btn("show", "Show", " aria-pressed='" + !node.hidden + "'", !node.hidden) +
+      btn("hide", "Hide", " aria-pressed='" + Boolean(node.hidden) + "'", Boolean(node.hidden)) + "</span>" +
+      (isG ? btn("rename", "Rename") + btn("remove", "Remove group") : "") +
+      btn("icon", "Change icon") + "</span></div>" +
+      (isG ? "<ul class='am-sub'>" + (node.items && node.items.length ? amRowsHtml(node.items, all, base, p)
+        : "<li class='am-empty'>This group is empty.</li>") + "</ul>" : "") +
+      "</li>";
+  }).join("");
+}
+async function viewArrangeMenu(v){
+  const base = navBase(document);
+  if (!ME || !ME.user){
+    v.innerHTML = emptyState("ic-user", "Arrange my menu", "An API token session has no menu of its own. Sign in with your email to arrange your menu.");
+    return;
+  }
+  if (!NAV_MENU.loaded){
+    v.innerHTML = "<p class='dim'>Loading your menu…</p>";
+    try { Object.assign(NAV_MENU, await api("GET", "/me/menu"), { loaded: true }); }
+    catch(e){
+      v.innerHTML = "<h2>Arrange my menu</h2><div class='card' role='alert'><p>Your menu did not load: " + esc(e.message) +
+        ". The sidebar shows the default menu.</p><button type='button' id='am-retry'>Retry</button></div>";
+      $("am-retry").onclick = () => viewArrangeMenu(v);
+      return;
+    }
+  }
+  const items = JSON.parse(JSON.stringify(navEffectiveItems(NAV_MENU.items, base)));
+  v.innerHTML = "<h2>Arrange my menu</h2>" +
+    "<p>Put your screens in the order you want. Make your own groups. Groups can go three levels deep.</p>" +
+    "<p class='dim am-note'>This is your own menu.</p>" +
+    "<p class='dim am-note'>Drag a row by its handle, or use the buttons next to it.</p>" +
+    "<div class='am-opt'><label><input type='checkbox' id='am-close' aria-describedby='am-close-help'" + (NAV_MENU.close_others ? " checked" : "") +
+    "> <b>Close my other groups when I open a group</b></label> <span id='am-close-st' class='dim' role='status'></span>" +
+    "<p class='dim am-note' id='am-close-help'>The groups that hold the open group stay open. The portal saves this choice at once.</p></div>" +
+    "<ul class='am-list' id='am-list'></ul>" +
+    "<div class='am-add'><label for='am-new'>Name of the new group</label>" +
+    "<div class='am-add-row'><input id='am-new' maxlength='60' autocomplete='off' aria-describedby='am-new-err'>" +
+    "<button type='button' class='small' id='am-add'>Add the group</button></div><span id='am-new-err' class='am-err' role='alert'></span></div>" +
+    "<div class='am-foot'><button type='button' class='primary' id='am-save'>Save my menu</button>" +
+    "<button type='button' id='am-reset'>Reset my menu</button>" +
+    "<button type='button' id='am-cancel'>Cancel</button></div>" +
+    "<p id='am-live' role='status'></p><p id='am-err' class='am-err' role='alert'></p>";
+  const list = $("am-list"), live = $("am-live"), errBox = $("am-err");
+  const say = t => { errBox.textContent = ""; live.textContent = t; };
+  const fail = t => { live.textContent = ""; errBox.textContent = t; };
+  const rowOf = path => list.querySelector("li[data-path='" + path.join(".") + "']");
+  const draw = (focusPath, act) => {
+    if (list._closePicker) list._closePicker();
+    list.innerHTML = amRowsHtml(items, items, base);
+    const li = focusPath && rowOf(focusPath);
+    if (!li) return;
+    const row = li.querySelector(":scope > .am-row");
+    const b = row.querySelector("button[data-act='" + act + "']:not([disabled])") || row.querySelector("button:not([disabled])");
+    if (b) b.focus();
+  };
+  draw();
+  list.onclick = async e => {
+    const b = e.target.closest("button[data-act]");
+    if (!b || b.disabled) return;
+    const li = b.closest("li[data-path]"), path = li.dataset.path.split(".").map(Number), act = b.dataset.act;
+    const node = amList(items, path)[path[path.length - 1]], name = navNodeName(node, base);
+    if (["up", "down", "into", "out"].includes(act)){
+      const to = amMove(items, path, act);
+      if (!to) return;
+      draw(to, act);
+      say(name + ({ up: " moved up.", down: " moved down.", into: " moved into the group above.", out: " moved out of its group." })[act]);
+    } else if (act === "show" || act === "hide"){
+      if (act === "hide") node.hidden = true; else delete node.hidden;
+      draw(path, act);
+      say(name + (act === "hide" ? " is hidden from the sidebar." : " shows in the sidebar."));
+    } else if (act === "remove"){
+      amRemoveGroup(items, path);
+      draw(path, "up");
+      say("Group " + name + " removed. Its screens moved up a level.");
+    } else if (act === "rename"){
+      const r = await openModal("Rename the group", [{ id: "name", label: "Name of the group", value: node.group, required: true }],
+        { label: "Rename the group", onSubmit: async f => {
+          const p = amNameProblem(f.name, items, node);
+          if (p){ const er = new Error(p); er.field = "name"; throw er; }
+          return f;
+        } });
+      if (!r) return;
+      node.group = r.name.trim();
+      draw(path, "rename");
+      say("Group renamed to " + node.group + ".");
+    } else if (act === "icon"){
+      const ic = await pickIcon(name, node.icon, li);
+      if (ic === undefined) return;
+      if (ic) node.icon = ic; else delete node.icon;
+      draw(path, "icon");
+      say(ic ? "Icon changed for " + name + "." : name + " uses its default icon.");
+    }
+  };
+  // Drag and drop is a shortcut for the mouse. Every move also works with the buttons. A row dropped
+  // on a row goes above it. A row dropped on "This group is empty." goes into that group.
+  let dragFrom = null;
+  const clearDrop = () => list.querySelectorAll(".am-drop").forEach(x => x.classList.remove("am-drop"));
+  list.ondragstart = e => {
+    const li = e.target.closest("li[data-path]");
+    if (!li) return;
+    dragFrom = li.dataset.path;
+    e.dataTransfer.setData("text/plain", dragFrom);
+    e.dataTransfer.effectAllowed = "move";
+  };
+  list.ondragover = e => {
+    const t = e.target.closest(".am-row, .am-empty");
+    if (!t || !dragFrom) return;
+    e.preventDefault();
+    clearDrop();
+    t.classList.add("am-drop");
+  };
+  list.ondragend = () => { dragFrom = null; clearDrop(); };
+  list.ondrop = e => {
+    const t = e.target.closest(".am-row, .am-empty");
+    if (!t || !dragFrom) return;
+    e.preventDefault();
+    const from = dragFrom.split(".").map(Number), to = t.closest("li[data-path]") || t.parentNode.closest("li[data-path]");
+    dragFrom = null;
+    const name = navNodeName(amList(items, from)[from[from.length - 1]], base);
+    const toPath = to.dataset.path.split(".").map(Number);
+    const p = t.classList.contains("am-empty") ? amMoveIntoEmpty(items, from, toPath) : amMoveBefore(items, from, toPath);
+    if (!p){ draw(); fail(name + " cannot go there. Groups can go three levels deep, and a group cannot go into itself."); return; }
+    draw(p, "up");
+    say(name + " moved.");
+  };
+  $("am-add").onclick = () => {
+    const box = $("am-new"), p = amNameProblem(box.value, items);
+    $("am-new-err").textContent = p;
+    box.setAttribute("aria-invalid", p ? "true" : "false");
+    if (p){ box.focus(); return; }
+    items.push({ group: box.value.trim(), items: [] });
+    box.value = "";
+    draw([items.length - 1], "up");
+    say("Group " + items[items.length - 1].group + " added at the end. Save my menu to keep it.");
+  };
+  $("am-new").onkeydown = e => { if (e.key === "Enter"){ e.preventDefault(); $("am-add").click(); } };
+  let busy = false;
+  $("am-save").onclick = async () => {
+    if (busy) return;
+    busy = true;
+    const b = $("am-save");
+    b.disabled = true; b.textContent = "Saving…";
+    try {
+      Object.assign(NAV_MENU, await api("PUT", "/me/menu", { items }));
+      applyNavMenu();
+      say("Your menu is saved. The sidebar shows it now.");
+    } catch(e){ fail("Your menu was not saved: " + e.message + ". Your changes are still here. Try again."); }
+    finally { busy = false; b.disabled = false; b.textContent = "Save my menu"; }
+  };
+  $("am-reset").onclick = async () => {
+    const r = await openModal("Reset my menu?", [], { label: "Reset my menu", danger: true, busyLabel: "Resetting…",
+      onSubmit: () => api("DELETE", "/me/menu") },
+      "<p>Your order, groups, names, icons and hidden screens go back to the default menu. You cannot undo this.</p>");
+    if (!r) return;
+    Object.assign(NAV_MENU, r);
+    applyNavMenu();
+    await viewArrangeMenu(v);
+    $("am-live").textContent = "Your menu is the default menu again.";
+  };
+  $("am-cancel").onclick = () => { if (history.length > 1) history.back(); else go("dashboard"); };
+  $("am-close").onchange = async e => {
+    const cb = e.target, want = cb.checked, st = $("am-close-st");
+    cb.disabled = true; st.textContent = "Saving…";
+    try { NAV_MENU.close_others = (await api("PUT", "/me/menu", { close_others: want })).close_others; st.textContent = "Saved."; }
+    catch(er){ cb.checked = !want; st.textContent = ""; fail("The option was not saved: " + er.message + ". Try again."); }
+    finally { cb.disabled = false; }
+  };
+}
+// Drag and drop onto an empty group: the entry goes into it. Null when that is not possible.
+function amMoveIntoEmpty(items, from, groupPath){
+  if (groupPath.length >= from.length && from.every((v, k) => groupPath[k] === v)) return null;
+  const node = amList(items, from)[from[from.length - 1]], group = amList(items, groupPath)[groupPath[groupPath.length - 1]];
+  if (!node || !group || group.group === undefined || groupPath.length + amLevels(node) > 3) return null;
+  amList(items, from).splice(from[from.length - 1], 1);
+  group.items = group.items || [];
+  group.items.push(node);
+  return amPathOf(items, node);
+}
+
+// Icon picker. The search list (static/icons/index.json) loads the first time the picker opens.
+function loadIconIndex(){
+  if (!NAV_MENU.iconIndex)
+    NAV_MENU.iconIndex = fetch("/static/icons/index.json").then(r => {
+      if (!r.ok) throw new Error("the server answered " + r.status);
+      return r.json();
+    }).catch(e => { NAV_MENU.iconIndex = null; throw e; });
+  return NAV_MENU.iconIndex;
+}
+// Icons whose name or search words hold every typed word, best match first, as "solid/name".
+function searchIcons(index, q, limit){
+  const words = String(q || "").toLowerCase().trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return { total: 0, icons: [] };
+  const hits = [];
+  for (const [name, styles, kw] of (index && index.icons) || []){
+    let score = 0;
+    for (const w of words){
+      const s = name === w ? 0 : name.startsWith(w) ? 1 : name.includes(w) ? 2 : (" " + kw).includes(" " + w) ? 3 : kw.includes(w) ? 4 : -1;
+      if (s < 0){ score = -1; break; }
+      score += s;
+    }
+    if (score < 0) continue;
+    for (const st of styles) hits.push({ score, name, st });
+  }
+  hits.sort((a, b) => a.score - b.score || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) || (a.st === "s" ? -1 : 1));
+  return { total: hits.length, icons: hits.slice(0, limit).map(h => (h.st === "s" ? "solid/" : "regular/") + h.name) };
+}
+// The icon picker opens as a panel under the entry's row. Focus goes to the search field. Escape or
+// Close closes it, and focus goes back to Change icon. Resolves with "solid/name" or "regular/name",
+// null for "Use the default", or undefined when closed without a choice.
+function pickIcon(name, current, host){
+  return new Promise(resolve => {
+    const list = host.closest(".am-list");
+    if (list && list._closePicker) list._closePicker();
+    const opener = document.activeElement;
+    const panel = document.createElement("div");
+    panel.className = "ip-panel";
+    panel.setAttribute("role", "group");
+    panel.setAttribute("aria-labelledby", "ip-t");
+    panel.innerHTML = "<p class='ip-title' id='ip-t'></p>" +
+      
+      "<div class='ip-field'><input id='ip-q' type='text' autocomplete='off' spellcheck='false' aria-labelledby='ip-t' aria-describedby='ip-hint'>" +
+      "<button type='button' class='ip-clear' aria-label='Clear the search' title='Clear the search'>×</button></div>" +
+      "<p id='ip-hint' class='dim am-note'>Type part of an icon's name, such as user or folder. Then click the icon you want.</p>" +
+      "<p id='ip-st' class='dim am-note' role='status'></p><p id='ip-err' class='am-err' role='alert'></p>" +
+      "<div id='ip-res' class='ip-grid'></div>" +
+      "<div class='ip-foot'><button type='button' class='small' id='ip-def'" + (current ? "" : " disabled") + ">Use the default</button>" +
+      "<button type='button' class='small' id='ip-close'>Close</button></div>";
+    panel.querySelector("#ip-t").textContent = "Find an icon for " + name;
+    host.querySelector(":scope > .am-row").after(panel);
+    let done = false, index = null, timer = 0;
+    const finish = val => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (list && list._closePicker === close) list._closePicker = null;
+      panel.remove();
+      if (opener && opener.isConnected) opener.focus();
+      resolve(val);
+    };
+    const close = () => finish(undefined);
+    if (list) list._closePicker = close;
+    panel.onkeydown = e => { if (e.key === "Escape"){ e.preventDefault(); e.stopPropagation(); close(); } };
+    panel.querySelector("#ip-close").onclick = close;
+    panel.querySelector("#ip-def").onclick = () => finish(null);
+    const q = panel.querySelector("#ip-q"), res = panel.querySelector("#ip-res"), st = panel.querySelector("#ip-st");
+    panel.querySelector(".ip-clear").onclick = () => { q.value = ""; show(); q.focus(); };
+    res.onclick = e => { const b = e.target.closest("button[data-icon]"); if (b) finish(b.dataset.icon); };
+    const show = () => {
+      if (!index) return;
+      const typed = q.value.trim(), r = searchIcons(index, typed, 60);
+      res.innerHTML = r.icons.map(ic => "<button type='button' class='ip-icon' data-icon='" + esc(ic) + "' aria-pressed='" + (ic === current) +
+        "' aria-label='" + esc(ic.split("/")[1] + ", " + ic.split("/")[0]) + "' title='" + esc(ic.split("/")[1]) + "'>" + faIconSvg(ic) + "</button>").join("");
+      st.textContent = !typed ? "" : !r.total ? "No icon matches " + typed + ". Try another word."
+        : r.total > r.icons.length ? r.total + " icons match. The first " + r.icons.length + " show. Type more words to narrow the list."
+        : r.total === 1 ? "1 icon matches." : r.total + " icons match.";
+    };
+    q.oninput = () => { clearTimeout(timer); timer = setTimeout(show, 120); };
+    q.focus();
+    st.textContent = "Loading the icon list…";
+    loadIconIndex().then(ix => { index = ix; if (!done){ st.textContent = ""; show(); } })
+      .catch(e => { st.textContent = ""; panel.querySelector("#ip-err").textContent = "The icon list did not load: " + e.message + ". Close this and try again."; });
+  });
+}
+const NAV_MENU = { items: null, close_others: false, loaded: false, iconIndex: null };
 const DETAIL = { id:null, tab:"overview", data:null, revs:[], comments:[], props:[], cmp:new Set(),
   pvSeq:null, folderCache:null };
 const TOOL = { id:null, tab:"general", data:null, cutting:[], docs:[] };
@@ -1407,6 +1901,7 @@ async function renderView(v, skeleton){
       case "search": await viewSearch(v); break;
       case "system": viewSystem(v); break;
       case "settings": await viewSettings(v); break;
+      case "menu": await viewArrangeMenu(v); break;
       case "admin": await viewAdmin(v); break;
       case "detail": await viewDetail(v); break;
       default: viewSoon(v, bigIcon("ic-warning"), "Not found", "Pick a section from the sidebar.");
@@ -5418,6 +5913,9 @@ function showUserMenu(ev){
     { label: "Change appearance", act: () => {
       if ($("sidebar").classList.contains("open")) setNavDrawer(false, document, false);
       go("settings"); } },
+    { label: "Arrange my menu", act: () => {
+      if ($("sidebar").classList.contains("open")) setNavDrawer(false, document, false);
+      go("menu"); } },
     "sep",
     { label: "Sign out", danger: true, act: () => signout() },
   ] : [{ label: "Sign out", danger: true, act: () => signout() }];

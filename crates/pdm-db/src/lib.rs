@@ -5621,6 +5621,58 @@ pub async fn put_client_settings(
     Ok(())
 }
 
+// ── Each person's own menu ──────────────────────────────────────────────
+
+/// A user's own sidebar menu (`None`: the default) and whether opening a group closes the others.
+pub async fn get_user_menu(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<(Option<serde_json::Value>, bool), PdmError> {
+    let row: Option<(Option<serde_json::Value>, bool)> =
+        sqlx::query_as("SELECT items, close_others FROM user_menu WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(PdmError::Db)?;
+    Ok(row.unwrap_or((None, false)))
+}
+
+/// Store a user's menu (`None` puts the default back). The close option stays as it is.
+pub async fn set_user_menu_items(
+    pool: &PgPool,
+    user_id: Uuid,
+    items: Option<&serde_json::Value>,
+) -> Result<(), PdmError> {
+    sqlx::query(
+        "INSERT INTO user_menu (user_id, items) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET items = EXCLUDED.items, updated_at = now()",
+    )
+    .bind(user_id)
+    .bind(items)
+    .execute(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    Ok(())
+}
+
+/// Store whether opening a group closes the user's other groups. The menu stays as it is.
+pub async fn set_user_menu_close_others(
+    pool: &PgPool,
+    user_id: Uuid,
+    close_others: bool,
+) -> Result<(), PdmError> {
+    sqlx::query(
+        "INSERT INTO user_menu (user_id, close_others) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET close_others = EXCLUDED.close_others, updated_at = now()",
+    )
+    .bind(user_id)
+    .bind(close_others)
+    .execute(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    Ok(())
+}
+
 // ── Server secrets ──────────────────────────────────────────────────────
 
 /// The server-wide secret `name`: `len` random bytes, made by whichever process asks first and

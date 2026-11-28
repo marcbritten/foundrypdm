@@ -279,7 +279,7 @@ test("the account button opens the account menu and says when it is open, and a 
   });
   const trigger = node();
   ctx.showUserMenu({ stopPropagation(){}, currentTarget: trigger });
-  assert.deepEqual([...shown[0].labels], ["Change password", "Change appearance", "-", "Sign out"]);
+  assert.deepEqual([...shown[0].labels], ["Change password", "Change appearance", "Arrange my menu", "-", "Sign out"]);
   assert.equal(shown[0].trigger, trigger, "Escape returns focus to the account button");
   assert.equal(trigger.getAttribute("aria-expanded"), "true");
   menu._trigger = trigger;

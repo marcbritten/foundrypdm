@@ -34,6 +34,7 @@ const MIGRATION_0028: &str = include_str!("../migrations/0028_session_expiry.sql
 const MIGRATION_0029: &str = include_str!("../migrations/0029_host_admin.sql");
 const MIGRATION_0030: &str = include_str!("../migrations/0030_audit_org_id.sql");
 const MIGRATION_0031: &str = include_str!("../migrations/0031_operator_role.sql");
+const MIGRATION_0032: &str = include_str!("../migrations/0032_user_menu.sql");
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), PdmError> {
     let mut tx = pool.begin().await.map_err(PdmError::Db)?;
@@ -90,6 +91,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), PdmError> {
         (29, MIGRATION_0029),
         (30, MIGRATION_0030),
         (31, MIGRATION_0031),
+        (32, MIGRATION_0032),
     ];
     for (version, sql) in migrations {
         if !applied.contains(version) {

@@ -6189,6 +6189,7 @@ pub fn api_router() -> Router<AppState> {
             get(client_settings_get).put(client_settings_put),
         )
         .route("/me/password", post(change_own_password))
+        .route("/me/menu", crate::menu::method_router())
         .route(
             "/settings/gpu-policy",
             get(get_gpu_policy).put(put_gpu_policy),

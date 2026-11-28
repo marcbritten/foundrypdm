@@ -24,6 +24,7 @@ mod design_link;
 mod error;
 mod events;
 mod mail;
+mod menu;
 mod onshape;
 mod portal;
 mod reading_font;
