@@ -65,7 +65,7 @@ Set these on **pdm** and **pdm-worker**. Compose already sets them for the bundl
 | `PDM_SESSION_IDLE_MINUTES` | `120` | A web sign-in ends after this many minutes without a request (`0` = never); see [Sign-in sessions](#sign-in-sessions) |
 | `PDM_SESSION_LIFETIME_MINUTES` | `720` | A web sign-in ends this many minutes after it was made, however busy (`0` = no limit) |
 | `PDM_MAX_UPLOAD_BYTES` | `2147483648` | Upload cap (2 GiB) |
-| `SOLIDCRAFT_GPU` | `auto` | `auto` / `hardware` / `software` / `cpu` |
+| `SOLIDCRAFT_GPU` | `auto` | `auto` / `hardware` / `software` / `cpu`. Previews do not use it: each preview job passes the organization's **Preview renderer** choice instead (see [GPU](#gpu-thumbnails)) |
 | `PDM_PORTAL_DIR` | `/opt/pdm/portal` | Static web UI (index.html, app.js) |
 | `PDM_SIGNIN_ORG` | — | API only. Name of the organization whose branding (name, logo, colors) the sign-in page shows. Unset or blank: a server with exactly one organization shows that one's; a server with several shows the defaults. A name no organization has turns sign-in branding off |
 
@@ -105,7 +105,7 @@ Set `PDM_S3_*` to AWS, MinIO, Garage, etc. Create the bucket before starting PDM
 
 ## GPU (thumbnails)
 
-The worker uses Vulkan when `/dev/dri` is visible. Compose passes `/dev/dri` and `SOLIDCRAFT_GPU=auto`. On hosts without a GPU, it falls back to CPU. Org setting **Settings → Preview renderer** can override (`auto` / `GPU` / `GPU software` / `CPU`).
+Preview snapshots use the GPU policy the organization picks under **Settings → Preview renderer** (`auto` / `GPU` / `GPU software` / `CPU`; default `auto`). The worker passes it to the CLI as `SOLIDCRAFT_GPU` for every preview job, so a `SOLIDCRAFT_GPU` set on the host does not change previews. The policy matters for **Viewport snapshot** previews (and the coarse viewport fallback for very large models); the default **Transparent product render** style uses the CPU product-image renderer. With `auto`, a viewport snapshot uses Vulkan when `/dev/dri` is visible and falls back to the CPU on hosts without a GPU. Compose passes `/dev/dri`.
 
 If compose fails on a machine with no `/dev/dri`, remove the `devices:` block from `docker/pdm-dev.yml`.
 
@@ -206,7 +206,7 @@ These are **not** env vars; they live in the org (Admin → Settings):
 
 - **Mail server** — SMTP host, port, user, password, from, STARTTLS/TLS. Required for **Invite user**.
 - **Onshape** — API access key + secret, default PDM project. Required for **Send to manufacturing**.
-- **Preview renderer** — GPU policy for the worker.
+- **Preview renderer** — GPU policy for preview snapshots (default Auto).
 - **Part-number prefixes** — auto part numbers.
 
 Do not put SMTP or Onshape secrets in git.
