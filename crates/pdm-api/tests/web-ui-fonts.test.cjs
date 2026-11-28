@@ -102,7 +102,7 @@ test("the font tokens default to the system stacks and a choice prepends its bun
       assert(fontFaces().some(f => f.get("font-family") === "\"" + o.name + "\""), o.name + " has @font-face rules");
     }
   }
-  assert.equal(ruleDecls("body").get("font"), "14px/1.5 var(--font-ui)", "body text uses the reading font, same size");
+  assert.equal(ruleDecls("body").get("font"), "var(--fs-base)/1.5 var(--font-ui)", "body text uses the reading font at the base step");
   assert.equal(ruleDecls(".mono").get("font-family"), "var(--font-mono)");
 });
 
@@ -163,7 +163,7 @@ test("index.html applies the saved fonts in <head>, with the same keys, ids and 
 // ── The setting in Settings ─────────────────────────────────────────────
 const FONT_FNS = ["fontSettings", "orgFont", "orgFace", "orgOptionName", "currentFont", "effectiveFont", "applyFonts",
   "applyFont", "fontPickerHTML", "orgFontPickerHTML", "wireFontPicker", "loadOrgFont", "syncFontPicker", "cacheOrgFont", "refreshOrgFont",
-  "saveOrgFont"];
+  "saveOrgFont", "textSizeOptions", "currentTextSize", "applyTextSize", "textSizeHTML"];
 function fontCtx(stored = {}, opts = {}){
   const attrs = {}, calls = [], notes = [];
   const ctx = loadFunctions(FONT_FNS, {
@@ -240,7 +240,7 @@ test("the picker offers Organization default first, names its face, and explains
     "reading font follows the organization, which uses Atkinson");
   assert.match(html, /<option value='atkinson' selected>Atkinson Hyperlegible Mono<\/option>/, "code font is the member's own choice");
   assert.match(html, /<option value='org'>Organization default \(System default\)<\/option>/);
-  assert.match(html, /stored in this browser/i, "says where the member's choice applies");
+  assert.match(html, /This browser keeps your font and text size choices/, "says where the member's choice applies");
   assert.match(html, /nothing is downloaded from the internet/, "says the fonts are bundled");
   assert.doesNotMatch(html, /data-org-font|org-font-save/, "members who are not admins do not see the organization picker");
 });

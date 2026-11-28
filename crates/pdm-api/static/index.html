@@ -23,6 +23,8 @@
       l.rel = "preload"; l.as = "font"; l.type = "font/ttf"; l.crossOrigin = "anonymous"; l.href = "/static/fonts/" + f[3];
       document.head.appendChild(l);
     });
+    var size = localStorage.getItem("pdm_text_size");
+    if (size === "112" || size === "125") document.documentElement.setAttribute("data-text-size", size);
   } catch (e) {}
 })();
 </script>

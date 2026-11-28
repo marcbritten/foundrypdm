@@ -2503,7 +2503,7 @@ function ncPartPreview(){
   const cand = l && NC.cands.find(c => c.id === l.item_id);
   const img = (cand && cand.hasFlat)
     ? "<span data-thumb='/items/" + cand.id + "/flat-pattern/preview' class='nc-partimg'></span>"
-    : "<div class='nc-preview nc-partimg' style='display:flex;align-items:center;justify-content:center;color:var(--draw-text, #666);font-size:11px'>" +
+    : "<div class='nc-preview nc-partimg' style='display:flex;align-items:center;justify-content:center;color:var(--draw-text, #666);font-size:var(--fs-sm)'>" +
       (cand ? "No flat pattern yet" : "Select a part") + "</div>";
   return "<div class='nc-previewwrap'>" + img +
     "<div class='nc-legend'>" +
@@ -4188,10 +4188,10 @@ function renderToolGeneral(v){
     "<div style='margin-top:14px'><button id='tsave2' class='small'>Save tool</button></div></div>" +
     "<div class='card' style='margin-top:12px'><h2 class='sec'>Documents (" + TOOL.docs.length + ")</h2>" +
     (TOOL.docs.length ?
-      "<table><thead><tr><th>Name</th><th>Size</th><th>Added</th><th></th></tr></thead><tbody>" +
+      "<table><thead><tr><th>Name</th><th class='num'>Size</th><th>Added</th><th></th></tr></thead><tbody>" +
       TOOL.docs.map(doc => "<tr>" +
         "<td><b>" + kindBadge(doc.content_type, doc.filename) + " " + esc(doc.filename) + "</b></td>" +
-        "<td class='muted'>" + bytes(doc.size_bytes) + "</td>" +
+        "<td class='muted num'>" + bytes(doc.size_bytes) + "</td>" +
         "<td class='muted'>" + fmtTime(doc.created_at) + "</td>" +
         "<td style='text-align:right;white-space:nowrap'>" +
         "<button class='small' data-dl='" + doc.id + "'>Download</button> " +
@@ -4760,7 +4760,7 @@ function apprFullTable(list){
           "<span class='dim'>no item</span>") + "</td>" +
         "<td class='muted'>" + esc(requester) + "</td>" +
         "<td class='muted'>" + esc(assignees) +
-          (mine && a.status === "pending" ? " <span class='dim' style='font-size:11px'>(you)</span>" : "") + "</td>" +
+          (mine && a.status === "pending" ? " <span class='dim' style='font-size:var(--fs-sm)'>(you)</span>" : "") + "</td>" +
         "<td>" + statusBadge(st.label, st.cls, st.icon) + "</td>" +
         "<td class='muted'>" + fmtTime(a.created_at) + "</td>" +
         "<td style='white-space:nowrap'>" +
@@ -4960,6 +4960,30 @@ function applyFont(setting, id){
   else localStorage.removeItem(setting.key);
   applyFonts();
 }
+// Text size for this browser: scales the root font size, so every --fs-* step grows with it.
+// index.html's <head> script applies it before first paint with the same key and ids.
+function textSizeOptions(){
+  return [{ id:"100", name:"Default (100%)" }, { id:"112", name:"Larger (112.5%)" }, { id:"125", name:"Largest (125%)" }];
+}
+function currentTextSize(){
+  const id = localStorage.getItem("pdm_text_size");
+  return textSizeOptions().some(o => o.id === id) ? id : "100";
+}
+function applyTextSize(id){
+  if (id !== "100" && textSizeOptions().some(o => o.id === id)){
+    document.documentElement.setAttribute("data-text-size", id);
+    localStorage.setItem("pdm_text_size", id);
+  } else {
+    document.documentElement.removeAttribute("data-text-size");
+    localStorage.removeItem("pdm_text_size");
+  }
+}
+function textSizeHTML(){
+  const cur = currentTextSize();
+  return "<div class='row'><label for='text-size'>Text size</label><select id='text-size' aria-describedby='text-size-hint'>" +
+    textSizeOptions().map(o => "<option value='" + o.id + "'" + (o.id === cur ? " selected" : "") + ">" + esc(o.name) + "</option>").join("") +
+    "</select></div><p class='dim' id='text-size-hint'>Sets the size of all text in the workspace, and the default of 100% follows your browser's text size.</p>";
+}
 function fontPickerHTML(){
   const org = orgFont();
   return fontSettings().map(s => {
@@ -4970,9 +4994,9 @@ function fontPickerHTML(){
       opts.map(o => "<option value='" + o.id + "'" + (o.id === cur ? " selected" : "") + ">" + esc(o.name) + "</option>").join("") +
       "</select></div><p class='dim' id='" + s.id + "-hint'>" + esc(s.hint) +
       " Default: Organization default, which is System default (your device's own font) until an admin picks another.</p>";
-  }).join("") +
+  }).join("") + textSizeHTML() +
     "<p class='dim'>Atkinson Hyperlegible is designed so that similar characters, such as 0 and O or 1, l and I, are easy to tell apart. " +
-    "Your font choices are stored in this browser. The fonts come with this server, so nothing is downloaded from the internet.</p>" +
+    "This browser keeps your font and text size choices. The fonts come with this server, so nothing is downloaded from the internet.</p>" +
     (isRole("admin") ? orgFontPickerHTML(org) : "");
 }
 function orgFontPickerHTML(org){
@@ -4992,6 +5016,8 @@ function wireFontPicker(root){
   root.querySelectorAll("[data-font-key]").forEach(sel => {
     sel.onchange = () => applyFont(settings.find(s => s.key === sel.dataset.fontKey), sel.value);
   });
+  const size = root.querySelector("#text-size");
+  if (size) size.onchange = () => applyTextSize(size.value);
   root.querySelectorAll("[data-org-font]").forEach(sel => { sel.onchange = () => { sel.dataset.edited = "1"; }; });
   const save = root.querySelector("#org-font-save"), retry = root.querySelector("#org-font-retry");
   if (save) save.onclick = () => saveOrgFont(root, save);
@@ -6440,7 +6466,7 @@ async function projectSettingsTab(box){
   const maSection =
     "<div style='margin-top:14px;border-top:1px solid var(--line);padding-top:14px'>" +
       "<h2 class='sec' style='margin-bottom:6px'>Main assembly</h2>" +
-      "<p class='dim' style='font-size:12.5px;margin:0 0 10px'>The item the bill of materials is built from. Its rendered thumbnail is also used as this project's image.</p>" +
+      "<p class='dim' style='font-size:var(--fs-sm);margin:0 0 10px'>The item the bill of materials is built from. Its rendered thumbnail is also used as this project's image.</p>" +
       (main
         ? "<div class='row' style='align-items:center'>" +
             "<span class='thumb-sm pcov' data-thumb='/items/" + main.id + "/thumbnail'></span>" +
@@ -6485,7 +6511,7 @@ async function projectSettingsTab(box){
     "<button id='os-step-go'>Upload STEP</button>" +
     "<p id='os-import-status' role='status' aria-live='polite' style='white-space:pre-wrap'></p>" +
     "</div>" +
-    "<p class='dim' style='font-size:12.5px;margin-top:12px'>Part-number prefixes and the approval gate are org-wide — set them under Settings. Use the project menu (⋮) to archive or delete this project.</p>" +
+    "<p class='dim' style='font-size:var(--fs-sm);margin-top:12px'>Part-number prefixes and the approval gate are org-wide — set them under Settings. Use the project menu (⋮) to archive or delete this project.</p>" +
     "</div>";
   const setBtn = $("ma-set"), chg = $("ma-change"), clr = $("ma-clear");
   if (setBtn) setBtn.onclick = () => chooseMainAssembly(pid);
@@ -7159,7 +7185,7 @@ async function tabOverview(box){
   box.innerHTML =
     "<div class='grid2'>" +
       "<div class='card'>" +
-        "<h3 class='dim' style='margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.05em'>Metadata</h3>" +
+        "<h3 class='dim' style='margin:0 0 10px;font-size:var(--fs-sm);text-transform:uppercase;letter-spacing:.05em'>Metadata</h3>" +
         "<div class='dmeta' style='margin:0'>" +
           "<div><span class='k'>Part no</span> <span class='mono'>" + esc(it.part_number) + "</span></div>" +
           "<div><span class='k'>Project</span> " + esc(proj.name || "—") + "</div>" +
@@ -7192,7 +7218,7 @@ async function tabOverview(box){
         "</div>" +
       "</div>" +
       "<div class='card'>" +
-        "<h3 class='dim' style='margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.05em'>Properties</h3>" +
+        "<h3 class='dim' style='margin:0 0 10px;font-size:var(--fs-sm);text-transform:uppercase;letter-spacing:.05em'>Properties</h3>" +
         "<table style='margin:0 0 8px'><tbody>" +
           (list.length ? list.map(p =>
             "<tr><td class='mono muted'>" + esc(p.prop_key || "") + "</td>" +
@@ -7444,7 +7470,7 @@ async function tabVersions(box){
   box.innerHTML =
     "<div id='cmpbox'></div>" +
     "<table><thead><tr>" +
-    "<th style='width:30px'></th><th>Ver</th><th>Type</th><th>Size</th><th>SHA-256</th>" +
+    "<th style='width:30px'></th><th>Ver</th><th>Type</th><th class='num'>Size</th><th>SHA-256</th>" +
     "<th>Author</th><th>Committed</th><th>Message</th><th></th>" +
     "</tr></thead><tbody>" +
     vs.map(vv =>
@@ -7461,7 +7487,7 @@ async function tabVersions(box){
         (versionRevLabel(vv) ? " <span class='dim' style='white-space:nowrap'>" + versionRevLabel(vv) + "</span>" : "") +
         (head && head.id === vv.id ? " <span class='badge'>head</span>" : "") + "</span></td>" +
       "<td>" + kindBadge(vv.mime_type, sourceFilename(vv,d) || vv.native_format) + "</td>" +
-      "<td class='muted'>" + bytes(vv.size_bytes) + "</td>" +
+      "<td class='muted num'>" + bytes(vv.size_bytes) + "</td>" +
       "<td class='mono muted' title='" + esc(vv.sha256 || "") + "'>" + shaShort(vv.sha256) + "</td>" +
       "<td class='muted'>" + esc(vv.author_name || "—") + "</td>" +
       "<td class='muted' title='" + fmtDate(vv.committed_at) + "'>" + fmtTime(vv.committed_at) + "</td>" +
@@ -7476,7 +7502,7 @@ async function tabVersions(box){
           "<button class='small' data-rs='" + vv.id + "' title='Restore this version as a new head'>↺ restore</button>" : "") +
       "</td></tr>").join("") +
     "</tbody></table>" +
-    "<div class='dim' style='font-size:12px;margin-top:8px'>Tick two versions to compare metadata. " +
+    "<div class='dim' style='font-size:var(--fs-sm);margin-top:8px'>Tick two versions to compare metadata. " +
     "Versions are immutable — restoring never overwrites history.</div>";
   await attachThumbs(box);
   box.querySelectorAll("[data-cmp]").forEach(cb => cb.addEventListener("change", () => {
@@ -7525,7 +7551,7 @@ function updateCompare(box, vs){
   const typeRow = cmpRow("type", ka.icon + " " + esc(ka.label), kb.icon + " " + esc(kb.label), ka.label !== kb.label);
   cbox.innerHTML =
     "<div class='card' style='margin-bottom:10px'>" +
-    "<b style='font-size:13px'>Comparing v" + a.seq + " ↔ v" + b.seq + "</b>" +
+    "<b style='font-size:var(--fs-base)'>Comparing v" + a.seq + " ↔ v" + b.seq + "</b>" +
     "<table style='margin-top:8px'><thead><tr><th></th><th>v" + a.seq + "</th><th>v" + b.seq + "</th>" +
     "<th></th></tr></thead><tbody>" +
     typeRow +
@@ -7626,7 +7652,7 @@ function tabRevisions(box){
       "<td class='muted'>" + esc(r.release_note || "") + "</td></tr>";
     }).join("") +
     "</tbody></table>" +
-    "<div class='dim' style='font-size:12px;margin-top:8px'>Revisions are named, immutable release pointers — " +
+    "<div class='dim' style='font-size:var(--fs-sm);margin-top:8px'>Revisions are named, immutable release pointers — " +
     "historical versions are never overwritten.</div>" :
     "<div class='empty'>No named revisions yet — use “Release revision” in the header to tag the current head " +
     "(labels auto-increment A, B, C…).</div>";

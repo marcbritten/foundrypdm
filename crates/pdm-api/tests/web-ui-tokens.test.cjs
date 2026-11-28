@@ -107,7 +107,7 @@ test("the shared :root block holds only scale tokens, never a theme token", () =
   for (const [name] of declarations(scaleBlocks[0].body)){
     assert(name.startsWith("--"), ":root declares " + name + "; only scale tokens belong there");
     assert(!THEME_TOKEN_NAMES.has(name), name + " is in a theme block and in :root (the later one wins in every theme)");
-    assert.match(name, /^--(sp|r|fs|lh|font)-/, name + " in :root is not a spacing, radius, type, line-height or font token");
+    assert.match(name, /^--(sp|r|fs|lh|font|icon)-/, name + " in :root is not a spacing, radius, type, line-height, font or icon token");
   }
   // No other rule redefines a theme token: it would silently override some themes.
   for (const r of RULES){
@@ -204,7 +204,7 @@ const FONT_TOKEN = /var\(--font-(?:ui|mono)\)/.source;
 const FONT_OK = {
   "font-family": new RegExp("^" + FONT_TOKEN + "$"),
   "font": new RegExp(/^(?:(?:normal|italic|oblique|bold|bolder|lighter|small-caps|[1-9]00)\s+)*/.source +
-    /[\d.]+(?:px|r?em|%)(?:\/[\d.]+(?:px|r?em|%)?)?\s+/.source + FONT_TOKEN + "$"),
+    /(?:[\d.]+(?:px|r?em|%)|var\(--fs-[a-z0-9-]+\))(?:\/[\d.]+(?:px|r?em|%)?)?\s+/.source + FONT_TOKEN + "$"),
 };
 const fontOk = (prop, value) => /^(?:inherit|initial|unset|revert)$/.test(value) || FONT_OK[prop].test(value);
 function fontStacksIn(name, src){
@@ -246,6 +246,35 @@ test("font-family and font use --font-ui or --font-mono, never a stack of their 
   [".e", ".f", ".g", ".h", ".i"]);
   assert.deepEqual(inlineFontsIn("t", "style='font:12px Arial' <text font-family=\"monospace\"> el.style.fontFamily = x;" +
     " style='font:11px var(--font-mono)' toast(\"Font: saved\")").length, 3);
+});
+
+// ── Font sizes come from the scale (guideline Y4) ───────────────────────
+// Every font-size, and the size in every font shorthand, is a --fs-* step; the steps themselves are rem
+// values in the :root block, so the Text size setting and the browser's own text size scale them all.
+const FS_STEPS = ["xs", "sm", "base", "lg", "xl", "2xl"];
+// --icon-xl sizes decorative glyphs; it is not a text step (web-ui-type-scale.test.cjs limits where it is used).
+const FS_VAR = new RegExp("^var\\(--(?:fs-(?:" + FS_STEPS.join("|") + ")|icon-xl)\\)");
+function sizesOffScale(name, src){
+  const found = [];
+  for (const r of parseRules(src)) for (const [prop, value] of declarations(r.body)){
+    if (prop === "font-size" && !FS_VAR.test(value) && value !== "inherit" &&
+      !(r.selector === "html" && value === "calc(100% * var(--fs-scale))")) found.push(name + ": " + r.selector + " { font-size:" + value + " }");
+    if (prop === "font" && /\d(?:px|r?em|%)/.test(value.split("/")[0])) found.push(name + ": " + r.selector + " { font:" + value + " }");
+  }
+  return found;
+}
+test("every font size is a step of the scale, in CSS and in inline styles", () => {
+  const read = file => fs.readFileSync(path.join(STATIC, file), "utf8");
+  const onshape = read("onshape.html");
+  const found = [...sizesOffScale("style.css", css), ...sizesOffScale("editors.css", read("editors.css")),
+    ...sizesOffScale("onshape.html", styleBlocks(onshape)), ...sizesOffScale("index.html", styleBlocks(indexHtml))];
+  for (const [name, src] of [["app.js", app], ["editors.js", read("editors.js")], ["index.html", indexHtml], ["onshape.html", onshape]])
+    for (const m of src.matchAll(/font-size\s*:\s*([^;"'<>]+)/g)) if (!FS_VAR.test(m[1].trim())) found.push(name + ": " + m[0]);
+  assert.deepEqual(found, [], "use var(--fs-xs|sm|base|lg|xl|2xl)");
+  const root = declarations(scaleBlocks[0].body);
+  for (const step of FS_STEPS) assert.match(root.get("--fs-" + step) || "", /^[\d.]+rem$/, "--fs-" + step + " is a rem value");
+  assert.deepEqual(sizesOffScale("t", ".a { font-size:13px } .b { font:600 10px var(--font-mono) } .c { font-size:var(--fs-sm) } .d { font:var(--fs-base)/1.5 var(--font-ui) }")
+    .map(f => f.split(" ")[1]), [".a", ".b"], "the check itself");
 });
 
 // The fixes this change makes, so a later edit cannot quietly put the old values back.

@@ -7,7 +7,7 @@
 <link rel="stylesheet" href="/static/style.css">
 <style>
   html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); }
-  #app { padding:12px; font-size:13px; }
+  #app { padding:12px; font-size:var(--fs-base); }
   .brand { font-weight:700; margin-bottom:8px; }
   #send { width:100%; padding:12px; font-weight:600; }
   .ok { color:var(--ok); margin-top:10px; }
@@ -15,8 +15,8 @@
   .pick-list { max-height:45vh; overflow:auto; border:1px solid rgba(128,128,128,.35); border-radius:6px; margin:8px 0; }
   .pick-row { padding:6px 10px; cursor:pointer; display:flex; gap:6px; }
   .pick-row:hover { background:var(--hover); }
-  .pick-sub { padding-left:26px; font-size:12px; }
-  .pick-tag { margin-left:auto; opacity:.6; font-size:11px; }
+  .pick-sub { padding-left:26px; font-size:var(--fs-sm); }
+  .pick-tag { margin-left:auto; opacity:.6; font-size:var(--fs-sm); }
   .selection-preview { margin:8px 0; text-align:center; }
   .selection-preview img { max-width:100%; max-height:220px; border-radius:6px; }
 </style>
@@ -213,7 +213,7 @@ function renderForm(){
     "<button class='primary' id='send'>Send to manufacturing</button>" +
     "<p class='dim' id='stat'></p>" +
     "<p class='dim' id='dbg'></p>" +
-    "<p class='dim' style='font-size:11px'>PDM build: " + esc(cfg.build || "dev") + "</p>" +
+    "<p class='dim' style='font-size:var(--fs-sm)'>PDM build: " + esc(cfg.build || "dev") + "</p>" +
     "<p><a class='dim' href='#' id='out'>Sign out of PDM</a></p>";
   $("out").onclick = async (e) => {
     e.preventDefault();
@@ -334,7 +334,7 @@ function renderPicker(d){
     "<button id='back' style='width:100%;margin-bottom:6px'>← Back</button>" +
     "<p class='dim'>Picking from this document's tabs:</p>" +
     "<div class='pick-list'>" + rows + "</div>" +
-    "<p class='dim' style='font-size:11px'>A tab sends the whole element; a body sends just that part; ↳ rows are the assembly's top-level sub-assemblies.</p>";
+    "<p class='dim' style='font-size:var(--fs-sm)'>A tab sends the whole element; a body sends just that part; ↳ rows are the assembly's top-level sub-assemblies.</p>";
   $("back").onclick = renderForm;
   document.querySelectorAll(".pick-row[data-sid]").forEach(r => {
     r.onclick = () => {
