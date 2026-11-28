@@ -2562,7 +2562,7 @@ pub async fn record_audit(
     object_id: Option<Uuid>,
     detail: Option<serde_json::Value>,
 ) -> Result<AuditEvent, PdmError> {
-    sqlx::query_as::<_, AuditEvent>(
+    let event = sqlx::query_as::<_, AuditEvent>(
         "INSERT INTO audit_events (org_id, actor_id, agent_id, action, object_type, object_id, detail)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING id, org_id, actor_id, agent_id, action, object_type, object_id, detail, at",
@@ -2576,7 +2576,137 @@ pub async fn record_audit(
     .bind(detail)
     .fetch_one(pool)
     .await
+    .map_err(PdmError::Db)?;
+    notify_audit(pool, &event).await;
+    Ok(event)
+}
+
+/// Postgres channel that carries an [`AuditHint`] for every new audit row. The API listens on it
+/// and passes the hints to `GET /events/stream`, so rows written by a separate worker process
+/// (`PDM_WORKER=0`) reach the browsers too.
+pub const AUDIT_CHANNEL: &str = "pdm_events";
+
+/// What changed, without the details: enough for a client to know what to refetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditHint {
+    pub audit_id: i64,
+    pub org_id: Uuid,
+    pub actor_id: Option<Uuid>,
+    pub action: String,
+    pub object_type: String,
+    pub object_id: Option<Uuid>,
+    /// The item or laser nest the change concerns, when the row's detail names one (a job's row
+    /// is about the job, but an item page or the nest list wants to know).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nest_id: Option<Uuid>,
+}
+
+impl AuditHint {
+    pub fn of(ev: &AuditEvent) -> Self {
+        let id_in_detail = |key: &str| {
+            ev.detail
+                .as_ref()
+                .and_then(|d| d.get(key))
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+        };
+        Self {
+            audit_id: ev.id,
+            org_id: ev.org_id,
+            actor_id: ev.actor_id,
+            action: ev.action.clone(),
+            object_type: ev.object_type.clone(),
+            object_id: ev.object_id,
+            item_id: id_in_detail("item_id"),
+            nest_id: id_in_detail("nest_id"),
+        }
+    }
+}
+
+/// Tell listeners about a new audit row. Best effort: the change and its audit row are saved
+/// already, so a failed notification is logged and never fails the caller (clients catch up from
+/// `GET /audit?since=` when they reconnect).
+async fn notify_audit(pool: &PgPool, ev: &AuditEvent) {
+    let payload = match serde_json::to_string(&AuditHint::of(ev)) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, audit_id = ev.id, "audit hint not encoded");
+            return;
+        }
+    };
+    if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(AUDIT_CHANNEL)
+        .bind(payload)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(error = %e, audit_id = ev.id, "audit hint not sent");
+    }
+}
+
+/// Audit rows after `since` (oldest first, at most `limit`), including background-job rows: what
+/// a client missed while it was not connected to `GET /events/stream`.
+pub async fn list_audit_since(
+    pool: &PgPool,
+    org_id: Uuid,
+    since: i64,
+    limit: u32,
+) -> Result<Vec<AuditEvent>, PdmError> {
+    sqlx::query_as::<_, AuditEvent>(
+        "SELECT id, org_id, actor_id, agent_id, action, object_type, object_id, detail, at
+           FROM audit_events
+          WHERE org_id = $1 AND id > $2
+          ORDER BY id
+          LIMIT $3",
+    )
+    .bind(org_id)
+    .bind(since)
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await
     .map_err(PdmError::Db)
+}
+
+/// The organization's highest audit row id (0 when it has none): a starting point for
+/// `GET /audit?since=`. By id, not time, so a clock step on the host cannot hide rows.
+pub async fn last_audit_id(pool: &PgPool, org_id: Uuid) -> Result<i64, PdmError> {
+    sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM audit_events WHERE org_id = $1")
+        .bind(org_id)
+        .fetch_one(pool)
+        .await
+        .map_err(PdmError::Db)
+}
+
+/// Whether a token still lets its holder in, for a long-lived request that passed the auth check
+/// when it started: `false` once it is deleted (signed out), expired, its sign-in ended or its
+/// user was deactivated. Reads only; the next ordinary request deletes an ended sign-in.
+pub async fn token_still_valid(
+    pool: &PgPool,
+    token_id: Uuid,
+    idle_minutes: i32,
+    lifetime_minutes: i32,
+) -> Result<bool, PdmError> {
+    let ok: Option<bool> = sqlx::query_scalar(
+        "SELECT (t.expires_at IS NULL OR t.expires_at > now())
+                AND COALESCE(u.active, true)
+                AND NOT (t.kind = 'web'
+                     AND (($2::int > 0
+                           AND COALESCE(t.last_used_at, t.created_at)
+                               < now() - make_interval(mins => $2::int))
+                       OR ($3::int > 0
+                           AND t.created_at < now() - make_interval(mins => $3::int))))
+           FROM api_tokens t LEFT JOIN users u ON u.id = t.user_id
+          WHERE t.id = $1",
+    )
+    .bind(token_id)
+    .bind(idle_minutes)
+    .bind(lifetime_minutes)
+    .fetch_optional(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    Ok(ok.unwrap_or(false))
 }
 
 pub async fn list_audit(
@@ -2591,10 +2721,12 @@ pub async fn list_audit(
          WHERE org_id = $1 {}
          ORDER BY at DESC
          LIMIT {}",
+        // Background jobs record when they start and finish (for live updates); they stay out of
+        // the activity feeds, which list what people did.
         if object_id.is_some() {
             "AND object_id = $2"
         } else {
-            ""
+            "AND object_type <> 'job'"
         },
         limit
     );

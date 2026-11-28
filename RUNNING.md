@@ -56,10 +56,13 @@ Push to your registry with `docker push solvecraft-pdm:<tag>` after building.
 - **Refresh behavior (web UI V.01-29):** pages use manual refresh by default so
   background updates cannot reset drafts, previews, menus or scroll position.
   Use the Refresh button to reload the current view. **Auto-refresh: Off/On**
-  beside it is remembered in this browser. Opting in refreshes list views every
-  six seconds; item details, Settings, Administration, and open dialogs/editors
-  remain protected from timer-driven refreshes. Completed actions still update
-  their view normally.
+  beside it is remembered in this browser. Changes made elsewhere arrive as they
+  happen (live updates): with Auto-refresh off, a bar under the top bar says who
+  changed something and offers Refresh; opting in refreshes list views when
+  something they show changes (every six seconds where live updates are not
+  available). Item details, Settings, Administration, and open dialogs/editors
+  remain protected from automatic refreshes and show the bar instead. Completed
+  actions still update their view normally.
 
 - Sign in (email/password) or connect with a `pdm_…` token. Sessions persist
   across refreshes; Sign out revokes the token.

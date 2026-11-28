@@ -80,14 +80,50 @@ Signing in with a password (the portal or the Onshape panel, `POST /auth/login`)
 sign-in. It ends after `PDM_SESSION_IDLE_MINUTES` without a request (default 120) or
 `PDM_SESSION_LIFETIME_MINUTES` after it was made (default 720, 12 hours), whichever comes first,
 and the portal asks the person to sign in again. Signing out ends it at once. Two things count
-as use besides clicking around: the portal's optional auto-refresh, whenever it refreshes, and
-an open web editor (SolidCraft or another CAD editor) in a visible tab, so modelling for a long
+as use besides clicking around: the portal's optional auto-refresh, whenever it refreshes (a page
+that only receives [live updates](#live-updates) does not count), and an open web editor (SolidCraft or another CAD editor) in a visible tab, so modelling for a long
 time doesn't end the sign-in; the lifetime still applies. If a sign-in ends while a web editor is
 open, the portal stays on the editor so the model can still be downloaded. A value that is not a
 whole number of minutes keeps the default.
 
 CAD connectors, agents and scripts should use an API token, which an administrator creates for
 a user in Administration (or with `pdm-cli create-token`): API tokens never expire on their own.
+
+### Live updates
+
+Open portal pages hear about changes as they happen, over `GET /events/stream` (Server-Sent
+Events): every change recorded in the activity log (items, versions, projects, approvals, users,
+laser nests) and every background job that starts, finishes or fails sends a short hint saying
+what changed, not the details. With Auto-refresh on, list views refresh when a change concerns
+them (at most once every three seconds); otherwise, and on item and administration pages, a bar
+names who changed it and offers Refresh. Pages whose changes are not recorded in the activity log
+yet (settings, the tool library, machines, post-processors, sheet-metal standards, system) keep
+the six-second Auto-refresh. Jobs run by a separate worker process (`PDM_WORKER=0` on the API)
+reach the browsers too, through PostgreSQL `LISTEN`/`NOTIFY`; each API process keeps one database
+connection for this. That connection must reach PostgreSQL directly or through a session-mode
+pooler: a transaction-mode pooler (PgBouncer's `pool_mode = transaction`) drops notifications.
+While the listener is not connected the stream answers 503, and pages fall back to refreshing
+every six seconds when Auto-refresh is on.
+
+Behind a reverse proxy the stream must be passed through unbuffered and allowed to stay open. The
+server sends `X-Accel-Buffering: no`, which Nginx honors, and a heartbeat every 25 seconds, so any
+read timeout of a minute or more is enough. To set it explicitly in Nginx:
+
+```nginx
+location /events/stream {
+    proxy_pass http://pdm:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 1h;
+}
+```
+
+Keep response compression off for this path: a compressing proxy holds events back. Over plain
+HTTP/1.1 a browser opens only six connections per server, so the portal lets the stream of a tab
+that stays hidden go after 30 seconds and catches up when the tab is shown again; HTTP/2 (which
+most TLS proxies speak to browsers) lifts that limit.
 
 ### External Postgres
 

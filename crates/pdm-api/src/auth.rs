@@ -115,8 +115,9 @@ pub async fn auth_middleware(
         None => None,
     };
 
-    // Fire-and-forget last-used update; do not fail the request on it.
-    {
+    // Fire-and-forget last-used update; do not fail the request on it. Opening the live-updates
+    // stream is not use: a page left open must not keep an idle sign-in alive by reconnecting.
+    if path != "/events/stream" {
         let pool = state.pool.clone();
         let id = tok.id;
         tokio::spawn(async move {

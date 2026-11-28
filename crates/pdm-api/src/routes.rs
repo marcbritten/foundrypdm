@@ -2680,11 +2680,12 @@ pub async fn search(
 
 // ── Audit ───────────────────────────────────────────────────────────────
 
-/// GET /audit?item=...&limit=...
+/// GET /audit?item=...&limit=...  (or ?since=<audit id>: what a live page missed)
 #[derive(Deserialize)]
 pub struct AuditQuery {
     pub item: Option<Uuid>,
     pub limit: Option<u32>,
+    pub since: Option<i64>,
 }
 
 pub async fn audit(
@@ -2693,6 +2694,17 @@ pub async fn audit(
     Query(q): Query<AuditQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
+    if let Some(since) = q.since {
+        // Oldest first, background jobs included; `last_id` is the cursor for the next call.
+        let limit = q.limit.unwrap_or(100).clamp(1, 200);
+        let events = pdm_db::list_audit_since(&state.pool, org, since, limit).await?;
+        let last_id = pdm_db::last_audit_id(&state.pool, org).await?;
+        let has_more = events.len() >= limit as usize;
+        return Ok(
+            serde_json::json!({ "events": events, "last_id": last_id, "has_more": has_more })
+                .into(),
+        );
+    }
     let limit = q.limit.unwrap_or(50).min(200);
     let events = pdm_db::list_audit(&state.pool, org, q.item, limit).await?;
     Ok(serde_json::json!({ "events": events }).into())
@@ -6182,6 +6194,7 @@ pub fn api_router() -> Router<AppState> {
         .route("/jobs/{id}", get(get_job_handler))
         .route("/search", get(search))
         .route("/audit", get(audit))
+        .route("/events/stream", get(crate::events::stream))
         .route("/home", get(home))
         .route("/users", get(list_users_handler).post(create_user_handler))
         .route("/users/invite", post(invite_user_handler))
