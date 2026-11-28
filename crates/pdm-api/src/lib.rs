@@ -26,6 +26,7 @@ mod events;
 mod mail;
 mod onshape;
 mod portal;
+mod reading_font;
 mod release_approval;
 mod routes;
 mod session;
