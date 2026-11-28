@@ -76,6 +76,14 @@ test("the sidebar has five folding groups in today's order, each a header button
   assert.deepEqual(rule(".sb-link[hidden]").get("display"), "none", "the hidden attribute wins over the link's flex layout");
 });
 
+test("every sidebar link and group header has its own icon from the sprite, so the icon rail reads on its own", () => {
+  const icons = [...NAV.matchAll(/<(?:a class="sb-link[^"]*"[^>]*|button type="button" class="sb-head"[^>]*)><span class="sb-ic"><svg class="icon"><use href="#(ic-[a-z-]+)"\/>/g)].map(m => m[1]);
+  assert.equal(icons.length, 21, "16 links and 5 group headers");
+  assert.deepEqual([...new Set(icons)], icons, "no two share an icon");
+  for (const id of icons) assert.match(indexHtml, new RegExp("<symbol id=\"" + id + "\" viewBox=\"[0-9 ]+\"><path fill=\"currentColor\" stroke=\"none\" d=\""), id);
+  assert.ok(indexHtml.includes("<!-- Icons: Font Awesome Free 7.3.1 by Fonticons, Inc. (https://fontawesome.com), CC BY 4.0"), "the credit sits next to the sprite");
+});
+
 test("group labels are sentence case: no uppercase or letter-spaced text in the sidebar", () => {
   assert.doesNotMatch(NAV, /sb-label/);
   const sidebarRules = RULES.filter(r => /\.sb-|#sidebar|\.menubtn/.test(r.selector));
