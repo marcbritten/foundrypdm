@@ -23,9 +23,12 @@ function isHostAdmin(){
   if (!ME) return false;
   if (typeof ME.host_admin === "boolean") return ME.host_admin;
   const u = ME.user; return !!(u && u.is_host_admin && u.active && u.role === "admin"); }
-function hostOnlyNote(){ return "<p class='dim host-only'>" + (isHostAdmin()
+function hostOnlyNote(h){ return "<p class='dim host-only'>" + ((h === undefined ? isHostAdmin() : h)
   ? "This applies to the whole server, not just this organization."
   : "Only a host admin can change this. It applies to the whole server, not just this organization.") + "</p>"; }
+// What describes the whole server (infrastructure, server-wide counts, the renderer's hardware)
+// is shown to host admins only; GET /system-info leaves it out for everyone else.
+function hostSeeNote(what){ return "<p class='dim host-only'>Only a host admin can see " + (what || "this") + ".</p>"; }
 // Account buttons on a host admin's row: only another host admin may use them.
 function hostLock(u){ return u && u.is_host_admin && !isHostAdmin()
   ? " disabled title='Only a host admin can change a host admin&#39;s account'" : ""; }
@@ -5434,7 +5437,9 @@ function viewSystem(v){
       const row = (k, val) =>
         "<tr><td class='dim'>" + k + "</td><td class='mono'>" +
         (val == null ? "—" : esc(String(val))) + "</td></tr>";
-      const hostDis = isHostAdmin() ? "" : " disabled";
+      // The server's answer decides, so a stale role in this browser shows nothing extra.
+      const host = d.host_details === true;
+      const hostDis = host ? "" : " disabled";
       const pdm = d.pdm || {}, cli = d.solidcraft_cli || {}, pg = d.postgres || {},
             st = d.storage || {}, c = d.counts || {}, gpu = d.gpu || {};
       const survey = gpu.survey || {};
@@ -5452,30 +5457,32 @@ function viewSystem(v){
           row("Build", pdm.build) +
           "<tr><td class='dim'>Update</td><td class='mono'>" +
             (pdm.update_available
-              ? "<a href='" + esc(pdm.releases_url || "#") + "' target='_blank' rel='noopener'>available " +
-                esc(String(pdm.latest != null ? pdm.latest : "?")) + "</a>"
+              ? (pdm.releases_url
+                ? "<a href='" + esc(pdm.releases_url) + "' target='_blank' rel='noopener'>available " +
+                  esc(String(pdm.latest != null ? pdm.latest : "?")) + "</a>"
+                : "available " + esc(String(pdm.latest != null ? pdm.latest : "?")))
               : (pdm.latest != null ? "up to date" : "—")) +
           "</td></tr>" +
           row("Package version", pdm.version) +
           row("Git commit", pdm.commit) + row("Built at", pdm.built_at) +
-          row("Uptime", fmtUptime(d.uptime_seconds)) + "</table></div>" +
+          (host ? row("Uptime", fmtUptime(d.uptime_seconds)) : "") + "</table></div>" +
         "<div class='card'><h2 class='sec'>SolidCraft CAD CLI</h2><table>" +
           "<tr><td class='dim'>Version</td><td class='mono'>" + cliLine + "</td></tr>" +
-          row("Binary path", cli.path) +
-          row("GitHub latest", cad.latest || "—") +
+          (host ? row("Binary path", cli.path) : "") +
+          (host ? row("GitHub latest", cad.latest || "—") : "") +
           "</table>" +
           (cli.error ? "<p class='dim errtext'>" + esc(cli.error) + "</p>" : "") +
           "<p class='dim'><a href='https://github.com/tangency-labs/solidcraft/releases/latest' target='_blank' rel='noreferrer'>tangency-labs/solidcraft</a></p>" +
           "<div class='row'><button id='cli-upd' class='primary'" + hostDis + ">" +
-            (cad.update_available ? "Update CLI" : "Check / reinstall CLI") + "</button></div>" + hostOnlyNote() +
+            (cad.update_available ? "Update CLI" : "Check / reinstall CLI") + "</button></div>" + hostOnlyNote(host) +
           "</div>" +
         "<div class='card'><h2 class='sec'>Dutchman (feature-tree converter)</h2><table>" +
           "<tr><td class='dim'>Installed</td><td class='mono'>" +
             (dm.installed
               ? esc(String(dm.installed)) + (dm.info && dm.info.tag ? " · " + esc(String(dm.info.channel)) : "")
-              : "<span class='dim'>" + (dm.path ? "not installed — pulled on demand" : "—") + "</span>") +
+              : "<span class='dim'>" + (dm.settings ? "not installed — pulled on demand" : "—") + "</span>") +
           "</td></tr>" +
-          row("Binary path", dm.path) +
+          (host ? row("Binary path", dm.path) : "") +
           "</table>" +
           (dm.error ? "<p class='dim errtext'>" + esc(dm.error) + "</p>" : "") +
           "<p class='dim'>Decodes native CAD (Fusion, Inventor, SolidWorks, FreeCAD, CATIA, Rhino, " +
@@ -5493,7 +5500,7 @@ function viewSystem(v){
           "</select></div>" +
           "<div class='row'><button id='dm-upd' class='primary'" + hostDis + ">" +
             (dm.update_available ? "Download the referenced release" : "Check / reinstall Dutchman") +
-            "</button></div>" + hostOnlyNote() +
+            "</button></div>" + hostOnlyNote(host) +
           "<h2 class='sec' style='margin-top:12px'>Conversion settings (this org)</h2>" +
           "<div class='row'><label for='dm-preset'>Preset</label>" +
           "<select id='dm-preset'>" + ["fast","standard","full"].map(p =>
@@ -5517,7 +5524,7 @@ function viewSystem(v){
           "<tr><td class='dim'>Installed</td><td class='mono'>" +
             (scweb.installed ? esc(String(scweb.installed)) : "<span class='dim'>not bundled</span>") +
           "</td></tr>" +
-          row("GitHub latest", scweb.latest) +
+          (host ? row("GitHub latest", scweb.latest) : "") +
           "</table>" +
           (scweb.error ? "<p class='dim errtext'>" + esc(scweb.error) + "</p>" : "") +
           "<p class='dim'>Serves “Edit in SolidCraft web” from the portal origin. " +
@@ -5526,24 +5533,31 @@ function viewSystem(v){
               : "Auto-update is off (PDM_WEB_UPDATE=0).") +
           " Open editors pick up a new build on the next open.</p>" +
           "<div class='row'><button id='scweb-upd' class='primary'" + hostDis + ">" +
-            (scweb.update_available ? "Update web editor" : "Check / reinstall web editor") + "</button></div>" + hostOnlyNote() +
+            (scweb.update_available ? "Update web editor" : "Check / reinstall web editor") + "</button></div>" + hostOnlyNote(host) +
           "</div>" +
         "<div class='card'><h2 class='sec'>Preview renderer</h2><table>" +
           row("Policy", gpu.policy) +
-          row("Lands on", lands) +
-          row("Adapter", chosen.name || chosen.adapter || chosen.info || null) +
-          row("Backends", Array.isArray(survey.backends) ? survey.backends.join(", ") : survey.backends) +
+          (host
+            ? row("Lands on", lands) +
+              row("Adapter", chosen.name || chosen.adapter || chosen.info || null) +
+              row("Backends", Array.isArray(survey.backends) ? survey.backends.join(", ") : survey.backends)
+            : "") +
           "</table>" +
+          (host ? "" : hostSeeNote("which hardware the renderer uses")) +
           (gpu.error ? "<p class='dim errtext'>" + esc(gpu.error) + "</p>" : "") + "</div>" +
-        "<div class='card'><h2 class='sec'>Infrastructure</h2><table>" +
-          row("PostgreSQL", pg.version ? pg.version + (pg.ok === false ? " (offline)" : "") : "—") +
-          row("Object storage", st.kind || "—") +
-          row("Storage endpoint", st.endpoint || "—") +
-          row("Bucket", st.bucket || "—") + "</table></div>" +
+        "<div class='card'><h2 class='sec'>Infrastructure</h2>" +
+          (host
+            ? "<table>" +
+              row("PostgreSQL", pg.version ? pg.version + (pg.ok === false ? " (offline)" : "") : "—") +
+              row("Object storage", st.kind || "—") +
+              row("Storage endpoint", st.endpoint || "—") +
+              row("Bucket", st.bucket || "—") + "</table>"
+            : hostSeeNote()) + "</div>" +
         "<div class='card'><h2 class='sec'>Counts</h2><table>" +
-          row("Organizations", c.organizations) + row("Users", c.users) +
+          (host ? row("Organizations", c.organizations) + row("Users", c.users) : "") +
           row("Projects (this org)", c.projects) + row("Items (this org)", c.items) +
-          row("Files (this org)", c.files) + row("Revisions (this org)", c.revisions) + "</table></div>" +
+          row("Files (this org)", c.files) + row("Revisions (this org)", c.revisions) + "</table>" +
+          (host ? "" : hostSeeNote("the server-wide counts")) + "</div>" +
         "</div>";
       $("sys-refresh").onclick = load;
       const up = $("cli-upd");

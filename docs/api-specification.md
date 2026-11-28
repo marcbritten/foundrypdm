@@ -19,6 +19,14 @@ Base URL in the dev image: `http://<host>:8080`.
   `POST /users/{id}/tokens` never expire on their own.
 - `POST /auth/logout` — invalidate the current token.
 - `GET /me` — the signed-in identity; `host_admin: true` for a host admin.
+- `GET /system-info` — the System page. Everyone signed in: `pdm` (build, release check),
+  `solidcraft_cli` `{ present, version }`, `gpu` `{ policy }` and their own organization's
+  `counts` (projects, items, files, revisions). Host admins also get `postgres`, `storage`,
+  `uptime_seconds`, server-wide `counts.organizations` / `counts.users`, `pdm.releases_url`, the
+  CLI `path` and `error`, and the GPU `survey` and `error` (only their request runs it).
+  `host_details` says which. For everyone but host admins, `GET /settings/cad-cli`,
+  `/settings/dutchman` and `/settings/solidcraft-web` return `path` / `dir` and `latest` as
+  `null`, list only the current Dutchman channel, and make no release lookup on GitHub.
 - `GET /me/settings`, `PUT /me/settings` — per-user jsonb payload (`{ payload }`). SolidCraft
   syncs its Prefs here.
 

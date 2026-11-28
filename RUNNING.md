@@ -204,7 +204,7 @@ docker exec docker-pdm-worker-1 /usr/local/bin/solidcraft-cli --version
 The image bakes the CLI's provenance into labels (`io.solidcraft.cli.version`,
 `io.solidcraft.cli.fork-revision`, `io.solidcraft.cli.upstream-revision`);
 `GET /system-info` reports the running CLI's `--version` under
-`solidcraft_cli`. Note the version line: the CAD fork reports `0.27.1` while
+`solidcraft_cli` (its path only to host admins). Note the version line: the CAD fork reports `0.27.1` while
 carrying features (Inventor editable-history import) that postdate the
 upstream `0.29.x` releases it syncs from — compare behaviour, not the number.
 

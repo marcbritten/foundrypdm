@@ -53,7 +53,7 @@ test("the System page disables the shared update controls for non-host admins", 
   for (const id of ["cli-upd", "dm-upd", "scweb-upd"])
     assert.match(sys, new RegExp("id='" + id + "' class='primary'\" \\+ hostDis \\+"), id);
   assert.match(sys, /<select id='dm-channel'" \+ hostDis \+/);
-  assert.equal((sys.match(/hostOnlyNote\(\)/g) || []).length, 3);
+  assert.equal((sys.match(/hostOnlyNote\(host\)/g) || []).length, 3);
 });
 
 const users = [

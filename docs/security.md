@@ -50,6 +50,11 @@
     replace the tokens (after an upgrade too).
   - Recovery when no host admin can sign in: `pdm-cli host-admin grant --email … [--org …]`;
     `pdm-cli host-admin list` shows who holds it.
+  - What describes the whole server is shown to host admins only: on the System page and
+    `GET /system-info`, the infrastructure (PostgreSQL, object storage), uptime, server-wide
+    organization and user counts, binary and build paths on the host, and the GPU survey
+    (which runs the CAD CLI on the host). Everyone else sees the PDM build, the CAD CLI
+    version, the GPU policy and their own organization's counts.
 
 ## Data & storage
 - **Content-addressed, immutable blobs** (SHA-256). Integrity is verified on check-in

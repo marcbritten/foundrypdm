@@ -312,13 +312,18 @@ pub async fn version(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(info)
 }
 
-/// GET /system-info — server + bundled SolidCraft CLI + infrastructure details for
-/// the web UI "System" panel. Authenticated; org-scoped counts are for the caller's org.
+/// GET /system-info — what the web UI "System" panel shows. Every signed-in user gets the
+/// PDM build, whether the SolidCraft CAD CLI is there and its version, the GPU policy and their
+/// own organization's counts. Host admins also get what describes the whole server: the
+/// infrastructure (PostgreSQL, object storage), uptime, server-wide organization and user
+/// counts, the CLI path and errors, and the GPU survey (which runs the CLI on the host).
+/// `host_details` says which of the two the caller got.
 pub async fn system_info(
     State(state): State<AppState>,
     Extension(authed): Extension<Authed>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let org = require_org(&authed);
+    let host = caller_is_host_admin(&authed);
 
     // Bundled SolidCraft CAD CLI — the engine the PDM worker drives for analysis,
     // previews and CAD restatement. Report its path and `--version`.
@@ -344,33 +349,6 @@ pub async fn system_info(
         }
     }
 
-    // PostgreSQL version (e.g. "PostgreSQL 16.3 (Debian …)" → "PostgreSQL 16.3").
-    let pg_raw = sqlx::query_scalar::<_, String>("SELECT version()")
-        .fetch_one(&state.pool)
-        .await
-        .ok();
-    let pg_version = pg_raw
-        .as_deref()
-        .map(|v| v.split_whitespace().take(2).collect::<Vec<_>>().join(" "));
-
-    // Object storage backend (MinIO/S3 or local dir) from env.
-    let storage_kind = if std::env::var("PDM_STORAGE_LOCAL").is_ok() {
-        "local"
-    } else {
-        "minio/s3"
-    };
-    let storage_endpoint = std::env::var("PDM_S3_ENDPOINT").ok();
-    let storage_bucket = std::env::var("PDM_S3_BUCKET").ok();
-
-    // Counts: global for orgs/users, org-scoped for the caller's data.
-    let orgs = sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM organizations")
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(0);
-    let users = sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM users")
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(0);
     let projects =
         sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM projects WHERE org_id = $1")
             .bind(org)
@@ -399,15 +377,66 @@ pub async fn system_info(
     .unwrap_or(0);
 
     // The release-check result, so the System panel's Update row can link out.
-    let update = state.update.read().await;
-    let mut pdm = version_info();
-    pdm["latest"] = serde_json::json!(update.latest);
-    pdm["update_available"] = serde_json::json!(update.update_available);
-    pdm["releases_url"] = serde_json::json!(pdm_update::releases_page_url());
+    let pdm = {
+        let update = state.update.read().await;
+        let mut pdm = version_info();
+        pdm["latest"] = serde_json::json!(update.latest);
+        pdm["update_available"] = serde_json::json!(update.update_available);
+        pdm["releases_url"] = serde_json::json!(pdm_update::releases_page_url());
+        pdm
+    };
 
     let gpu_policy = pdm_db::get_gpu_policy(&state.pool, org)
         .await
         .unwrap_or_else(|_| "auto".into());
+
+    if !host {
+        // The update source may be a private host; only host admins act on updates.
+        let mut pdm = pdm;
+        if let Some(o) = pdm.as_object_mut() {
+            o.remove("releases_url");
+        }
+        let version = cli["version"].as_str().and_then(plain_version);
+        return Ok(serde_json::json!({
+            "host_details": false,
+            "pdm": pdm,
+            "solidcraft_cli": { "present": cli["present"], "version": version },
+            "gpu": { "policy": gpu_policy },
+            "counts": {
+                "projects": projects, "items": items, "files": files, "revisions": revisions
+            }
+        })
+        .into());
+    }
+
+    // PostgreSQL version (e.g. "PostgreSQL 16.3 (Debian …)" → "PostgreSQL 16.3").
+    let pg_raw = sqlx::query_scalar::<_, String>("SELECT version()")
+        .fetch_one(&state.pool)
+        .await
+        .ok();
+    let pg_version = pg_raw
+        .as_deref()
+        .map(|v| v.split_whitespace().take(2).collect::<Vec<_>>().join(" "));
+
+    // Object storage backend (MinIO/S3 or local dir) from env.
+    let storage_kind = if std::env::var("PDM_STORAGE_LOCAL").is_ok() {
+        "local"
+    } else {
+        "minio/s3"
+    };
+    let storage_endpoint = std::env::var("PDM_S3_ENDPOINT").ok();
+    let storage_bucket = std::env::var("PDM_S3_BUCKET").ok();
+
+    // Server-wide counts.
+    let orgs = sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM organizations")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+    let users = sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM users")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+
     let mut gpu = serde_json::json!({ "policy": gpu_policy, "survey": serde_json::Value::Null });
     if std::path::Path::new(&cli_path).exists() {
         match Command::new(&cli_path)
@@ -437,6 +466,7 @@ pub async fn system_info(
     }
 
     Ok(serde_json::json!({
+        "host_details": true,
         "pdm": pdm,
         "solidcraft_cli": cli,
         "gpu": gpu,
@@ -542,6 +572,28 @@ pub(crate) fn require_admin(authed: &Authed) -> Result<&User, AppError> {
 /// A host admin: an active admin with `is_host_admin` (see `pdm_db::set_host_admin`).
 fn is_host_admin(user: &User) -> bool {
     user.is_host_admin && user.active && user.role == "admin"
+}
+
+/// Whether the caller is a host admin (service accounts are not).
+fn caller_is_host_admin(authed: &Authed) -> bool {
+    authed.user.as_ref().is_some_and(is_host_admin)
+}
+
+/// Where a binary or build lives on the host is shown to host admins only.
+fn host_path(authed: &Authed, path: String) -> Option<String> {
+    caller_is_host_admin(authed).then_some(path)
+}
+
+/// A version line as everyone may see it ("solidcraft-cli 0.27.1"); anything else, such as a
+/// loader error naming paths on the host, is left out.
+fn plain_version(line: &str) -> Option<String> {
+    let line = line.trim();
+    let ok = (1..=64).contains(&line.len())
+        && line.bytes().any(|b| b.is_ascii_digit())
+        && line
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b" ._+-()".contains(&b));
+    ok.then(|| line.to_string())
 }
 
 /// Host-admin only: for what the whole server shares (the CAD CLI and web editor builds on
@@ -1026,7 +1078,7 @@ pub async fn onshape_import_request(
 
 /// GET /settings/cad-cli — installed SolidCraft CLI vs GitHub latest.
 pub async fn get_cad_cli(
-    Extension(_authed): Extension<Authed>,
+    Extension(authed): Extension<Authed>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let path = std::env::var("PDM_SOLVECRAFT_CLI")
         .unwrap_or_else(|_| pdm_update::CAD_CLI_DEFAULT_PATH.to_string());
@@ -1037,17 +1089,22 @@ pub async fn get_cad_cli(
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string());
-    let latest = pdm_update::fetch_cad_cli_latest()
-        .await
-        .ok()
-        .map(|r| r.tag_name);
+    // The release lookup goes to GitHub; only host admins, who can act on it, trigger it.
+    let latest = if caller_is_host_admin(&authed) {
+        pdm_update::fetch_cad_cli_latest()
+            .await
+            .ok()
+            .map(|r| r.tag_name)
+    } else {
+        None
+    };
     let update_available = match (&latest, &installed) {
         (Some(tag), Some(cur)) => pdm_update::is_newer(tag, cur),
         (Some(_), None) => true,
         _ => false,
     };
     Ok(serde_json::json!({
-        "path": path,
+        "path": host_path(&authed, path),
         "installed": installed,
         "latest": latest,
         "update_available": update_available,
@@ -1086,10 +1143,17 @@ pub async fn get_dutchman(
     };
     let info = pdm_update::read_dutchman_info(std::path::Path::new(&path));
     let settings = pdm_db::get_dutchman_settings(&state.pool, org).await?;
-    let latest = pdm_update::fetch_dutchman_latest()
-        .await
-        .ok()
-        .map(|r| r.tag_name);
+    // Release and channel lookups go to GitHub; only host admins, who pick the channel,
+    // trigger them. Everyone else gets the current channel as the only option.
+    let host = caller_is_host_admin(&authed);
+    let latest = if host {
+        pdm_update::fetch_dutchman_latest()
+            .await
+            .ok()
+            .map(|r| r.tag_name)
+    } else {
+        None
+    };
     // A due update: no binary yet, or the installed build came from another
     // channel than the org's (the boot/interval loop chases marker changes).
     let update_available = !std::path::Path::new(&path).exists()
@@ -1097,17 +1161,21 @@ pub async fn get_dutchman(
             .as_ref()
             .map(|i| i.channel != settings.channel)
             .unwrap_or(true);
-    let channels = pdm_update::dutchman_channels().await.map_or_else(
+    let channels = if !host {
+        serde_json::json!([{ "value": settings.channel, "label": settings.channel }])
+    } else {
+        pdm_update::dutchman_channels().await.map_or_else(
         |_| serde_json::json!([{ "value": "latest", "label": format!("Latest stable ({})", latest.as_deref().unwrap_or("?")) }, { "value": "nightly", "label": "Nightly (includes unreleased work)" }]),
         |opts| {
             serde_json::json!(opts
                 .into_iter()
                 .map(|(value, label)| serde_json::json!({ "value": value, "label": label }))
                 .collect::<Vec<_>>())
-        },
-    );
+            },
+        )
+    };
     Ok(serde_json::json!({
-        "path": path,
+        "path": host_path(&authed, path),
         "installed": installed,
         "info": info,
         "settings": settings,
@@ -1233,22 +1301,27 @@ fn solidcraft_web_dir() -> Option<std::path::PathBuf> {
 /// GET /settings/solidcraft-web — the installed "Edit in SolidCraft web" build
 /// vs the newest SolidCraft release on GitHub.
 pub async fn get_solidcraft_web(
-    Extension(_authed): Extension<Authed>,
+    Extension(authed): Extension<Authed>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let dir = solidcraft_web_dir();
     let installed = dir
         .as_ref()
         .and_then(|d| pdm_update::installed_solidcraft_web_version(d));
-    let latest = pdm_update::fetch_cad_cli_latest()
-        .await
-        .ok()
-        .map(|r| r.tag_name);
+    // The release lookup goes to GitHub; only host admins, who can act on it, trigger it.
+    let latest = if caller_is_host_admin(&authed) {
+        pdm_update::fetch_cad_cli_latest()
+            .await
+            .ok()
+            .map(|r| r.tag_name)
+    } else {
+        None
+    };
     let update_available = match (&latest, &installed) {
         (Some(tag), Some(cur)) => pdm_update::is_newer(tag, cur),
         _ => false,
     };
     Ok(serde_json::json!({
-        "dir": dir.map(|d| d.to_string_lossy().into_owned()),
+        "dir": dir.and_then(|d| host_path(&authed, d.to_string_lossy().into_owned())),
         "installed": installed,
         "latest": latest,
         "update_available": update_available,
