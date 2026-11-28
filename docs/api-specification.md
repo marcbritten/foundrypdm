@@ -65,6 +65,10 @@ Base URL in the dev image: `http://<host>:8080`.
   and `active: true` to enable it. Disabled users cannot sign in or authenticate
   with existing tokens. Disabling or demoting the last active administrator
   returns `409 Conflict`; this constraint also applies to concurrent updates.
+- `GET /settings/release-approval` → `{ require_approval_on_release }` (any member; default `false`).
+  `PUT /settings/release-approval` `{ require_approval_on_release: bool }` (admin) — when `true`,
+  `POST /items/{id}/release` opens an approval request and puts the item in review instead of
+  releasing at once; the revision is made when the request is approved.
 
 ### Branding (`crates/pdm-api/src/branding.rs`)
 An organization's display name, logo and color overrides, which replace the "Foundry PDM" mark

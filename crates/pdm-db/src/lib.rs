@@ -563,6 +563,26 @@ pub async fn set_gpu_policy(pool: &PgPool, org_id: Uuid, policy: &str) -> Result
     Ok(policy.to_string())
 }
 
+/// Set a boolean flag in the org's `settings` JSONB. It is stored as a JSON boolean, which
+/// [`org_setting_bool`] reads back as the same value.
+pub async fn set_org_setting_bool(
+    pool: &PgPool,
+    org_id: Uuid,
+    key: &str,
+    value: bool,
+) -> Result<(), PdmError> {
+    sqlx::query(
+        "UPDATE organizations SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), ARRAY[$1::text], to_jsonb($2::bool), true) WHERE id = $3",
+    )
+    .bind(key)
+    .bind(value)
+    .bind(org_id)
+    .execute(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    Ok(())
+}
+
 /// Read a boolean flag from the org's `settings` JSONB (missing → false).
 pub async fn org_setting_bool(pool: &PgPool, org_id: Uuid, key: &str) -> Result<bool, PdmError> {
     // The org row always exists; the flag itself may be missing (NULL → false).

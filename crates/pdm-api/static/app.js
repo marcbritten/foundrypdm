@@ -4280,6 +4280,43 @@ function auditTable(list){
         "</pre></details></td></tr>";
     }).join("") + "</tbody></table>";
 }
+// Settings card: should a release wait for an approval? (org setting, default off).
+// It loads and saves on its own, so it never redraws the rest of the Settings page.
+async function releaseApprovalCard(box, canEdit){
+  if (!box) return;
+  box.innerHTML = "<h2 class='sec'>Release approval</h2><div class='card'><p class='dim'>Loading…</p></div>";
+  let on;
+  try { on = !!(await api("GET", "/settings/release-approval")).require_approval_on_release; }
+  catch(e){
+    box.innerHTML = "<h2 class='sec'>Release approval</h2><div class='card'><p>Release approval setting not loaded: " +
+      esc(e.message) + "</p><button id='ra-retry'>Try again</button></div>";
+    $("ra-retry").onclick = () => releaseApprovalCard(box, canEdit);
+    return;
+  }
+  box.innerHTML = "<h2 class='sec'>Release approval</h2><div class='card'>" +
+    "<label><input id='ra-on' type='checkbox'" + (on ? " checked" : "") + (canEdit ? "" : " disabled") +
+    " aria-describedby='ra-hint'> Releases need an approval first</label>" +
+    "<p class='dim' id='ra-hint'>When on, Release opens an approval request and puts the item in review. " +
+    "The request goes to every editor and admin unless the release names its approvers; the revision is made when it is approved. " +
+    "When off, Release makes the revision at once. Default: off.</p>" +
+    (canEdit ? "<div class='row'><button id='ra-save'>Save release approval</button>" +
+      "<span class='dim' id='ra-state' role='status'></span></div>" : "") + "</div>";
+  const cb = $("ra-on"), save = $("ra-save"), state = $("ra-state");
+  if (!save) return;
+  cb.onchange = () => { state.textContent = cb.checked !== on ? "Unsaved changes" : ""; };
+  save.onclick = async () => {
+    if (save.disabled) return;
+    save.disabled = cb.disabled = true; save.textContent = "Saving…";
+    try {
+      const d = await api("PUT", "/settings/release-approval", { require_approval_on_release: cb.checked });
+      on = !!d.require_approval_on_release;
+      cb.checked = on;
+      state.textContent = "Saved";
+    } catch(e){ toast("Release approval not saved: " + e.message, "err"); }
+    finally { save.disabled = cb.disabled = false; save.textContent = "Save release approval"; }
+  };
+}
+
 function genPassword(){
   const c = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
   let s = "";
@@ -4724,6 +4761,7 @@ async function viewSettings(v){
     "<b>category</b> below. Categories with no configured prefix fall back to the category name itself.</p>" +
     prefixTable(prefixes, canEdit) +
     "<p class='dim muted' style='margin-top:10px'>Existing items keep their part numbers; changing a prefix only affects newly auto-assigned ones.</p></div>" +
+    "<div id='release-approval'></div>" +
     "<h2 class='sec'>My account</h2>" +
     "<div class='card'><p class='dim'>Password for your account (" + esc(myName()) + "). " +
     "Org admins can also reset any user's password from Administration.</p>" +
@@ -4732,6 +4770,7 @@ async function viewSettings(v){
   if (addBtn) addBtn.onclick = () => addPrefix();
   const cpBtn = $("changepw");
   if (cpBtn) cpBtn.onclick = () => changePassword();
+  releaseApprovalCard($("release-approval"), canEdit);
   wireThemePicker(v);
   wireGpuPicker(v, canEdit);
   if ($("preview-style-save")) $("preview-style-save").onclick = async () => {
