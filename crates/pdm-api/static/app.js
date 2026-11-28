@@ -16,6 +16,19 @@ function bytes(n){ if (n==null||n==="") return "—"; n=Number(n); if (isNaN(n))
   if (n<1024) return n+" B"; if (n<1048576) return (n/1024).toFixed(1)+" KB"; return (n/1048576).toFixed(1)+" MB"; }
 function shaShort(s){ return s ? String(s).slice(0,12)+"…" : "—"; }
 function itemName(it){ return (it && (it.description || it.part_number)) || "unnamed item"; }
+// Host admins change what the whole server shares (CAD CLI, web editor, Dutchman channel,
+// GPU policy); everyone else sees those controls read-only with this note.
+// (GET /me reports host_admin; right after sign-in ME is built from the login reply's user.)
+function isHostAdmin(){
+  if (!ME) return false;
+  if (typeof ME.host_admin === "boolean") return ME.host_admin;
+  const u = ME.user; return !!(u && u.is_host_admin && u.active && u.role === "admin"); }
+function hostOnlyNote(){ return "<p class='dim host-only'>" + (isHostAdmin()
+  ? "This applies to the whole server, not just this organization."
+  : "Only a host admin can change this. It applies to the whole server, not just this organization.") + "</p>"; }
+// Account buttons on a host admin's row: only another host admin may use them.
+function hostLock(u){ return u && u.is_host_admin && !isHostAdmin()
+  ? " disabled title='Only a host admin can change a host admin&#39;s account'" : ""; }
 function myId(){ return ME && ME.user ? ME.user.id : null; }
 function myName(){ return ME && ME.user ? (ME.user.display_name || ME.user.email) : ""; }
 function isRole(min){ const r = ME && ME.user ? ME.user.role : "viewer";
@@ -4256,14 +4269,18 @@ function usersTable(list){
       "<td><span style='display:inline-flex;gap:8px;align-items:center'>" + userAv(u, !u.active) +
         "<span>" + esc(u.display_name || "—") + "</span></span></td>" +
       "<td class='mono'>" + esc(u.email) + "</td>" +
-      "<td>" + esc(u.role) + "</td>" +
+      "<td>" + esc(u.role) + (u.is_host_admin ? " <span class='dim'>· host admin</span>" : "") + "</td>" +
       "<td class='muted'>" + (u.active ? "Active" : "Disabled") + "</td>" +
        "<td class='muted'>" + String(u.created_at || "").slice(0, 10) + "</td>" +
-        "<td style='white-space:nowrap'><button class='small' data-edit='" + u.id + "'>edit</button> " +
-        "<button class='small' data-pw='" + u.id + "'>password</button> " +
-        "<button class='small' data-tok='" + u.id + "'>＋ token</button> " +
-        "<button class='small' data-active='" + u.id + "'>" + (u.active ? "Disable" : "Enable") + "</button></td>" +
-       "</tr>").join("") + "</tbody></table>";
+        "<td style='white-space:nowrap'><button class='small' data-edit='" + u.id + "'" + hostLock(u) + ">edit</button> " +
+        "<button class='small' data-pw='" + u.id + "'" + hostLock(u) + ">password</button> " +
+        "<button class='small' data-tok='" + u.id + "'" + hostLock(u) + ">＋ token</button> " +
+        "<button class='small' data-active='" + u.id + "'" + hostLock(u) + ">" + (u.active ? "Disable" : "Enable") + "</button>" +
+        (isHostAdmin() && u.active && u.role === "admin"
+          ? " <button class='small' data-hostadm='" + u.id + "'>" + (u.is_host_admin ? "Revoke host admin" : "Make host admin") + "</button>"
+          : "") + "</td>" +
+       "</tr>").join("") + "</tbody></table>" +
+    (list.some(u => hostLock(u)) ? "<p class='dim'>Only a host admin can change a host admin's account.</p>" : "");
 }
 function auditTable(list){
   if (!list.length) return "<div class='empty'>No audit events.</div>";
@@ -4339,6 +4356,20 @@ async function editUser(u){
     toast("User “" + u.email + "” updated", "ok");
     render(false);
   } catch(e){ toast("Edit user: " + e.message, "err"); }
+}
+// Grant or revoke host admin (shown to host admins only; the server refuses the last one).
+// The row's new label is the confirmation; errors stay in the dialog.
+async function toggleHostAdmin(u){
+  const grant = !u.is_host_admin, self = u.id === myId();
+  const ok = await openModal(grant ? "Make " + u.email + " a host admin?" : "Revoke host admin from " + u.email + "?", [],
+    { label: grant ? "Make host admin" : "Revoke host admin", busyLabel: grant ? "Granting…" : "Revoking…", danger: !grant,
+      onSubmit: async () => { await api("PUT", "/users/" + u.id + "/host-admin", { host_admin: grant }); return true; } },
+    "<p class='modal-note'>" + (grant
+      ? "Host admins change what every organization on this server shares (CAD CLI, web editor, Dutchman channel, GPU policy) and can make other admins host admins."
+      : "They stay an admin of their organization." + (self ? " This is your account: you will no longer be able to change server-wide settings." : "")) + "</p>");
+  if (!ok) return;
+  if (!grant && self) ME.host_admin = false;
+  render(false);
 }
 async function toggleUserActive(u){
   const active = !u.active;
@@ -4462,6 +4493,7 @@ function viewSystem(v){
       const row = (k, val) =>
         "<tr><td class='dim'>" + k + "</td><td class='mono'>" +
         (val == null ? "—" : esc(String(val))) + "</td></tr>";
+      const hostDis = isHostAdmin() ? "" : " disabled";
       const pdm = d.pdm || {}, cli = d.solidcraft_cli || {}, pg = d.postgres || {},
             st = d.storage || {}, c = d.counts || {}, gpu = d.gpu || {};
       const survey = gpu.survey || {};
@@ -4493,8 +4525,8 @@ function viewSystem(v){
           "</table>" +
           (cli.error ? "<p class='dim errtext'>" + esc(cli.error) + "</p>" : "") +
           "<p class='dim'><a href='https://github.com/tangency-labs/solidcraft/releases/latest' target='_blank' rel='noreferrer'>tangency-labs/solidcraft</a></p>" +
-          "<div class='row'><button id='cli-upd' class='primary'>" +
-            (cad.update_available ? "Update CLI" : "Check / reinstall CLI") + "</button></div>" +
+          "<div class='row'><button id='cli-upd' class='primary'" + hostDis + ">" +
+            (cad.update_available ? "Update CLI" : "Check / reinstall CLI") + "</button></div>" + hostOnlyNote() +
           "</div>" +
         "<div class='card'><h2 class='sec'>Dutchman (feature-tree converter)</h2><table>" +
           "<tr><td class='dim'>Installed</td><td class='mono'>" +
@@ -4512,15 +4544,15 @@ function viewSystem(v){
               : "Auto-update is off (PDM_DUTCHMAN_UPDATE=0).") +
           " <a href='https://github.com/dutchman-cad/dutchman/releases' target='_blank' rel='noreferrer'>dutchman-cad/dutchman releases</a></p>" +
           "<div class='row'><label for='dm-channel'>Release channel</label>" +
-          "<select id='dm-channel'>" +
+          "<select id='dm-channel'" + hostDis + ">" +
             ((dm.channels || []).map(c =>
               "<option value='" + esc(c.value) + "'" +
               (dm.settings && dm.settings.channel === c.value ? " selected" : "") + ">" + esc(c.label) + "</option>")
             .join("")) +
           "</select></div>" +
-          "<div class='row'><button id='dm-upd' class='primary'>" +
+          "<div class='row'><button id='dm-upd' class='primary'" + hostDis + ">" +
             (dm.update_available ? "Download the referenced release" : "Check / reinstall Dutchman") +
-            "</button></div>" +
+            "</button></div>" + hostOnlyNote() +
           "<h2 class='sec' style='margin-top:12px'>Conversion settings (this org)</h2>" +
           "<div class='row'><label for='dm-preset'>Preset</label>" +
           "<select id='dm-preset'>" + ["fast","standard","full"].map(p =>
@@ -4552,8 +4584,8 @@ function viewSystem(v){
               ? "Tracks the newest release automatically (every 6 h; PDM_WEB_UPDATE=0 opts out)."
               : "Auto-update is off (PDM_WEB_UPDATE=0).") +
           " Open editors pick up a new build on the next open.</p>" +
-          "<div class='row'><button id='scweb-upd' class='primary'>" +
-            (scweb.update_available ? "Update web editor" : "Check / reinstall web editor") + "</button></div>" +
+          "<div class='row'><button id='scweb-upd' class='primary'" + hostDis + ">" +
+            (scweb.update_available ? "Update web editor" : "Check / reinstall web editor") + "</button></div>" + hostOnlyNote() +
           "</div>" +
         "<div class='card'><h2 class='sec'>Preview renderer</h2><table>" +
           row("Policy", gpu.policy) +
@@ -4656,7 +4688,7 @@ async function viewSettings(v){
     "<option value='transparent'" + (preview.preview_style !== "viewport" ? " selected" : "") + ">Transparent product render</option>" +
     "<option value='viewport'" + (preview.preview_style === "viewport" ? " selected" : "") + ">Viewport snapshot (background, grid and axes)</option></select>" +
     (canEdit ? "<button id='preview-style-save'>Save preview style</button>" : "") + "</div>" +
-    gpuPickerHTML(gpuPolicy, canEdit) + "</div>" +
+    gpuPickerHTML(gpuPolicy, isHostAdmin()) + hostOnlyNote() + "</div>" +
     "<h2 class='sec'>Mail server</h2>" +
     "<div class='card'><p class='dim'>SMTP used when you invite a user. Leave password blank to keep the current one.</p>" +
     "<div class='grid2'>" +
@@ -4733,7 +4765,7 @@ async function viewSettings(v){
   const cpBtn = $("changepw");
   if (cpBtn) cpBtn.onclick = () => changePassword();
   wireThemePicker(v);
-  wireGpuPicker(v, canEdit);
+  wireGpuPicker(v, isHostAdmin());
   if ($("preview-style-save")) $("preview-style-save").onclick = async () => {
     try { await api("PUT", "/settings/preview-style", {preview_style:$("preview-style").value}); toast("Preview style saved", "ok"); }
     catch(e){ toast("Preview style: " + e.message, "err"); }
@@ -4898,6 +4930,7 @@ async function viewAdmin(v){
   v.querySelectorAll("[data-pw]").forEach(b => b.addEventListener("click", () => resetPassword(UMAP[b.dataset.pw])));
   v.querySelectorAll("[data-edit]").forEach(b => b.addEventListener("click", () => editUser(UMAP[b.dataset.edit])));
   v.querySelectorAll("[data-active]").forEach(b => b.addEventListener("click", () => toggleUserActive(UMAP[b.dataset.active])));
+  v.querySelectorAll("[data-hostadm]").forEach(b => b.addEventListener("click", () => toggleHostAdmin(UMAP[b.dataset.hostadm])));
   $("setsave").onclick = async () => {
     try {
       const payload = JSON.parse($("setjson").value || "{}");

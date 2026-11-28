@@ -143,16 +143,11 @@ pub fn parse_gpu_policy(s: &str) -> Result<&'static str, PdmError> {
     }
 }
 
-/// Preview renderer policy for this org (`auto` / `hardware` / `software` / `cpu`).
-pub async fn get_gpu_policy(pool: &PgPool, org_id: Uuid) -> Result<String, PdmError> {
-    let v: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT settings->>'gpu_policy' FROM organizations WHERE id = $1",
-    )
-    .bind(org_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(PdmError::Db)?
-    .flatten();
+/// Preview renderer policy (`auto` / `hardware` / `software` / `cpu`). The renderer runs on
+/// the shared worker, so the policy is server-wide (`host_settings`, set by a host admin);
+/// `_org_id` is kept so callers read it the same way as before it moved there.
+pub async fn get_gpu_policy(pool: &PgPool, _org_id: Uuid) -> Result<String, PdmError> {
+    let v = get_host_setting_str(pool, HOST_GPU_POLICY).await?;
     match v.as_deref().and_then(|s| parse_gpu_policy(s).ok()) {
         Some(p) => Ok(p.to_string()),
         None => Ok("auto".into()),
@@ -403,8 +398,9 @@ pub async fn signin_org(pool: &PgPool, name: Option<&str>) -> Result<Option<Uuid
     })
 }
 
-/// The org's Dutchman settings (release channel + conversion options), stored in
-/// `organizations.settings`; absent or malformed values fall back to the defaults.
+/// The org's Dutchman settings: conversion options from `organizations.settings`, and the
+/// release channel, which is server-wide (`host_settings`, `latest` until a host admin
+/// picks one). Absent or malformed values fall back to the defaults.
 pub async fn get_dutchman_settings(
     pool: &PgPool,
     org_id: Uuid,
@@ -416,12 +412,20 @@ pub async fn get_dutchman_settings(
             .await
             .map_err(PdmError::Db)?
             .flatten();
+    let default = pdm_core::DutchmanSettings::default();
+    let channel = host_dutchman_channel(pool)
+        .await?
+        .unwrap_or_else(|| default.channel.clone());
     let parsed = v
         .as_ref()
-        .and_then(|v| serde_json::from_value::<pdm_core::DutchmanSettings>(v.clone()).ok());
+        .and_then(|v| serde_json::from_value::<pdm_core::DutchmanSettings>(v.clone()).ok())
+        .map(|s| pdm_core::DutchmanSettings {
+            channel: channel.clone(),
+            ..s
+        });
     let settings = match parsed {
         Some(s) if s.validate().is_ok() => s,
-        _ => pdm_core::DutchmanSettings::default(),
+        _ => pdm_core::DutchmanSettings { channel, ..default },
     };
     Ok(settings)
 }
@@ -459,19 +463,6 @@ pub async fn set_org_nest_defaults(
     .await
     .map_err(PdmError::Db)?;
     Ok(())
-}
-
-/// The Dutchman channel of the org created first (`None` when no org has a
-/// channel set): the boot-time update loop has no org of its own, so it keeps
-/// the oldest org's choice current on this host.
-pub async fn first_org_dutchman_channel(pool: &PgPool) -> Option<String> {
-    let v: Option<String> = sqlx::query_scalar(
-        "SELECT settings->'dutchman'->>'channel' FROM organizations ORDER BY created_at LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .ok()??;
-    v
 }
 
 /// Store the org's Dutchman settings (validated; replaces the whole object).
@@ -550,17 +541,67 @@ pub async fn set_mail_settings(
     Ok(())
 }
 
-pub async fn set_gpu_policy(pool: &PgPool, org_id: Uuid, policy: &str) -> Result<String, PdmError> {
+/// Set the server-wide preview renderer policy (callers check for a host admin).
+pub async fn set_gpu_policy(pool: &PgPool, policy: &str) -> Result<String, PdmError> {
     let policy = parse_gpu_policy(policy)?;
+    set_host_setting_str(pool, HOST_GPU_POLICY, policy).await?;
+    Ok(policy.to_string())
+}
+
+// ── Server-wide settings (host_settings) ────────────────────────────────
+
+const HOST_GPU_POLICY: &str = "gpu_policy";
+const HOST_DUTCHMAN_CHANNEL: &str = "dutchman_channel";
+
+async fn get_host_setting_str(pool: &PgPool, key: &str) -> Result<Option<String>, PdmError> {
+    let v: Option<Option<String>> =
+        sqlx::query_scalar("SELECT value #>> '{}' FROM host_settings WHERE key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .map_err(PdmError::Db)?;
+    Ok(v.flatten())
+}
+
+async fn set_host_setting_str(pool: &PgPool, key: &str, value: &str) -> Result<(), PdmError> {
     sqlx::query(
-        "UPDATE organizations SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{gpu_policy}', to_jsonb($1::text), true) WHERE id = $2",
+        "INSERT INTO host_settings (key, value) VALUES ($1, to_jsonb($2::text))
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
     )
-    .bind(policy)
-    .bind(org_id)
+    .bind(key)
+    .bind(value)
     .execute(pool)
     .await
     .map_err(PdmError::Db)?;
-    Ok(policy.to_string())
+    Ok(())
+}
+
+/// The server-wide Dutchman release channel (`None` until a host admin picks one). Every
+/// conversion uses the one installed binary, so the channel is not per organization.
+pub async fn host_dutchman_channel(pool: &PgPool) -> Result<Option<String>, PdmError> {
+    // A value that does not validate (only possible through a manual edit) reads as unset.
+    Ok(get_host_setting_str(pool, HOST_DUTCHMAN_CHANNEL)
+        .await?
+        .map(|c| c.trim().to_string())
+        .filter(|c| {
+            pdm_core::DutchmanSettings {
+                channel: c.clone(),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        }))
+}
+
+/// Set the server-wide Dutchman release channel (validated; callers check for a host admin).
+pub async fn set_host_dutchman_channel(pool: &PgPool, channel: &str) -> Result<(), PdmError> {
+    let channel = channel.trim();
+    pdm_core::DutchmanSettings {
+        channel: channel.to_string(),
+        ..Default::default()
+    }
+    .validate()?;
+    set_host_setting_str(pool, HOST_DUTCHMAN_CHANNEL, channel).await
 }
 
 /// Read a boolean flag from the org's `settings` JSONB (missing → false).
@@ -590,7 +631,7 @@ pub async fn create_user(
     sqlx::query_as::<_, User>(
         "INSERT INTO users (org_id, email, display_name, role, password_hash)
          VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, org_id, email, display_name, role, active, created_at, password_hash",
+         RETURNING id, org_id, email, display_name, role, active, is_host_admin, created_at, password_hash",
     )
     .bind(org_id)
     .bind(email)
@@ -608,7 +649,7 @@ pub async fn get_user_by_email(
     email: &str,
 ) -> Result<Option<User>, PdmError> {
     sqlx::query_as::<_, User>(
-        "SELECT id, org_id, email, display_name, role, active, created_at, password_hash
+        "SELECT id, org_id, email, display_name, role, active, is_host_admin, created_at, password_hash
              FROM users WHERE org_id = $1 AND email = $2",
     )
     .bind(org_id)
@@ -620,7 +661,7 @@ pub async fn get_user_by_email(
 
 pub async fn get_user_by_id(pool: &PgPool, id: Uuid) -> Result<Option<User>, PdmError> {
     sqlx::query_as::<_, User>(
-        "SELECT id, org_id, email, display_name, role, active, created_at, password_hash
+        "SELECT id, org_id, email, display_name, role, active, is_host_admin, created_at, password_hash
              FROM users WHERE id = $1",
     )
     .bind(id)
@@ -661,8 +702,8 @@ pub async fn update_user(
         .map_err(PdmError::Db)?
         .ok_or_else(|| PdmError::NotFound(format!("organization {org_id}")))?;
     let target = sqlx::query_as::<_, User>(
-        "SELECT id, org_id, email, display_name, role, active, created_at, password_hash
-         FROM users WHERE id = $1 AND org_id = $2",
+        "SELECT id, org_id, email, display_name, role, active, is_host_admin, created_at, password_hash
+         FROM users WHERE id = $1 AND org_id = $2 FOR UPDATE",
     )
     .bind(user_id)
     .bind(org_id)
@@ -670,6 +711,13 @@ pub async fn update_user(
     .await
     .map_err(PdmError::Db)?
     .ok_or_else(|| PdmError::NotFound(format!("user {user_id}")))?;
+    // A host admin stays an active admin until host admin is revoked, so the count of host
+    // admins only changes through grant and revoke (which never remove the last one).
+    if target.is_host_admin && (!active || role != "admin") {
+        return Err(PdmError::Conflict(
+            "this user is a host admin: revoke host admin before disabling or demoting them".into(),
+        ));
+    }
     if target.active && target.role == "admin" && (!active || role != "admin") {
         let other_admin = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM users
@@ -688,7 +736,7 @@ pub async fn update_user(
     }
     let user = sqlx::query_as::<_, User>(
         "UPDATE users SET display_name = $2, role = $3, active = $4 WHERE id = $1 AND org_id = $5
-         RETURNING id, org_id, email, display_name, role, active, created_at, password_hash",
+         RETURNING id, org_id, email, display_name, role, active, is_host_admin, created_at, password_hash",
     )
     .bind(user_id)
     .bind(display_name)
@@ -706,7 +754,7 @@ pub async fn update_user(
 /// resolution, administration).
 pub async fn list_users(pool: &PgPool, org_id: Uuid) -> Result<Vec<User>, PdmError> {
     sqlx::query_as::<_, User>(
-        "SELECT id, org_id, email, display_name, role, active, created_at, password_hash
+        "SELECT id, org_id, email, display_name, role, active, is_host_admin, created_at, password_hash
              FROM users WHERE org_id = $1 ORDER BY created_at",
     )
     .bind(org_id)
@@ -718,13 +766,121 @@ pub async fn list_users(pool: &PgPool, org_id: Uuid) -> Result<Vec<User>, PdmErr
 /// All users with this email across every organization (email is only unique per org).
 pub async fn get_users_by_email(pool: &PgPool, email: &str) -> Result<Vec<User>, PdmError> {
     sqlx::query_as::<_, User>(
-        "SELECT id, org_id, email, display_name, role, active, created_at, password_hash
+        "SELECT id, org_id, email, display_name, role, active, is_host_admin, created_at, password_hash
              FROM users WHERE email = $1",
     )
     .bind(email)
     .fetch_all(pool)
     .await
     .map_err(PdmError::Db)
+}
+
+// ── Host admins ──────────────────────────────────────────────────────────
+
+/// Serializes every change to the set of host admins across the server (they can sit in
+/// different organizations, so the per-org row lock in `update_user` does not cover them).
+const HOST_ADMIN_LOCK: i64 = 0x6864_6d6e; // "hdmn"
+
+/// Grant (`true`) or revoke (`false`) host admin. Only an active admin can be granted it,
+/// and the last active host admin cannot be revoked. Returns the user and whether the flag
+/// changed (`false`: it already had that value).
+pub async fn set_host_admin(
+    pool: &PgPool,
+    user_id: Uuid,
+    grant: bool,
+) -> Result<(User, bool), PdmError> {
+    let mut tx = pool.begin().await.map_err(PdmError::Db)?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(HOST_ADMIN_LOCK)
+        .execute(&mut *tx)
+        .await
+        .map_err(PdmError::Db)?;
+    let target = sqlx::query_as::<_, User>(
+        "SELECT id, org_id, email, display_name, role, active, is_host_admin, created_at, password_hash
+         FROM users WHERE id = $1 FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?
+    .ok_or_else(|| PdmError::NotFound(format!("user {user_id}")))?;
+    if target.is_host_admin == grant {
+        return Ok((target, false));
+    }
+    if grant && !(target.active && target.role == "admin") {
+        return Err(PdmError::Conflict(
+            "only an active admin can be made a host admin".into(),
+        ));
+    }
+    if !grant {
+        let others: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE is_host_admin AND active AND id <> $1)",
+        )
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(PdmError::Db)?;
+        if !others {
+            return Err(PdmError::Conflict(
+                "cannot revoke the last host admin: grant it to someone else first".into(),
+            ));
+        }
+    }
+    let user = sqlx::query_as::<_, User>(
+        "UPDATE users SET is_host_admin = $2 WHERE id = $1
+         RETURNING id, org_id, email, display_name, role, active, is_host_admin, created_at, password_hash",
+    )
+    .bind(user_id)
+    .bind(grant)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?;
+    tx.commit().await.map_err(PdmError::Db)?;
+    Ok((user, true))
+}
+
+/// Make this user the first host admin when the server has none yet (`pdm-cli create-user
+/// --role admin` on a new server). Returns whether it did.
+pub async fn bootstrap_host_admin(pool: &PgPool, user_id: Uuid) -> Result<bool, PdmError> {
+    let mut tx = pool.begin().await.map_err(PdmError::Db)?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(HOST_ADMIN_LOCK)
+        .execute(&mut *tx)
+        .await
+        .map_err(PdmError::Db)?;
+    let done = sqlx::query(
+        "UPDATE users SET is_host_admin = true
+         WHERE id = $1 AND active AND role = 'admin'
+           AND NOT EXISTS (SELECT 1 FROM users WHERE is_host_admin AND active)",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(PdmError::Db)?
+    .rows_affected()
+        == 1;
+    tx.commit().await.map_err(PdmError::Db)?;
+    Ok(done)
+}
+
+/// Every host admin on the server with their organization's name, oldest first.
+pub async fn list_host_admins(pool: &PgPool) -> Result<Vec<(User, String)>, PdmError> {
+    let users = sqlx::query_as::<_, User>(
+        "SELECT id, org_id, email, display_name, role, active, is_host_admin, created_at, password_hash
+         FROM users WHERE is_host_admin ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    let mut out = Vec::with_capacity(users.len());
+    for u in users {
+        let org = get_org_by_id(pool, u.org_id)
+            .await?
+            .map(|o| o.name)
+            .unwrap_or_default();
+        out.push((u, org));
+    }
+    Ok(out)
 }
 
 // ── API Tokens ───────────────────────────────────────────────────────────
@@ -5661,6 +5817,92 @@ mod tests {
                 .fetch_one(&pool)
                 .await?;
         assert_eq!(left, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PDM_TEST_DATABASE_URL pointing to an isolated Postgres database"]
+    async fn host_admins_and_server_wide_settings() -> Result<(), Box<dyn std::error::Error>> {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&std::env::var("PDM_TEST_DATABASE_URL")?)
+            .await?;
+        migrate(&pool).await?;
+        let a = create_org(&pool, &format!("host-test-a-{}", Uuid::new_v4())).await?;
+        let b = create_org(&pool, &format!("host-test-b-{}", Uuid::new_v4())).await?;
+        let admin_a = create_user(&pool, a.id, "a@test.dev", "A", "admin", None).await?;
+        let admin_b = create_user(&pool, b.id, "b@test.dev", "B", "admin", None).await?;
+        let editor = create_user(&pool, b.id, "e@test.dev", "E", "editor", None).await?;
+        let before: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM users WHERE is_host_admin AND active")
+                .fetch_all(&pool)
+                .await?;
+
+        // Only an active admin can be granted; granting twice changes nothing.
+        assert!(matches!(
+            set_host_admin(&pool, editor.id, true).await,
+            Err(PdmError::Conflict(_))
+        ));
+        let (u, changed) = set_host_admin(&pool, admin_a.id, true).await?;
+        assert!(u.is_host_admin && changed);
+        assert!(!set_host_admin(&pool, admin_a.id, true).await?.1);
+        // With a host admin on the server, a new admin is not bootstrapped.
+        assert!(!bootstrap_host_admin(&pool, admin_b.id).await?);
+
+        // A host admin is not disabled or demoted until revoked (org A has another admin, so
+        // the last-administrator rule is not what refuses it).
+        create_user(&pool, a.id, "a2@test.dev", "A2", "admin", None).await?;
+        for (role, active) in [("admin", false), ("editor", true)] {
+            let refused = update_user(&pool, a.id, admin_a.id, "A", role, active).await;
+            assert!(matches!(&refused, Err(PdmError::Conflict(m)) if m.contains("host admin")));
+        }
+        if before.is_empty() {
+            assert!(matches!(
+                set_host_admin(&pool, admin_a.id, false).await,
+                Err(PdmError::Conflict(_))
+            ));
+        }
+        // Across organizations: grant B, then A can go; B is then the last one.
+        set_host_admin(&pool, admin_b.id, true).await?;
+        let (u, changed) = set_host_admin(&pool, admin_a.id, false).await?;
+        assert!(!u.is_host_admin && changed);
+        // Once revoked, the usual rules apply.
+        update_user(&pool, a.id, admin_a.id, "A", "editor", true).await?;
+        let listed: Vec<Uuid> = list_host_admins(&pool)
+            .await?
+            .into_iter()
+            .map(|(u, _)| u.id)
+            .collect();
+        assert!(listed.contains(&admin_b.id) && !listed.contains(&admin_a.id));
+
+        // Server-wide values: one channel and one GPU policy whatever the organization.
+        let old_channel = host_dutchman_channel(&pool).await?;
+        let old_gpu = get_gpu_policy(&pool, a.id).await?;
+        set_host_dutchman_channel(&pool, "nightly").await?;
+        set_gpu_policy(&pool, "cpu").await?;
+        for org in [a.id, b.id] {
+            assert_eq!(get_dutchman_settings(&pool, org).await?.channel, "nightly");
+            assert_eq!(get_gpu_policy(&pool, org).await?, "cpu");
+        }
+        assert!(
+            set_host_dutchman_channel(&pool, "Not A Channel")
+                .await
+                .is_err()
+        );
+        match old_channel {
+            Some(c) => set_host_dutchman_channel(&pool, &c).await?,
+            None => {
+                sqlx::query("DELETE FROM host_settings WHERE key = 'dutchman_channel'")
+                    .execute(&pool)
+                    .await?;
+            }
+        }
+        set_gpu_policy(&pool, &old_gpu).await?;
+
+        sqlx::query("DELETE FROM organizations WHERE id = ANY($1)")
+            .bind(vec![a.id, b.id])
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 

@@ -18,7 +18,7 @@ Base URL in the dev image: `http://<host>:8080`.
   `session_expired` and the token is deleted, so later ones get 401 `auth_failed`. Tokens from
   `POST /users/{id}/tokens` never expire on their own.
 - `POST /auth/logout` — invalidate the current token.
-- `GET /me` — the signed-in identity.
+- `GET /me` — the signed-in identity; `host_admin: true` for a host admin.
 - `GET /me/settings`, `PUT /me/settings` — per-user jsonb payload (`{ payload }`). SolidCraft
   syncs its Prefs here.
 
@@ -65,6 +65,13 @@ Base URL in the dev image: `http://<host>:8080`.
   and `active: true` to enable it. Disabled users cannot sign in or authenticate
   with existing tokens. Disabling or demoting the last active administrator
   returns `409 Conflict`; this constraint also applies to concurrent updates.
+- Host admins (see `docs/security.md`): `PUT /users/{id}/host-admin` `{ host_admin }` grants or
+  revokes it for an active admin of any organization (`409` for a non-admin or the last host
+  admin); `GET /host-admins` lists them. Both need a host admin, as do
+  `POST /settings/cad-cli/update`, `POST /settings/solidcraft-web/update`,
+  `POST /settings/dutchman/update`, `PUT /settings/gpu-policy` and changing `channel` in
+  `PUT /settings/dutchman`. A host admin's password, tokens and account are changed only by a
+  host admin.
 
 ### Branding (`crates/pdm-api/src/branding.rs`)
 An organization's display name, logo and color overrides, which replace the "Foundry PDM" mark
