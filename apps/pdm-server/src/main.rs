@@ -127,11 +127,11 @@ async fn main() -> Result<(), MainError> {
         });
     }
     // Keep Dutchman (native CAD → SolidCraft with a feature tree) on the release
-    // the org's settings reference: check at boot, then on an interval
+    // channel a host admin picked: check at boot, then on an interval
     // (PDM_DUTCHMAN_UPDATE=0 opts out; PDM_DUTCHMAN_CLI names the binary,
-    // default /usr/local/bin/dutchman; PDM_DUTCHMAN_CHANNEL overrides the org
-    // choice for this host). Conversion and Onshape-import jobs also pull the
-    // referenced release on demand.
+    // default /usr/local/bin/dutchman; PDM_DUTCHMAN_CHANNEL overrides the
+    // server's choice for this host). Conversion and Onshape-import jobs also
+    // pull the referenced release on demand.
     if !pdm_update::dutchman_update_disabled() {
         let dest = std::path::PathBuf::from(pdm_update::dutchman_cli_path());
         let pool = pool.clone();
@@ -142,7 +142,7 @@ async fn main() -> Result<(), MainError> {
             loop {
                 let channel = env_channel
                     .clone()
-                    .or(pdm_db::first_org_dutchman_channel(&pool).await);
+                    .or(pdm_db::host_dutchman_channel(&pool).await.ok().flatten());
                 let channel = match channel {
                     Some(c) if !c.trim().is_empty() => c,
                     _ => "latest".to_string(),

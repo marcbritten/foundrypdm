@@ -41,6 +41,21 @@ docker compose -f solidcraft-pdm/docker/pdm-dev.yml exec pdm pdm-cli create-user
 
 Open http://localhost:8080/ and sign in.
 
+This first admin is also the server's **host admin**: the account that changes what every
+organization on the server shares (System › CAD CLI, SolidCraft web editor and Dutchman release
+channel; Settings › Preview renderer) and makes other admins host admins (Administration › Users).
+Other admins, in this organization or another, manage only their own organization until a host
+admin makes them host admins. On an upgraded server, see who holds it with `host-admin list`. To
+hand over or recover access:
+
+```sh
+docker compose -f solidcraft-pdm/docker/pdm-dev.yml exec pdm pdm-cli host-admin list
+docker compose -f solidcraft-pdm/docker/pdm-dev.yml exec pdm pdm-cli host-admin grant \
+  --email someone@example.com [--org Acme]
+```
+
+`host-admin revoke` takes the same options and refuses to remove the last host admin.
+
 ## Environment (DB and storage)
 
 Set these on **pdm** and **pdm-worker**. Compose already sets them for the bundled Postgres/MinIO.
@@ -57,7 +72,7 @@ Set these on **pdm** and **pdm-worker**. Compose already sets them for the bundl
 | `PDM_DUTCHMAN_CLI` | `/usr/local/bin/dutchman` | Dutchman binary (native CAD → SolidCraft with feature history) |
 | `PDM_DUTCHMAN_UPDATE` | `1` | Pull the referenced Dutchman release (boot + hourly + on first conversion); `0` opts out |
 | `PDM_DUTCHMAN_UPDATE_HOURS` | `1` | Hours between Dutchman release checks |
-| `PDM_DUTCHMAN_CHANNEL` | — | Host-level channel override for the update loop (`latest`, `nightly`, or a tag); the org's System › Dutchman choice otherwise wins |
+| `PDM_DUTCHMAN_CHANNEL` | — | Host-level channel override for the update loop (`latest`, `nightly`, or a tag); the server's System › Dutchman channel (set by a host admin) otherwise wins |
 | `PDM_DUTCHMAN_TIMEOUT_SECS` | `1800` | Wall-clock limit for one Dutchman conversion (the org can override it) |
 | `PDM_WORKER` | `0` on API, `1` on worker | Whether this process claims jobs |
 | `PDM_WORKER_CONCURRENCY` | `4` | Parallel jobs on the worker |
@@ -105,7 +120,7 @@ Set `PDM_S3_*` to AWS, MinIO, Garage, etc. Create the bucket before starting PDM
 
 ## GPU (thumbnails)
 
-The worker uses Vulkan when `/dev/dri` is visible. Compose passes `/dev/dri` and `SOLIDCRAFT_GPU=auto`. On hosts without a GPU, it falls back to CPU. Org setting **Settings → Preview renderer** can override (`auto` / `GPU` / `GPU software` / `CPU`).
+The worker uses Vulkan when `/dev/dri` is visible. Compose passes `/dev/dri` and `SOLIDCRAFT_GPU=auto`. On hosts without a GPU, it falls back to CPU. The server-wide **Settings → Preview renderer** (host admin only) can override (`auto` / `GPU` / `GPU software` / `CPU`).
 
 If compose fails on a machine with no `/dev/dri`, remove the `devices:` block from `docker/pdm-dev.yml`.
 
@@ -158,7 +173,7 @@ and update, then retry the URL import. A current stable release is not necessari
 an Onshape-capable release. The import page keeps the job ID and failure message
 visible alongside the STEP fallback.
 
-Dutchman runs on a **release channel** chosen per org in **System ›
+Dutchman runs on a **release channel** chosen for the whole server by a host admin in **System ›
 Dutchman** (dropdown: latest stable, nightly, the Onshape-preview builds, or a
 pinned tag). The PDM keeps the host on that channel: at boot, hourly, and on
 the first conversion that references it. Conversion options (preset, part
@@ -202,11 +217,11 @@ PDM_BUILD_TAG=V.01-37 docker compose -f solidcraft-pdm/docker/pdm-dev.yml up -d
 
 ## After boot — Settings in the portal
 
-These are **not** env vars; they live in the org (Admin → Settings):
+These are **not** env vars; they live in the org (Admin → Settings), except where marked server-wide:
 
 - **Mail server** — SMTP host, port, user, password, from, STARTTLS/TLS. Required for **Invite user**.
 - **Onshape** — API access key + secret, default PDM project. Required for **Send to manufacturing**.
-- **Preview renderer** — GPU policy for the worker.
+- **Preview renderer** — GPU policy for the shared worker. Server-wide: only a host admin changes it.
 - **Part-number prefixes** — auto part numbers.
 
 Do not put SMTP or Onshape secrets in git.

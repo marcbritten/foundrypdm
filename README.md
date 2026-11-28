@@ -53,7 +53,10 @@ docker compose exec pdm pdm-cli create-user \
   --password "change-me"
 ```
 
-Open http://localhost:8080/ and sign in.
+Open http://localhost:8080/ and sign in. This first admin is also the server's host admin: the
+one who changes what every organization on the server shares and can make other admins host
+admins (see [docs/security.md](docs/security.md#authorization); recovery:
+`pdm-cli host-admin grant --email … [--org …]`).
 
 ### 4. Manage your installation
 

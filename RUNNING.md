@@ -216,7 +216,7 @@ interval — no reboot, no image rebuild:
 - **Dutchman** — the PDM converts native CAD (Fusion, Inventor, SolidWorks,
   FreeCAD, CATIA, Rhino, Creo View, ACIS, STEP, Onshape bundles) with a
   [dutchman-cad/dutchman](https://github.com/dutchman-cad/dutchman) release
-  picked from a **channel** (System › Dutchman, per org): the newest stable
+  picked from a **channel** (System › Dutchman, one per server, set by a host admin): the newest stable
   (`latest`), `nightly`, the `onshape-preview` builds (Onshape import), or a
   pinned tag. The image bakes the newest stable in at build
   (`docker/install-dutchman.sh`); the server re-checks on boot and hourly
@@ -224,7 +224,7 @@ interval — no reboot, no image rebuild:
   a `.info` file beside the binary; and a conversion job pulls it on demand
   when the binary is missing or from another channel. `PDM_DUTCHMAN_UPDATE=0`
   opts out; `PDM_DUTCHMAN_CLI` names the binary (default
-  `/usr/local/bin/dutchman`); `PDM_DUTCHMAN_CHANNEL` overrides the org choice
+  `/usr/local/bin/dutchman`); `PDM_DUTCHMAN_CHANNEL` overrides the server's choice
   for the host's update loop; `PDM_DUTCHMAN_TIMEOUT_SECS` (default 1800)
   bounds one conversion (the org's settings field overrides it).
 - **Onshape import** — project Settings → "Import from Onshape (Dutchman)"
