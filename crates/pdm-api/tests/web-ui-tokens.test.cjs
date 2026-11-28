@@ -270,6 +270,9 @@ test("every font size is a step of the scale, in CSS and in inline styles", () =
     ...sizesOffScale("onshape.html", styleBlocks(onshape)), ...sizesOffScale("index.html", styleBlocks(indexHtml))];
   for (const [name, src] of [["app.js", app], ["editors.js", read("editors.js")], ["index.html", indexHtml], ["onshape.html", onshape]])
     for (const m of src.matchAll(/font-size\s*:\s*([^;"'<>]+)/g)) if (!FS_VAR.test(m[1].trim())) found.push(name + ": " + m[0]);
+  // The font shorthand in inline styles carries a size too.
+  for (const [name, src] of [["app.js", app], ["editors.js", read("editors.js")], ["index.html", indexHtml], ["onshape.html", onshape]])
+    for (const m of src.matchAll(/\bfont\s*:\s*([^;"'<>]+)/g)) if (/\d(?:px|r?em|%)/.test(m[1].split("/")[0])) found.push(name + ": " + m[0]);
   assert.deepEqual(found, [], "use var(--fs-xs|sm|base|lg|xl|2xl)");
   const root = declarations(scaleBlocks[0].body);
   for (const step of FS_STEPS) assert.match(root.get("--fs-" + step) || "", /^[\d.]+rem$/, "--fs-" + step + " is a rem value");

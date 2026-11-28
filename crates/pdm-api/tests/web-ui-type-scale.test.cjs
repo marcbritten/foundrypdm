@@ -52,7 +52,13 @@ test("11px is used only for text that repeats something shown elsewhere (Y4)", (
 test("compact density changes padding only, never font size (L3)", () => {
   const dense = RULES.filter(r => /\.dense\b/.test(r.selector));
   assert(dense.length > 0);
-  for (const r of dense) for (const p of ["font-size", "font"]) assert(!r.decls.has(p), r.selector + " sets " + p);
+  for (const r of dense) for (const p of r.decls.keys())
+    assert(p !== "font-size" && p !== "font" && !p.startsWith("--fs-"), r.selector + " sets " + p);
+});
+
+test("table cells are body text, also when they show codes or muted text (Y4)", () => {
+  assert.equal(rule("th, td").get("font-size"), "var(--fs-base)");
+  assert.equal(rule("td.mono, td.dim").get("font-size"), "var(--fs-base)", "the class rules for .mono and .dim would make them 12px");
 });
 
 test("numbers compared down a column use tabular, right-aligned digits (Y6)", () => {

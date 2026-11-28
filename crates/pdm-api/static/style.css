@@ -113,6 +113,8 @@ input:focus, select:focus, textarea:focus { outline:none; border-color:var(--acc
 .num { font-variant-numeric:tabular-nums; text-align:right; }
 /* A select with a long option stays inside its row on narrow screens and at larger text sizes. */
 .row > select { max-width:100%; }
+/* Table cells are body text (guideline Y4), also when they are codes (.mono) or muted (.dim). */
+td.mono, td.dim { font-size:var(--fs-base); }
 .dim { color:var(--dim); font-size:var(--fs-sm); }
 .grow { flex:1; min-width:0; }
 .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:6px 0; }
