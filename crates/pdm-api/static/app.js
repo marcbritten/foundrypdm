@@ -4867,11 +4867,14 @@ async function viewSearch(v){
 }
 
 // ── themes ──────────────────────────────────────────────────────────────
+// Theme picker swatches: these tokens, each drawn inside its theme's own data-theme scope, so the
+// colors come from that theme's block in style.css and cannot drift from it.
+const THEME_SWATCHES = ["--bg", "--panel", "--acc", "--fg"];
 const THEMES = [
-  { id:"dark", name:"Dark", desc:"Midnight (default)", swatches:["#0f141b","#182130","#5aa9ff","#d8e1ec"] },
-  { id:"light", name:"Light", desc:"Bright workspace", swatches:["#f3f5f8","#ffffff","#1f6fd6","#1d2733"] },
-  { id:"slate", name:"Slate", desc:"Cool grey, cyan accent", swatches:["#1a1d23","#22262e","#88c0d0","#eceff4"] },
-  { id:"contrast", name:"High contrast", desc:"Maximum readability", swatches:["#000","#0a0a0a","#ffff00","#fff"] }
+  { id:"dark", name:"Dark", desc:"Midnight (default)" },
+  { id:"light", name:"Light", desc:"Bright workspace" },
+  { id:"slate", name:"Slate", desc:"Cool grey, cyan accent" },
+  { id:"contrast", name:"High contrast", desc:"Maximum readability" }
 ];
 function currentTheme(){
   return localStorage.getItem("pdm_theme") || "dark";
@@ -4887,7 +4890,7 @@ function themePickerHTML(){
   const cur = currentTheme();
   return "<div class='theme-grid'>" + THEMES.map(t =>
     "<button type='button' class='theme-card" + (t.id === cur ? " on" : "") + "' data-theme-id='" + t.id + "' aria-pressed='" + (t.id === cur) + "'>" +
-    "<div class='theme-swatches'>" + t.swatches.map(c => "<span style='background:" + c + "'></span>").join("") + "</div>" +
+    "<div class='theme-swatches'>" + THEME_SWATCHES.map(c => "<span data-theme='" + t.id + "' style='background:var(" + c + ")'></span>").join("") + "</div>" +
     "<strong>" + esc(t.name) + "</strong><span class='dim'>" + esc(t.desc) + "</span></button>"
   ).join("") + "</div>";
 }

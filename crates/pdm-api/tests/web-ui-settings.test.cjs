@@ -120,6 +120,7 @@ async function settingsHarness(){
     releaseApprovalCard(){}, // another Settings card, loaded on its own
     mountBrandingCard(){}, // the Branding card, tested on its own
     fontPickerHTML: () => "", wireFontPicker(){}, // font settings (reading-font PR), tested on their own
+    THEME_SWATCHES: constValue("THEME_SWATCHES"), // the theme cards read these from the stylesheet
     isHostAdmin: () => false, hostOnlyNote: () => "", // host-admin gating, tested on its own
     api: async (method, url, body) => {
       calls.push({ method, url, body });
@@ -301,7 +302,7 @@ test("Invite user is disabled with a reason when no mail server is set up", asyn
   const v = stubEl("view");
   const c = loadFunctions(["viewAdmin", "usersTable", "auditTable", "themePickerHTML", "wireThemePicker", "markPicked"], {
     $, v, esc: s => String(s ?? ""), isRole: () => true, myName: () => "Admin", ME:{ user:{ role:"admin" } },
-    currentTheme: () => "dark", THEMES: constValue("THEMES"), userAv: () => "", fmtDate: () => "", actorName: () => "",
+    currentTheme: () => "dark", THEMES: constValue("THEMES"), THEME_SWATCHES: constValue("THEME_SWATCHES"), userAv: () => "", fmtDate: () => "", actorName: () => "",
     USERS: [], UMAP: {}, go(){}, addUser(){}, inviteUser(){}, giveToken(){}, resetPassword(){}, editUser(){}, toggleUserActive(){},
     api: async (m, url) => url === "/settings/mail" ? { configured:false } : url === "/users" ? { users: [] } : {} });
   await c.viewAdmin(v);
@@ -309,7 +310,7 @@ test("Invite user is disabled with a reason when no mail server is set up", asyn
   assert.match(v.innerHTML, /needs a mail server/);
   const withMail = loadFunctions(["viewAdmin", "usersTable", "auditTable", "themePickerHTML", "wireThemePicker", "markPicked"], {
     $, esc: s => String(s ?? ""), isRole: () => true, myName: () => "Admin", ME:{ user:{ role:"admin" } },
-    currentTheme: () => "dark", THEMES: constValue("THEMES"), userAv: () => "", fmtDate: () => "", actorName: () => "",
+    currentTheme: () => "dark", THEMES: constValue("THEMES"), THEME_SWATCHES: constValue("THEME_SWATCHES"), userAv: () => "", fmtDate: () => "", actorName: () => "",
     USERS: [], UMAP: {}, go(){}, addUser(){}, inviteUser(){}, giveToken(){}, resetPassword(){}, editUser(){}, toggleUserActive(){},
     api: async (m, url) => url === "/settings/mail" ? { configured:true } : url === "/users" ? { users: [] } : {} });
   const v2 = stubEl("view2");

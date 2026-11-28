@@ -129,18 +129,7 @@ test("every var() without a fallback names a declared custom property", () => {
 // Literals still owned by other open changes, by rule and property; any other literal fails,
 // including a second use of an allowed one. Remove an entry once its rule uses a token.
 const ALLOWED_LITERALS = [
-  { selector:".thumb::after, .thumb-sm::after", prop:"color", literal:"#3a485e", use:"--mark-dim" },
-  { selector:".dcard .thumb-lg::after", prop:"color", literal:"#3a485e", use:"--mark-dim" },
-  { selector:".modal-backdrop", prop:"background", literal:"rgba(5,8,12,.6)", use:"--backdrop" },
-  { selector:".detailPane .backdrop", prop:"background", literal:"rgba(5,8,12,.5)", use:"--backdrop (alpha .6)" },
   { selector:".pv-canvas img, .pv-canvas svg", prop:"box-shadow", literal:"rgba(0,0,0,.4)", use:"a shadow token" },
-  { selector:".pv-canvas iframe", prop:"background", literal:"#fff", use:"--paper" },
-  { selector:".ln-preview", prop:"background", literal:"#f6f8fb", use:"--paper (white)" },
-  { selector:".nc-preview", prop:"background", literal:"#111", use:"--canvas" },
-  { selector:".nc-pickthumb", prop:"background", literal:"#111", use:"--canvas" },
-  { selector:".nc-partimg", prop:"background", literal:"#111", use:"--canvas" },
-  { selector:".nc-legend", prop:"color", literal:"#ccc", use:"a text token on --canvas" },
-  { selector:".nc-legend", prop:"background", literal:"rgba(0,0,0,.5)", use:"--canvas with transparency" },
 ];
 // var(--token, fallback) is fine once --token is a theme token: the fallback is never used.
 function dropKnownFallbacks(value){
@@ -315,9 +304,7 @@ const PAIRS = [
   ["--draw-text", "--canvas", 4.5],         // labels on drawing previews
   ["--acc", "--bg", 3],                     // focus ring (non-text)
   ["--acc", "--panel", 3],
-  ["--field-line", "--panel", 3],           // form field edges (non-text)
-  ["--field-line", "--panel2", 3],
-  ["--field-line", "--bg", 3],
+  ...SURFACES.map(bg => ["--field-line", bg, 3]),  // form field edges (non-text), on every surface
   ["--draw-sheet", "--canvas", 3], ["--draw-grain", "--canvas", 3],
   ["--draw-profile", "--canvas", 3], ["--draw-hole", "--canvas", 3], ["--draw-ignore", "--canvas", 3],
 ];

@@ -2,7 +2,7 @@
 /* Theme tokens. Each of the four theme blocks declares every color token, so no theme
    falls back to another's values (tests/web-ui-tokens.test.cjs checks this and the WCAG AA
    pairs). Text pairs meet 4.5:1 on bg, panel, panel2, head, hover and active; field edges
-   meet 3:1 on bg, panel and panel2. Sizes, spacing and radii are in the :root block below.
+   meet 3:1 on the same six surfaces. Sizes, spacing and radii are in the :root block below.
    --on-acc       text on an --acc fill (call to action, selected tab or row)
    --field-line   edge of inputs, selects and segmented controls
    --mark-dim     placeholder glyph in empty thumbnails
@@ -17,7 +17,7 @@
   --warn:#e0a53f; --hover:#223049; --active:#1d2b42; --head:#141c28;
   --shadow:0 10px 34px rgba(0,0,0,.45);
   --text-1:var(--fg); --text-2:#b9c6d6; --text-3:var(--dim);
-  --on-acc:#0f141b; --seg-on-bg:var(--active); --field-line:#66778f;
+  --on-acc:#0f141b; --seg-on-bg:var(--active); --field-line:#6c7e98;
   --primary-bg:#2f4a77; --primary-border:#3a5a8c; --primary-hover:#3a5a8c; --primary-fg:var(--fg);
   --surface:var(--panel); --surface-2:var(--panel2);
   --surface-3:color-mix(in srgb, var(--panel) 82%, var(--panel2));
@@ -52,7 +52,7 @@
   --warn:#ebcb8b; --hover:#2c313c; --active:#343b48; --head:#1e222a;
   --shadow:0 10px 34px rgba(0,0,0,.4);
   --text-1:var(--fg); --text-2:#c5cbd6; --text-3:var(--dim);
-  --on-acc:#1a1d23; --seg-on-bg:var(--active); --field-line:#737c8e;
+  --on-acc:#1a1d23; --seg-on-bg:var(--active); --field-line:#7f889c;
   --primary-bg:#2f4a77; --primary-border:#3a5a8c; --primary-hover:#3a5a8c; --primary-fg:var(--fg);
   --surface:var(--panel); --surface-2:var(--panel2);
   --surface-3:color-mix(in srgb, var(--panel) 82%, var(--panel2));
@@ -116,8 +116,10 @@ input:focus, select:focus, textarea:focus { outline:none; border-color:var(--acc
 .theme-card { text-align:left; width:100%; padding:12px; background:var(--bg); }
 .theme-card.on { border-color:var(--acc); box-shadow:0 0 0 2px var(--acc); }
 .theme-card strong { display:block; font-size:13px; }
-.theme-swatches { display:flex; gap:6px; margin-bottom:8px; }
-.theme-swatches span { width:22px; height:22px; border-radius:50%; border:1px solid var(--line); display:inline-block; }
+/* Each swatch carries its own theme's data-theme, so its fill is that theme's token; the edge
+   is kept from the current theme (captured here, outside the swatch's scope). */
+.theme-swatches { display:flex; gap:6px; margin-bottom:8px; --swatch-edge:var(--line); }
+.theme-swatches span { width:22px; height:22px; border-radius:50%; border:1px solid var(--swatch-edge); display:inline-block; }
 
 /* ── Login ── */
 #login-view { min-height:100vh; display:flex; align-items:flex-start;
@@ -320,7 +322,7 @@ button.tab:focus-visible { outline-offset:-2px; }
   overflow:hidden; flex:0 0 auto; }
 .thumb img, .thumb-sm img { width:100%; height:100%; object-fit:contain; display:block; }
 .thumb::after, .thumb-sm::after { content:"⬢"; position:absolute; inset:0; display:flex;
-  align-items:center; justify-content:center; color:#3a485e; font-size:11px; }
+  align-items:center; justify-content:center; color:var(--mark-dim); font-size:11px; }
 .thumb-sm::after { font-size:10px; }
 .thumb-sm.thumb-err::after { content:"!"; color:var(--warn); }
 .thumb:has(> img)::after, .thumb-sm:has(> img)::after { content:none; }
@@ -349,7 +351,7 @@ td.pn { color:var(--fg); white-space:nowrap; }
 .dcard .thumb-lg { width:96px; height:96px; border-radius:6px; border:1px solid var(--line);
   background:transparent; display:block; margin:0 auto 8px; position:relative; overflow:hidden; }
 .dcard .thumb-lg::after { content:"⬢"; position:absolute; inset:0; display:flex;
-  align-items:center; justify-content:center; color:#3a485e; font-size:18px; }
+  align-items:center; justify-content:center; color:var(--mark-dim); font-size:18px; }
 .dcard .thumb-lg:has(> img)::after { content:none; }
 .dcard .nm { font-size:13px; font-weight:600; white-space:nowrap; overflow:hidden;
   text-overflow:ellipsis; }
@@ -471,7 +473,7 @@ dialog.modal-backdrop::backdrop { background:transparent; }
 .pv-canvas img, .pv-canvas svg { display:block; box-shadow:0 4px 18px rgba(0,0,0,.4);
   max-width:none; }
 .pv-canvas img.model-preview { box-shadow:none; background:transparent; }
-.pv-canvas iframe { width:100%; height:100%; border:0; background:#fff; }
+.pv-canvas iframe { width:100%; height:100%; border:0; background:var(--paper); }
 .pv-canvas pre { margin:0; max-width:900px; font:11px var(--font-mono);
   color:var(--dim); overflow:auto; height:100%; }
 .dcard .thumb-lg img { width:100%; height:100%; object-fit:contain; display:block; }
@@ -623,7 +625,7 @@ table.dense th, html.dense table th { font-size:10.5px; }
 /* ── Detail pane (§4.4) ── */
 .detailPane { position:fixed; inset:0; z-index:200; display:flex; }
 .detailPane:not(.open) { display:none; }
-.detailPane .backdrop { position:absolute; inset:0; background:rgba(5,8,12,.5);
+.detailPane .backdrop { position:absolute; inset:0; background:var(--backdrop);
   backdrop-filter:blur(2px); z-index:1; cursor:default; }
 .detailPane .panel { position:relative; z-index:2; width:min(430px,94vw);
   background:var(--panel); border-left:1px solid var(--line);
@@ -704,7 +706,7 @@ table.dense th, html.dense table th { font-size:10.5px; }
 .ln-partline { display:flex; align-items:center; gap:4px; }
 .ln-sheets { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:10px; }
 .ln-sheet { border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--bg); }
-.ln-preview { width:100%; height:160px; object-fit:contain; background:#f6f8fb; display:block; }
+.ln-preview { width:100%; height:160px; object-fit:contain; background:var(--paper); display:block; }
 .ln-sheetmeta { font-size:12px; padding:6px 8px; color:var(--dim);
   display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
 .ln-sheetmeta .badge { margin-left:0; }
@@ -740,7 +742,7 @@ table.dense th, html.dense table th { font-size:10.5px; }
 .nc-preview { width:100%; height:200px; border:1px solid var(--line); border-radius:7px;
   display:block; background:var(--canvas, #111); }
 .nc-legend { position:absolute; top:6px; right:8px; display:flex; gap:10px;
-  font-size:11px; color:#ccc; background:rgba(0,0,0,.5); padding:2px 6px; border-radius:4px; }
+  font-size:11px; color:var(--draw-text); background:var(--canvas); padding:2px 6px; border-radius:4px; }
 .nc-legend i { display:inline-block; width:10px; height:10px; margin-right:4px;
   vertical-align:-1px; border-radius:2px; }
 /* Part picker */
@@ -762,6 +764,10 @@ table.dense th, html.dense table th { font-size:10.5px; }
   padding:0 4px; border-radius:4px; border:none; background:transparent; line-height:1; }
 .nc-rmline:hover { color:var(--err); background:var(--hover); }
 .nc-partrow.sel .nc-rmline, .nc-partrow.sel .nc-lineerr { color:var(--on-acc, #fff); }
+/* On the accent row, hover and keyboard focus invert the remove button instead of using --hover
+   and the --acc focus ring, which would vanish into the row. */
+.nc-partrow.sel .nc-rmline:hover, .nc-partrow.sel .nc-rmline:focus-visible {
+  color:var(--acc); background:var(--on-acc); outline-color:var(--on-acc); }
 .nc-lineerr { flex-basis:100%; }
 /* Part preview image (flat pattern / 3D thumbnail) */
 .nc-partimg { width:100%; height:200px; border:1px solid var(--line); border-radius:7px;
