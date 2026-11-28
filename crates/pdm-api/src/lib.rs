@@ -25,6 +25,7 @@ mod error;
 mod mail;
 mod onshape;
 mod portal;
+mod release_approval;
 mod routes;
 mod session;
 mod state;

@@ -225,7 +225,7 @@ pub struct ChangePasswordReq {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn require_org(authed: &Authed) -> Uuid {
+pub(crate) fn require_org(authed: &Authed) -> Uuid {
     authed.org_id
 }
 
@@ -531,7 +531,7 @@ pub async fn change_own_password(
 // ── Settings: part-number prefixes ─────────────────────────────────────
 
 /// Org-admin only. Returns a forbidden error when the caller isn't an admin.
-fn require_admin(authed: &Authed) -> Result<&User, AppError> {
+pub(crate) fn require_admin(authed: &Authed) -> Result<&User, AppError> {
     let user = require_user(authed)?;
     if user.role != "admin" {
         return Err(AppError(PdmError::Forbidden("admin only".into())));
@@ -2821,7 +2821,7 @@ pub async fn release(
     // Optional per-release approval gate (org setting "require_approval_on_release").
     // When gated, release() only creates a pending approval request (item -> in_review);
     // the revision + WIP -> Released flip happen on `POST /approvals/{id}/decide` approve.
-    let gated = pdm_db::org_setting_bool(&state.pool, org, "require_approval_on_release").await?;
+    let gated = pdm_db::org_setting_bool(&state.pool, org, crate::release_approval::KEY).await?;
     if gated {
         let assignees = body.assignee_ids.clone().unwrap_or_default();
         let assignees = if assignees.is_empty() {
@@ -6181,6 +6181,11 @@ pub fn api_router() -> Router<AppState> {
         .route(
             "/settings/preview-style",
             get(get_preview_style).put(put_preview_style),
+        )
+        .route(
+            "/settings/release-approval",
+            get(crate::release_approval::get_release_approval)
+                .put(crate::release_approval::put_release_approval),
         )
         .route("/settings/cad-cli", get(get_cad_cli))
         .route("/settings/cad-cli/update", post(update_cad_cli))
