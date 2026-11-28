@@ -130,7 +130,9 @@ function runHead(stored, opts = {}){
     head:{ appendChild(el){ links.push(Object.assign({}, el)); } },
   };
   const context = vm.createContext({ localStorage, document, assert });
-  vm.runInContext(headScript().replace("} catch (e) {}", "} catch (e) { if (!" + Boolean(opts.throws) + ") throw e; }"), context);
+  // Let errors through the outer catch (the one that guards storage access), so a broken script fails the test.
+  const src = headScript(), at = src.lastIndexOf("} catch (e) {}");
+  vm.runInContext(src.slice(0, at) + "} catch (e) { if (!" + Boolean(opts.throws) + ") throw e; }" + src.slice(at + 14), context);
   assert.deepEqual(Object.keys(context).sort(), ["assert", "document", "localStorage"], "the script leaves no globals behind");
   return { attrs, links };
 }
@@ -141,7 +143,7 @@ const uprightSrc = family => "/static/fonts/" + fontFaces().find(f => f.get("fon
 test("index.html applies the saved fonts in <head>, with the same keys, ids and default as app.js", () => {
   assert(indexHtml.indexOf("pdm_font_ui") < indexHtml.indexOf("<link rel=\"stylesheet\""), "before the stylesheets load");
   for (const s of settings()){
-    for (const id of [...s.options.map(o => o.id), "neon", "Atkinson", "", null]){
+    for (const id of [...s.options.map(o => o.id), "org", "neon", "Atkinson", "", null]){
       const { attrs, links } = runHead({ [s.key]:id });
       const chosen = id !== "system" && s.options.some(o => o.id === id);
       assert.deepEqual(attrs, chosen ? { [s.attr]:id } : {}, s.key + "=" + id);
@@ -159,58 +161,181 @@ test("index.html applies the saved fonts in <head>, with the same keys, ids and 
 });
 
 // ── The setting in Settings ─────────────────────────────────────────────
-function fontCtx(stored = {}){
-  const attrs = {};
-  const ctx = loadFunctions(["fontSettings", "currentFont", "applyFont", "fontPickerHTML", "wireFontPicker"], {
+const FONT_FNS = ["fontSettings", "orgFont", "orgFace", "orgOptionName", "currentFont", "effectiveFont", "applyFonts",
+  "applyFont", "fontPickerHTML", "orgFontPickerHTML", "wireFontPicker", "loadOrgFont", "syncFontPicker", "cacheOrgFont", "refreshOrgFont",
+  "saveOrgFont"];
+function fontCtx(stored = {}, opts = {}){
+  const attrs = {}, calls = [], notes = [];
+  const ctx = loadFunctions(FONT_FNS, {
     esc,
-    localStorage:{ getItem:k => (k in stored ? stored[k] : null), setItem(k, v){ stored[k] = String(v); } },
+    isRole: min => min !== "admin" || opts.role === "admin",
+    toast: (m, k) => notes.push([m, k]),
+    api: async (method, url, body) => {
+      calls.push({ method, url, body });
+      return opts.api ? opts.api(method, url, body) : { ui:"system", mono:"system" };
+    },
+    localStorage:{ getItem:k => (k in stored ? stored[k] : null), setItem(k, v){ stored[k] = String(v); }, removeItem(k){ delete stored[k]; } },
     document:{ documentElement:{ setAttribute(k, v){ attrs[k] = v; }, removeAttribute(k){ delete attrs[k]; } } },
   });
-  return { ctx, attrs, stored };
+  return { ctx, attrs, stored, calls, notes };
 }
+const ORG_BOTH = JSON.stringify({ ui:"atkinson", mono:"atkinson" });
 
-test("each font setting defaults to System default and ignores unknown saved values", () => {
-  const { ctx } = fontCtx({ pdm_font_ui:"atkinson", pdm_font_mono:"comic" });
+test("without a face of their own, members get the organization default, in <head> and in app.js alike", () => {
+  const values = ["system", "atkinson", "org", "neon", null];
+  const orgs = [null, ORG_BOTH, JSON.stringify({ ui:"system", mono:"atkinson" }), JSON.stringify({ ui:"comic" }), "{not json", "\"atkinson\""];
+  for (const ui of values) for (const mono of values) for (const org of orgs){
+    const stored = {};
+    if (ui !== null) stored.pdm_font_ui = ui;
+    if (mono !== null) stored.pdm_font_mono = mono;
+    if (org !== null) stored.pdm_org_font = org;
+    const head = runHead(stored);
+    const { ctx, attrs } = fontCtx(Object.assign({}, stored));
+    ctx.applyFonts();
+    assert.deepEqual(head.attrs, attrs, "head script and app.js agree for " + JSON.stringify(stored));
+    assert.equal(head.links.length, Object.keys(head.attrs).length, "a preload for each applied face");
+  }
+  assert.deepEqual(runHead({ pdm_org_font:ORG_BOTH }).attrs, { "data-font-ui":"atkinson", "data-font-mono":"atkinson" },
+    "no choice of their own: the organization default");
+  assert.deepEqual(runHead({ pdm_org_font:ORG_BOTH, pdm_font_ui:"system" }).attrs, { "data-font-mono":"atkinson" },
+    "an explicit System default wins over the organization default");
+  assert.deepEqual(runHead({ pdm_org_font:"{not json" }).attrs, {}, "a broken cache is ignored");
+});
+
+test("each font setting follows the organization default unless the member picked a face", () => {
+  const { ctx } = fontCtx({ pdm_font_ui:"atkinson", pdm_font_mono:"comic", pdm_org_font:JSON.stringify({ ui:"system", mono:"atkinson" }) });
   const [ui, mono] = ctx.fontSettings();
   assert.equal(ctx.currentFont(ui), "atkinson");
-  assert.equal(ctx.currentFont(mono), "system");
-  assert.equal(fontCtx().ctx.currentFont(ui), "system");
+  assert.equal(ctx.currentFont(mono), "org", "an unknown saved value follows the organization");
+  assert.equal(ctx.effectiveFont(mono), "atkinson");
+  assert.equal(fontCtx().ctx.currentFont(ui), "org", "nothing saved: Organization default");
+  assert.equal(fontCtx().ctx.effectiveFont(ui), "system", "no organization default known: the system font");
   assert.deepEqual([...ctx.fontSettings().map(s => s.key)], ["pdm_font_ui", "pdm_font_mono"]);
 });
 
-test("choosing a font sets it on <html> at once and remembers it in this browser", () => {
-  const { ctx, attrs, stored } = fontCtx();
+test("choosing a font applies it at once and remembers it; Organization default hands the choice back", () => {
+  const { ctx, attrs, stored } = fontCtx({ pdm_org_font:JSON.stringify({ ui:"atkinson", mono:"system" }) });
   const [ui, mono] = ctx.fontSettings();
-  ctx.applyFont(ui, "atkinson");
-  ctx.applyFont(mono, "atkinson");
-  assert.deepEqual(attrs, { "data-font-ui":"atkinson", "data-font-mono":"atkinson" });
-  assert.deepEqual(stored, { pdm_font_ui:"atkinson", pdm_font_mono:"atkinson" });
   ctx.applyFont(ui, "system");
+  ctx.applyFont(mono, "atkinson");
+  assert.deepEqual(attrs, { "data-font-mono":"atkinson" }, "own choices win over the organization default");
+  assert.equal(stored.pdm_font_ui, "system");
+  assert.equal(stored.pdm_font_mono, "atkinson");
+  ctx.applyFont(ui, "org");
   ctx.applyFont(mono, "nope");
-  assert.deepEqual(attrs, {}, "System default removes the attribute, so the token keeps its default");
-  assert.deepEqual(stored, { pdm_font_ui:"system", pdm_font_mono:"system" });
+  assert.deepEqual(attrs, { "data-font-ui":"atkinson" }, "back on the organization default");
+  assert(!("pdm_font_ui" in stored) && !("pdm_font_mono" in stored), "no own choice is kept");
 });
 
-test("the picker labels each select, marks the current choice and explains effect, scope and default", () => {
-  const { ctx } = fontCtx({ pdm_font_mono:"atkinson" });
+test("the picker offers Organization default first, names its face, and explains effect, scope and default", () => {
+  const { ctx } = fontCtx({ pdm_font_mono:"atkinson", pdm_org_font:JSON.stringify({ ui:"atkinson", mono:"system" }) });
   const html = ctx.fontPickerHTML();
   for (const s of ctx.fontSettings()){
-    assert.match(html, new RegExp("<label for='" + s.id + "'>" + s.label + "</label><select id='" + s.id + "'"));
+    assert.match(html, new RegExp("<label for='" + s.id + "'>" + s.label + "</label><select id='" + s.id + "'[^>]*><option value='org'"),
+      s.label + ": Organization default is the first option");
     assert.match(html, new RegExp("aria-describedby='" + s.id + "-hint'"));
-    assert.match(html, new RegExp("<p class='dim' id='" + s.id + "-hint'>[^<]*Default: System default"), s.label + " says its default");
+    assert.match(html, new RegExp("<p class='dim' id='" + s.id + "-hint'>[^<]*Default: Organization default"), s.label + " says its default");
   }
-  assert.match(html, /<option value='atkinson' selected>Atkinson Hyperlegible Mono<\/option>/);
-  assert.match(html, /<option value='system' selected>System default<\/option>/, "reading font still on its default");
-  assert.match(html, /stored in this browser/i, "says where the choice applies");
+  assert.match(html, /<option value='org' selected>Organization default \(Atkinson Hyperlegible Next\)<\/option>/,
+    "reading font follows the organization, which uses Atkinson");
+  assert.match(html, /<option value='atkinson' selected>Atkinson Hyperlegible Mono<\/option>/, "code font is the member's own choice");
+  assert.match(html, /<option value='org'>Organization default \(System default\)<\/option>/);
+  assert.match(html, /stored in this browser/i, "says where the member's choice applies");
   assert.match(html, /nothing is downloaded from the internet/, "says the fonts are bundled");
+  assert.doesNotMatch(html, /data-org-font|org-font-save/, "members who are not admins do not see the organization picker");
 });
 
-test("changing a select applies that font", () => {
-  const { ctx, attrs } = fontCtx();
+test("admins also get the organization default picker, with its scope, default and a save button", () => {
+  const { ctx } = fontCtx({ pdm_org_font:JSON.stringify({ ui:"atkinson", mono:"system" }) }, { role:"admin" });
+  const html = ctx.fontPickerHTML();
+  assert.match(html, /<p class='dim' id='org-font-hint'>[^]*everyone in this organization[^]*Default: System default\.<\/p>/);
+  assert.match(html, /<label for='org-font-ui'>Organization reading font<\/label><select id='org-font-ui' data-org-font='ui' aria-describedby='org-font-hint'>/);
+  assert.match(html, /<label for='org-font-mono'>Organization code font<\/label><select id='org-font-mono' data-org-font='mono'/);
+  assert.match(html, /data-org-font='ui'[^]*?<option value='atkinson' selected>Atkinson Hyperlegible Next/);
+  assert.match(html, /data-org-font='mono'[^]*?<option value='system' selected>System default/);
+  assert.match(html, /<button type='button' id='org-font-save' disabled>Save organization default<\/button>/,
+    "Save waits until the current default has loaded");
+  assert.match(html, /<span class='dim' id='org-font-status' role='status'>Loading the current organization default…<\/span>/);
+  assert.match(html, /<button type='button' id='org-font-retry' hidden>Retry<\/button>/);
+});
+
+// A root element stand-in for the Settings view.
+function stubRoot({ fontSelects = [], orgSelects = [], options = {}, save = null, status = null, retry = null } = {}){
+  const byId = { "#org-font-save":save, "#org-font-status":status, "#org-font-retry":retry };
+  return {
+    querySelectorAll: q => (q === "[data-font-key]" ? fontSelects : q === "[data-org-font]" ? orgSelects : []),
+    querySelector: q => (q in byId ? byId[q] : options[q] ||
+      orgSelects.find(s => q === "[data-org-font='" + s.dataset.orgFont + "']") || null),
+  };
+}
+
+test("changing a select applies that font, and opening Settings refreshes the organization default", async () => {
+  const { ctx, attrs, calls } = fontCtx({}, { api: () => ({ ui:"system", mono:"atkinson" }) });
   const sel = { dataset:{ fontKey:"pdm_font_ui" }, value:"atkinson" };
-  ctx.wireFontPicker({ querySelectorAll:q => (q === "[data-font-key]" ? [sel] : []) });
+  await ctx.wireFontPicker(stubRoot({ fontSelects:[sel] }));
+  assert.deepEqual(calls.map(c => c.method + " " + c.url), ["GET /settings/reading-font"]);
+  assert.deepEqual(attrs, { "data-font-mono":"atkinson" }, "the fetched organization default applies");
   sel.onchange();
-  assert.deepEqual(attrs, { "data-font-ui":"atkinson" });
+  assert.deepEqual(attrs, { "data-font-ui":"atkinson", "data-font-mono":"atkinson" });
+});
+
+test("the organization default is fetched, kept for the next page load and applied; a failed fetch keeps the last one", async () => {
+  const ok = fontCtx({}, { api: () => ({ ui:"atkinson", mono:"system", extra:1 }) });
+  assert.equal(await ok.ctx.refreshOrgFont(), true);
+  const cached = JSON.parse(ok.stored.pdm_org_font);
+  assert.deepEqual([cached.ui, cached.mono, typeof cached.at], ["atkinson", "system", "number"], "only ui and mono, with when");
+  assert.deepEqual(ok.attrs, { "data-font-ui":"atkinson" });
+  const down = fontCtx({ pdm_org_font:ORG_BOTH }, { api: () => { throw new Error("network error"); } });
+  assert.equal(await down.ctx.refreshOrgFont(), false);
+  assert.equal(down.stored.pdm_org_font, ORG_BOTH, "the cached default stays");
+  assert.deepEqual(down.attrs, { "data-font-ui":"atkinson", "data-font-mono":"atkinson" });
+  const start = app.indexOf("async function enterWorkspace(");
+  assert.match(app.slice(start, app.indexOf("\n}", start)), /\n\s*refreshOrgFont\(\);/, "the workspace fetches it when it opens");
+});
+
+test("an admin saves the organization default: busy while saving, then applied, shown and confirmed", async () => {
+  let during;
+  const btn = { textContent:"Save organization default", disabled:false };
+  const orgSelects = [{ dataset:{ orgFont:"ui", edited:"1" }, value:"atkinson" }, { dataset:{ orgFont:"mono" }, value:"system" }];
+  const orgOpt = { textContent:"Organization default (System default)" };
+  const root = stubRoot({ orgSelects, save:btn, options:{ "[data-font-key='pdm_font_ui'] option[value='org']":orgOpt } });
+  const { ctx, attrs, stored, calls, notes } = fontCtx({}, { role:"admin", api: (m, u, body) => {
+    during = { disabled:btn.disabled, text:btn.textContent };
+    ctx.saveOrgFont(root, btn); // a second click while saving sends nothing
+    return body;
+  } });
+  await ctx.saveOrgFont(root, btn);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.map(c => [c.method, c.url, c.body]))), [["PUT", "/settings/reading-font", { ui:"atkinson", mono:"system" }]]);
+  assert.deepEqual(during, { disabled:true, text:"Saving…" });
+  assert.deepEqual({ disabled:btn.disabled, text:btn.textContent }, { disabled:false, text:"Save organization default" });
+  assert.deepEqual([JSON.parse(stored.pdm_org_font).ui, JSON.parse(stored.pdm_org_font).mono], ["atkinson", "system"]);
+  assert.deepEqual(attrs, { "data-font-ui":"atkinson" }, "members on Organization default see it at once in this browser");
+  assert.equal(orgOpt.textContent, "Organization default (Atkinson Hyperlegible Next)");
+  assert(!("edited" in orgSelects[0].dataset), "saved selects follow later refreshes again");
+  assert.deepEqual(notes, [["Organization default font saved", "ok"]]);
+});
+
+test("a refused save says so, keeps the last default and leaves the button usable", async () => {
+  const btn = { textContent:"Save organization default", disabled:false };
+  const orgSelects = [{ dataset:{ orgFont:"ui" }, value:"atkinson" }, { dataset:{ orgFont:"mono" }, value:"atkinson" }];
+  const { ctx, stored, notes } = fontCtx({ pdm_org_font:JSON.stringify({ ui:"system", mono:"system" }) },
+    { role:"admin", api: () => { throw new Error("admin only"); } });
+  await ctx.saveOrgFont(stubRoot({ orgSelects, save:btn }), btn);
+  assert.deepEqual(notes, [["Organization default font not saved: admin only", "err"]]);
+  assert.equal(stored.pdm_org_font, JSON.stringify({ ui:"system", mono:"system" }));
+  assert.deepEqual({ disabled:btn.disabled, text:btn.textContent }, { disabled:false, text:"Save organization default" });
+});
+
+test("a refreshed organization default updates the labels but not an admin's unsaved edit", () => {
+  const { ctx } = fontCtx({ pdm_org_font:ORG_BOTH }, { role:"admin" });
+  const uiOpt = { textContent:"" }, monoOpt = { textContent:"" };
+  const orgSelects = [{ dataset:{ orgFont:"ui", edited:"1" }, value:"system" }, { dataset:{ orgFont:"mono" }, value:"system" }];
+  ctx.syncFontPicker(stubRoot({ orgSelects, options:{
+    "[data-font-key='pdm_font_ui'] option[value='org']":uiOpt, "[data-font-key='pdm_font_mono'] option[value='org']":monoOpt } }));
+  assert.equal(uiOpt.textContent, "Organization default (Atkinson Hyperlegible Next)");
+  assert.equal(monoOpt.textContent, "Organization default (Atkinson Hyperlegible Mono)");
+  assert.equal(orgSelects[0].value, "system", "the admin's unsaved edit stays");
+  assert.equal(orgSelects[1].value, "atkinson");
 });
 
 test("Settings shows the font settings in the Appearance card, right after the theme picker", () => {
@@ -218,4 +343,56 @@ test("Settings shows the font settings in the Appearance card, right after the t
   const body = app.slice(start, app.indexOf("\nasync function ", start + 1));
   assert.match(body, /themePickerHTML\(\) \+ fontPickerHTML\(\) \+ "<\/div>"/);
   assert.match(body, /wireFontPicker\(v\);\r?\n\s*wireThemePicker\(v\);/);
+});
+
+test("Settings wires the admin picker: Save turns on once the default has loaded, edits are kept, Save sends them", async () => {
+  const save = { textContent:"Save organization default", disabled:true }, status = { textContent:"Loading…" }, retry = { hidden:true };
+  const orgSelects = [{ dataset:{ orgFont:"ui" }, value:"system" }, { dataset:{ orgFont:"mono" }, value:"system" }];
+  const { ctx, calls } = fontCtx({}, { role:"admin", api: (m, u, body) => (m === "GET" ? { ui:"system", mono:"atkinson" } : body) });
+  const root = stubRoot({ orgSelects, save, status, retry });
+  assert.equal(await ctx.wireFontPicker(root), true);
+  assert.deepEqual([save.disabled, status.textContent, retry.hidden], [false, "", true]);
+  assert.equal(orgSelects[1].value, "atkinson", "the admin selects show the loaded default");
+  orgSelects[0].value = "atkinson";
+  orgSelects[0].onchange();
+  assert.equal(orgSelects[0].dataset.edited, "1", "a changed select is marked, so a refresh keeps it");
+  await save.onclick();
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.map(c => [c.method, c.body || null]))),
+    [["GET", null], ["PUT", { ui:"atkinson", mono:"atkinson" }]]);
+});
+
+test("if the default cannot be loaded, Save stays off, the reason shows and Retry loads it again", async () => {
+  let up = false;
+  const save = { textContent:"Save organization default", disabled:true }, status = { textContent:"" }, retry = { hidden:true };
+  const { ctx, calls } = fontCtx({ pdm_org_font:JSON.stringify({ ui:"system", mono:"system" }) }, { role:"admin",
+    api: () => { if (!up) throw new Error("network error"); return { ui:"atkinson", mono:"atkinson" }; } });
+  const root = stubRoot({ orgSelects:[{ dataset:{ orgFont:"ui" }, value:"system" }], save, status, retry });
+  assert.equal(await ctx.wireFontPicker(root), false);
+  assert.equal(save.disabled, true, "saving the cached or fallback value could overwrite a default this browser has not seen");
+  assert.match(status.textContent, /could not be loaded/);
+  assert.equal(retry.hidden, false);
+  up = true;
+  await retry.onclick();
+  assert.deepEqual([save.disabled, status.textContent, retry.hidden], [false, "", true]);
+  assert.equal(calls.length, 2);
+});
+
+test("an answer to a fetch that started before a save does not undo the save in this browser", async () => {
+  let answer;
+  const pendingGet = new Promise(r => { answer = r; });
+  const btn = { textContent:"Save organization default", disabled:false };
+  const orgSelects = [{ dataset:{ orgFont:"ui" }, value:"atkinson" }, { dataset:{ orgFont:"mono" }, value:"atkinson" }];
+  const { ctx, stored, attrs } = fontCtx({}, { role:"admin", api: (m, u, body) => (m === "GET" ? pendingGet : body) });
+  const slow = ctx.refreshOrgFont();
+  await ctx.saveOrgFont(stubRoot({ orgSelects, save:btn }), btn);
+  answer({ ui:"system", mono:"system" });
+  assert.equal(await slow, true);
+  const cached = JSON.parse(stored.pdm_org_font);
+  assert.deepEqual([cached.ui, cached.mono], ["atkinson", "atkinson"], "the saved value stays cached");
+  assert.deepEqual(attrs, { "data-font-ui":"atkinson", "data-font-mono":"atkinson" });
+  // A cached time in the future (the clock was set back) does not block later answers.
+  const later = fontCtx({ pdm_org_font:JSON.stringify({ ui:"atkinson", mono:"atkinson", at:Date.now() + 864e5 }) },
+    { api: () => ({ ui:"system", mono:"system" }) });
+  await later.ctx.refreshOrgFont();
+  assert.equal(JSON.parse(later.stored.pdm_org_font).ui, "system");
 });
