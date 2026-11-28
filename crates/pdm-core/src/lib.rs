@@ -99,7 +99,7 @@ pub struct User {
     pub org_id: Uuid,
     pub email: String,
     pub display_name: String,
-    /// 'viewer' | 'editor' | 'admin' (Phase-1 simplification of the roles model).
+    /// 'viewer' | 'operator' | 'editor' | 'admin' (Phase-1 simplification of the roles model).
     pub role: String,
     pub active: bool,
     /// Argon2id PHC hash of the user's password, if any.

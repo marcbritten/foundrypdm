@@ -2953,7 +2953,10 @@ pub async fn logout(
 
 // ── Users / Admin ───────────────────────────────────────────────────────
 
-const ROLE_LEVEL: &[(&str, u8)] = &[("viewer", 0), ("editor", 1), ("admin", 2)];
+/// Roles in rank order: each may do everything the ones before it may. Operators record what
+/// happens on the shop floor (production and print job status, inspections); editors change
+/// the vault, libraries and manufacturing records; admins manage users and settings.
+const ROLE_LEVEL: &[(&str, u8)] = &[("viewer", 0), ("operator", 1), ("editor", 2), ("admin", 3)];
 
 fn role_level(role: &str) -> u8 {
     ROLE_LEVEL
@@ -3147,7 +3150,7 @@ pub async fn update_user_handler(
         return Err(AppError(PdmError::Forbidden("user not in this org".into())));
     }
     let role = body.role.as_deref().unwrap_or(&target.role);
-    if !matches!(role, "viewer" | "editor" | "admin") {
+    if !matches!(role, "viewer" | "operator" | "editor" | "admin") {
         return Err(AppError(PdmError::Validation(format!(
             "invalid role '{role}'"
         ))));
@@ -4194,7 +4197,7 @@ pub async fn set_production_job_status(
     Path(id): Path<Uuid>,
     Json(body): Json<SetJobStatusReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_role(&authed, "editor")?;
+    require_role(&authed, "operator")?;
     let org = require_org(&authed);
     let j = pdm_db::set_production_job_status(&state.pool, org, id, &body.status).await?;
     Ok(serde_json::json!({ "production_job": j }).into())
@@ -4218,7 +4221,7 @@ pub async fn create_inspection(
     Extension(authed): Extension<Authed>,
     Json(body): Json<CreateInspectionReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_role(&authed, "editor")?;
+    require_role(&authed, "operator")?;
     let org = require_org(&authed);
     let i = pdm_db::create_inspection(
         &state.pool,
@@ -4467,7 +4470,7 @@ pub async fn set_print_job_status(
     Path(id): Path<Uuid>,
     Json(body): Json<SetPrintJobStatusReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_role(&authed, "editor")?;
+    require_role(&authed, "operator")?;
     let org = require_org(&authed);
     let p = pdm_db::set_print_job_status(&state.pool, org, id, &body.status).await?;
     Ok(serde_json::json!({ "print_job": p }).into())

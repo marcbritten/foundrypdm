@@ -82,6 +82,8 @@ Admin → **Settings** (not env vars):
 In **Administration → Users**, admins can disable or enable accounts. Disabled
 accounts retain their files and history, but cannot sign in or use existing API
 tokens until enabled again. At least one active administrator must remain.
+Each account has a role: viewer, operator (also records shop-floor job status and
+inspections), editor or admin; see [docs/security.md](docs/security.md#authorization).
 
 Do not commit SMTP or Onshape secrets.
 
