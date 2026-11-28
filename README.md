@@ -74,6 +74,9 @@ for advanced CAD, GPU and S3 configuration.
 
 Admin → **Settings** (not env vars):
 
+- **Branding** — display name, logo and theme colors for the sidebar, the sign-in page and
+  the browser tab; on a server with several organizations, `PDM_SIGNIN_ORG` picks the one the
+  sign-in page shows. `?nobrand` in the address turns the colors off for one visit
 - **Mail server** — SMTP so **Invite user** works
 - **Onshape** — API keys + default project for Send to manufacturing
 - **Preview renderer** — GPU vs CPU for thumbnails
