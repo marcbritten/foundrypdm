@@ -68,6 +68,7 @@ These rules apply when the portal lets an organization brand it.
 - **W2 Units on every quantity.** In the label ("Sheet width (mm)") or the column head. Where a setting picks the unit system, the fields it governs show the unit.
 - **W3 No jargon without a hint.** A term a new user would not know gets a one-line helper. Raw JSON, internal ids and HTTP codes are not UI.
 - **W4 Errors say what, why and what next.** Plain words first; the server's message is detail, not the headline. No "Something went wrong", "Error", "Oops" or exclamation marks.
+- **W5 Use the glossary term.** Name each thing with its term from [`glossary.md`](glossary.md), and do not use the words on its "Not:" line. A new thing gets its glossary entry in the same PR.
 
 ## 8. States
 
