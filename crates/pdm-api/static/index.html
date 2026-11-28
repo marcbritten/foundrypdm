@@ -12,8 +12,13 @@
   } catch (e) {}
 })();
 </script>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%235aa9ff' d='M8 0 14 4v8L8 16 2 12V4z'/%3E%3C/svg%3E">
+<link id="favicon" rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%235aa9ff' d='M8 0 14 4v8L8 16 2 12V4z'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css">
+<link id="brand-css" rel="stylesheet" href="/public/branding.css">
+<script>
+// ?nobrand in the address turns organization branding colors off for this visit (app.js does the rest).
+try { if (/[?&]nobrand(?:[=&]|$)/.test(location.search)) document.getElementById("brand-css").disabled = true; } catch (e) {}
+</script>
 <link rel="stylesheet" href="/static/editors.css">
 </head>
 <body>
@@ -59,7 +64,7 @@
 </svg>
 <div id="login-view" class="hidden">
   <div class="auth-card">
-    <div class="auth-logo"><span class="mark">⬢</span>Foundry PDM</div>
+    <div class="auth-logo"><span class="mark" data-brand-mark>⬢</span><span data-brand-name>Foundry PDM</span></div>
     <p class="auth-sub">Engineering product-data workspace</p>
     <form id="signin-form">
       <h3 class="auth-h">Sign in</h3>
@@ -80,7 +85,7 @@
 
 <div id="ws" class="hidden">
   <nav id="sidebar" aria-label="Sections">
-    <div class="sb-brand"><span class="mark">⬢</span> Foundry PDM</div>
+    <div class="sb-brand"><span class="mark" data-brand-mark>⬢</span> <span data-brand-name>Foundry PDM</span></div>
     <div class="sb-section"><span class="sb-label">Workspace</span>
       <a class="sb-link" href="#/dashboard" data-nav="dashboard"><span class="sb-ic"><svg class="icon"><use href="#ic-home"/></svg></span><span class="sb-tx">Dashboard</span></a>
       <a class="sb-link" href="#/projects" data-nav="projects"><span class="sb-ic"><svg class="icon"><use href="#ic-project"/></svg></span><span class="sb-tx">Projects</span></a>

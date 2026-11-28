@@ -118,6 +118,7 @@ async function settingsHarness(){
     toast: (m, k) => notes.push([m, k]), render: () => { renders++; },
     addPrefix(){}, changePassword(){}, editPrefix(){}, deletePrefix(){}, applyTheme(){},
     releaseApprovalCard(){}, // another Settings card, loaded on its own
+    mountBrandingCard(){}, // the Branding card, tested on its own
     fontPickerHTML: () => "", wireFontPicker(){}, // font settings (reading-font PR), tested on their own
     isHostAdmin: () => false, hostOnlyNote: () => "", // host-admin gating, tested on its own
     api: async (method, url, body) => {

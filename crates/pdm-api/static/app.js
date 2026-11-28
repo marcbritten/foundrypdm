@@ -237,6 +237,605 @@ async function attachThumbs(root){
   }));
 }
 
+// ── organization branding ────────────────────────────────────────────────
+// An admin's display name, logo and color overrides (Settings, Branding), checked and stored by
+// the server (/settings/branding). Before sign-in, index.html links the sign-in organization's
+// /public/branding.css and init shows /public/branding's name and logo; after sign-in the user's
+// own organization's branding replaces both. Colors are token values only, written as
+// html[data-theme="…"]{--token:#rrggbb} the way the server writes them. ?nobrand in the address
+// turns the colors off for one visit.
+const BRAND_THEMES = [["dark", "Dark"], ["light", "Light"], ["slate", "Slate"], ["contrast", "High contrast"]];
+const BRAND_TOKEN_LABELS = {
+  bg:"Page background", panel:"Panels and cards", panel2:"Raised panels and fields",
+  line:"Lines and borders", fg:"Text", dim:"Muted text", acc:"Accent: links, selection, focus ring",
+  ok:"Success", err:"Error", warn:"Warning", hover:"Row under the pointer", active:"Selected row",
+  head:"Table heads", "on-acc":"Text on accent fills", "primary-bg":"Primary button",
+  "primary-border":"Primary button edge", "primary-hover":"Primary button under the pointer",
+  "primary-fg":"Primary button text", "seg-on-bg":"Selected segment", "field-line":"Form field edges",
+  "mark-dim":"Placeholder mark in empty previews", "text-2":"Secondary text",
+  "life-wip":"Lifecycle: work in progress", "life-in-review":"Lifecycle: in review",
+  "life-draft":"Lifecycle: draft", "life-released":"Lifecycle: released",
+  "life-obsolete":"Lifecycle: obsolete", "life-deprecated":"Lifecycle: deprecated",
+  "life-lock":"Lifecycle: locked"
+};
+// Pairs checked as colors are chosen, at the WCAG 2.2 AA minimums: [ink, surface, minimum, label].
+const BRAND_PAIRS = [
+  ["fg", "bg", 4.5, "Text on the page"], ["fg", "panel", 4.5, "Text on panels"],
+  ["fg", "panel2", 4.5, "Text on raised panels"], ["dim", "panel", 4.5, "Muted text on panels"],
+  ["text-2", "panel", 4.5, "Secondary text on panels"], ["acc", "panel", 4.5, "Links and accent text"],
+  ["on-acc", "acc", 4.5, "Text on accent fills (selected tabs and rows)"],
+  ["primary-fg", "primary-bg", 4.5, "Primary button text"],
+  ["ok", "panel", 4.5, "Success text"], ["err", "panel", 4.5, "Error text"],
+  ["warn", "panel", 4.5, "Warning text"], ["fg", "hover", 4.5, "Text on the row under the pointer"],
+  ["fg", "active", 4.5, "Text on selected rows"], ["dim", "head", 4.5, "Table head text"],
+  ["acc", "seg-on-bg", 4.5, "Text on the selected segment"],
+  ["primary-fg", "primary-hover", 4.5, "Primary button text under the pointer"],
+  ["life-wip", "panel", 4.5, "Lifecycle: work in progress"], ["life-in-review", "panel", 4.5, "Lifecycle: in review"],
+  ["life-draft", "panel", 4.5, "Lifecycle: draft"], ["life-released", "panel", 4.5, "Lifecycle: released"],
+  ["life-obsolete", "panel", 4.5, "Lifecycle: obsolete"], ["life-deprecated", "panel", 4.5, "Lifecycle: deprecated"],
+  ["life-lock", "panel", 4.5, "Lifecycle: locked"],
+  ["acc", "bg", 3, "Focus ring on the page"], ["field-line", "panel", 3, "Form field edges"]
+];
+let BRAND_ORG = false;   // the signed-in organization's branding is on screen; the public one must not replace it
+function brandOff(search){
+  return /[?&]nobrand(?:[=&]|$)/.test(search == null ? location.search : search);
+}
+// "#rrggbb" in lower case from "#rgb", "#rrggbb" or an opaque "rgb(…)"; null for anything else.
+function brandHex(v){
+  const s = String(v == null ? "" : v).trim().toLowerCase();
+  if (/^#[0-9a-f]{6}$/.test(s)) return s;
+  let m = s.match(/^#([0-9a-f])([0-9a-f])([0-9a-f])$/);
+  if (m) return "#" + m[1] + m[1] + m[2] + m[2] + m[3] + m[3];
+  m = s.match(/^rgba?\(\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)\s*(?:[,/]\s*([\d.]+%?)\s*)?\)$/);
+  if (m && (m[4] === undefined || m[4] === "1" || m[4] === "100%"))
+    return "#" + [m[1], m[2], m[3]].map(n => Math.min(255, Number(n)).toString(16).padStart(2, "0")).join("");
+  return null;
+}
+// WCAG 2.x contrast ratio of two colors (1 to 21), or null when either is not a plain color.
+function contrastRatio(a, b){
+  const lum = c => {
+    const h = brandHex(c); if (!h) return null;
+    const [r, g, bl] = [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255)
+      .map(x => x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4));
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+  };
+  const la = lum(a), lb = lum(b);
+  if (la == null || lb == null) return null;
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+// The pairs that fall below their minimum with `effective` (token -> color), as
+// { fg, bg, min, label, ratio }. A pair with a color that is not plain is skipped.
+function brandingWarnings(effective, pairs){
+  const out = [];
+  for (const [fg, bg, min, label] of pairs){
+    const ratio = contrastRatio(effective[fg], effective[bg]);
+    if (ratio != null && ratio < min) out.push({ fg, bg, min, label, ratio });
+  }
+  return out;
+}
+// Accent colors for each theme from one brand color: lightened on dark panels, darkened on light
+// ones, in 2% steps until it reads at 4.5:1 on every surface accent text sits on (the panel, the
+// selected segment and the selected row), with black or white text on it, whichever contrasts
+// more. High contrast is left alone unless withContrast. defaults: theme -> token -> color.
+function deriveAccent(hex, defaults, withContrast){
+  const base = brandHex(hex), out = {};
+  if (!base) return out;
+  const mix = (a, b, t) => "#" + [1, 3, 5].map(i => {
+    const x = parseInt(a.slice(i, i + 2), 16), y = parseInt(b.slice(i, i + 2), 16);
+    return Math.round(x + (y - x) * t).toString(16).padStart(2, "0");
+  }).join("");
+  for (const theme of ["dark", "light", "slate", "contrast"]){
+    if (theme === "contrast" && !withContrast) continue;
+    const set = (defaults || {})[theme] || {}, panel = brandHex(set.panel);
+    if (!panel) continue;
+    const surfaces = [panel, brandHex(set["seg-on-bg"]), brandHex(set.active)].filter(Boolean);
+    const worst = c => Math.min(...surfaces.map(s => contrastRatio(c, s)));
+    const toward = contrastRatio(panel, "#ffffff") > contrastRatio(panel, "#000000") ? "#ffffff" : "#000000";
+    let acc = base;
+    for (let step = 1; step <= 50 && worst(acc) < 4.5; step++) acc = mix(base, toward, step * 0.02);
+    const onAcc = contrastRatio("#000000", acc) >= contrastRatio("#ffffff", acc) ? "#000000" : "#ffffff";
+    out[theme] = { acc, "on-acc": onAcc };
+  }
+  return out;
+}
+// The stylesheet for color overrides, built like the server's /public/branding.css: one rule per
+// theme, html[data-theme="…"]{--token:#rrggbb;…}, from allow-listed themes and tokens and #rrggbb
+// values only, in a stable order.
+function brandCss(colors, tokens){
+  const allowed = new Set((tokens || []).filter(t => /^[a-z0-9-]+$/.test(t)));
+  let out = "";
+  for (const theme of Object.keys(colors || {}).sort()){
+    if (!["dark", "light", "slate", "contrast"].includes(theme)) continue;
+    const set = colors[theme] || {};
+    const decls = Object.keys(set).sort()
+      .filter(k => allowed.has(k) && /^#[0-9a-fA-F]{6}$/.test(String(set[k])))
+      .map(k => "--" + k + ":" + String(set[k]).toLowerCase());
+    if (decls.length) out += "html[data-theme=\"" + theme + "\"]{" + decls.join(";") + "}\n";
+  }
+  return out;
+}
+// The `colors` of PUT /settings/branding that turns the saved overrides into the pending ones:
+// new and changed tokens with their value, removed ones as null, a theme left with none as null.
+function brandColorPatch(saved, pending){
+  const out = {};
+  for (const theme of ["dark", "light", "slate", "contrast"]){
+    const s = (saved || {})[theme] || {}, p = (pending || {})[theme] || {};
+    if (!Object.keys(p).length){ if (Object.keys(s).length) out[theme] = null; continue; }
+    const t = {};
+    for (const k of Object.keys(p)) if (p[k] !== s[k]) t[k] = p[k];
+    for (const k of Object.keys(s)) if (!(k in p)) t[k] = null;
+    if (Object.keys(t).length) out[theme] = t;
+  }
+  return out;
+}
+// Shows an organization's name and logo in place of the product's: sidebar, sign-in card, tab
+// title and, when chosen, the tab icon. b = { name, showName, logoSrc, faviconSrc }, or null for
+// the product's own. The name goes in as text, never as HTML. A logo that fails to load falls
+// back to the mark and the name.
+function applyBrandIdentity(b, doc){
+  const name = (b && b.name) || "Foundry PDM";
+  const logo = (b && b.logoSrc) || "";
+  const showName = !logo || b.showName !== false;
+  const names = [...doc.querySelectorAll("[data-brand-name]")];
+  for (const el of names){ el.textContent = name; el.title = name; el.hidden = !showName; }
+  for (const el of doc.querySelectorAll("[data-brand-mark]")){
+    el.textContent = "";
+    el.classList.toggle("has-logo", Boolean(logo));
+    el.classList.toggle("logo-only", Boolean(logo) && !showName);
+    if (!logo){ el.textContent = "⬢"; continue; }
+    const img = doc.createElement("img");
+    img.className = "brand-logo";
+    img.alt = showName ? "" : name;
+    img.onerror = () => {
+      if (img.parentNode !== el) return;   // already replaced by a newer logo
+      el.textContent = "⬢"; el.classList.toggle("has-logo", false); el.classList.toggle("logo-only", false);
+      for (const n of names) n.hidden = false;
+    };
+    img.src = logo;
+    el.appendChild(img);
+  }
+  doc.title = name + " — Workspace";
+  const fav = doc.getElementById("favicon");
+  if (fav){
+    if (!fav.dataset.productHref) fav.dataset.productHref = fav.getAttribute("href");
+    fav.setAttribute("href", (b && b.faviconSrc) || fav.dataset.productHref);
+  }
+}
+// The signed-in organization's colors as a <style> after style.css; the sign-in organization's
+// #brand-css is switched off, since the signed-in one always wins. Nothing with ?nobrand.
+function applyBrandColors(colors, tokens, doc, search){
+  const link = doc.getElementById("brand-css");
+  if (link) link.disabled = true;
+  let el = doc.getElementById("org-brand");
+  if (brandOff(search)){ if (el) el.remove(); return; }
+  if (!el){ el = doc.createElement("style"); el.id = "org-brand"; doc.head.appendChild(el); }
+  el.textContent = brandCss(colors, tokens);
+}
+// Before sign-in: the sign-in organization's name and logo (its colors come from #brand-css).
+function loadPublicBranding(){
+  api("GET", "/public/branding").then(b => {
+    if (BRAND_ORG || !b) return;
+    applyBrandIdentity({ name: b.display_name, showName: b.show_name_with_logo !== false,
+      logoSrc: b.logo_url, faviconSrc: b.favicon_url }, document);
+  }).catch(() => {});
+}
+// After sign-in (and after each branding change): the user's organization's branding. A server
+// without branding keeps the product's.
+async function loadOrgBranding(view){
+  if (!view){
+    try { view = await api("GET", "/settings/branding"); }
+    catch(e){
+      // Signed in, but the organization's branding could not be read: show the product's own,
+      // not the sign-in organization's, which may be another organization's.
+      BRAND_ORG = true;
+      applyBrandIdentity(null, document);
+      const link = document.getElementById("brand-css");
+      if (link) link.disabled = true;
+      return null;
+    }
+  }
+  BRAND_ORG = true;
+  const logoSrc = view.logo ? await thumbUrl(view.logo.url) : null;
+  applyBrandIdentity({ name: view.display_name, showName: view.show_name_with_logo !== false,
+    logoSrc, faviconSrc: view.favicon_from_logo ? logoSrc : null }, document);
+  applyBrandColors(view.colors, view.tokens, document);
+  if (brandOff() && !loadOrgBranding.told){
+    loadOrgBranding.told = true;
+    toast("Organization colors are off for this visit. Remove ?nobrand from the address to turn them back on.", "ok");
+  }
+  return view;
+}
+// Each token's color in `theme` with `overrides` (token -> color) applied, as the browser computes
+// it: style.css holds the defaults, so they are read back, not copied here. Branding rules match
+// <html> only, so this probe always starts from the defaults.
+function themeColors(theme, tokens, overrides, doc){
+  const probe = doc.createElement("div");
+  probe.setAttribute("data-theme", theme);
+  probe.hidden = true;
+  for (const [k, val] of Object.entries(overrides || {})) probe.style.setProperty("--" + k, val);
+  doc.body.appendChild(probe);
+  const cs = getComputedStyle(probe), out = {};
+  for (const t of tokens || []){ const hex = brandHex(cs.getPropertyValue("--" + t)); if (hex) out[t] = hex; }
+  probe.remove();
+  return out;
+}
+// Canvas size for a logo that is redrawn: about 160 px tall, at most 2048 px wide and at least 16 px
+// each way; an image without a size of its own (some SVGs) is drawn 160 px square.
+function logoCanvasSize(w, h){
+  if (!(w > 0 && h > 0)) return { w: 160, h: 160 };
+  let ch = 160, cw = Math.round(w * ch / h);
+  if (cw > 2048){ cw = 2048; ch = Math.max(16, Math.round(h * cw / w)); }
+  return { w: Math.max(16, cw), h: ch };
+}
+// The file to upload as the logo. PNG and WebP go as they are when the server takes them (at
+// most 256 KB and 2048 px, at least 16 px); SVG, and anything larger, is redrawn as a PNG about
+// 160 px tall that keeps its transparency. An SVG is only ever loaded as an image, so any
+// script in it never runs.
+async function prepareLogo(file){
+  const svg = file.type === "image/svg+xml" || /\.svg$/i.test(file.name || "");
+  if (!svg && file.type !== "image/png" && file.type !== "image/webp")
+    throw new Error("choose a PNG, WebP or SVG file.");
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = () => reject(new Error("that file could not be read as an image."));
+      i.src = url;
+    });
+    const w = img.naturalWidth, h = img.naturalHeight;
+    if (!svg && (w < 16 || h < 16)) throw new Error("the image is " + w + " × " + h + " px; it needs at least 16 px each way.");
+    if (!svg && file.size <= 256 * 1024 && w <= 2048 && h <= 2048) return file;
+    const size = logoCanvasSize(w, h);
+    const canvas = document.createElement("canvas");
+    canvas.width = size.w; canvas.height = size.h;
+    canvas.getContext("2d").drawImage(img, 0, 0, size.w, size.h);
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
+    if (!blob) throw new Error("that image could not be converted to PNG.");
+    if (blob.size > 256 * 1024) throw new Error("the converted logo is larger than 256 KB; try a simpler image.");
+    return blob;
+  } finally { URL.revokeObjectURL(url); }
+}
+
+// Settings, Branding (admins only): mounted under the page head by viewSettings. Unsaved edits are
+// kept in BRAND_EDIT, so a re-render of Settings (the theme picker, Refresh, another card's save)
+// does not lose them.
+let BRAND_EDIT = null;
+async function mountBrandingCard(v, focusHead){
+  const head = v.querySelector(".head");
+  if (!head) return;
+  const sec = document.createElement("section");
+  sec.setAttribute("aria-labelledby", "brand-sec-h");
+  sec.innerHTML = "<h2 class='sec' id='brand-sec-h' tabindex='-1'>Branding</h2><div class='card' id='brand-card'><p class='dim'>Loading branding…</p></div>";
+  head.after(sec);
+  if (focusHead) sec.querySelector("#brand-sec-h").focus();
+  const card = sec.querySelector("#brand-card");
+  let view;
+  try { view = await api("GET", "/settings/branding"); }
+  catch(e){
+    if (!card.isConnected) return;
+    if (e.status === 404){
+      card.innerHTML = "<p class='dim'>This server does not support branding yet. Update the server to set a name, logo and colors here.</p>";
+      return;
+    }
+    card.innerHTML = "<p class='errtext' role='alert'>Couldn't load the branding settings: " + esc(e.message) + "</p>" +
+      "<button type='button' id='brand-retry'>Retry</button>";
+    card.querySelector("#brand-retry").onclick = () => { sec.remove(); mountBrandingCard(v, true); };
+    return;
+  }
+  if (!card.isConnected) return;
+  renderBrandEditor(card, brandEditState(view));
+}
+// The editor's state for `view`. A draft from before a re-render is kept: typed name and logo
+// options always, pending colors when they were made against the same saved colors.
+function brandEditState(view){
+  const prev = BRAND_EDIT;
+  const st = { view, theme: currentTheme(), colors: brandCopy(view.colors), defaults: {},
+    allOpen: false, accentHc: false, draft: {} };
+  if (prev){
+    st.draft = prev.draft;
+    if (JSON.stringify(prev.view.colors || {}) === JSON.stringify(view.colors || {}))
+      Object.assign(st, { theme: prev.theme, colors: prev.colors, allOpen: prev.allOpen, accentHc: prev.accentHc });
+  }
+  if (!BRAND_THEMES.some(([id]) => id === st.theme)) st.theme = "dark";
+  for (const [t] of BRAND_THEMES) st.defaults[t] = themeColors(t, view.tokens, null, document);
+  BRAND_EDIT = st;
+  return st;
+}
+function brandCopy(colors){
+  const out = {};
+  for (const [t, m] of Object.entries(colors || {})) out[t] = { ...m };
+  return out;
+}
+function renderBrandEditor(card, st){
+  const b = st.view, logo = b.logo, d = st.draft;
+  const showName = "show" in d ? d.show : b.show_name_with_logo !== false;
+  const favicon = "fav" in d ? d.fav : Boolean(b.favicon_from_logo);
+  card.innerHTML =
+    "<p class='dim'>Shown to everyone in this organization: in the sidebar, on the sign-in page and in the browser tab.</p>" +
+    "<p class='dim'>" + (b.signin_org
+      ? "Sign-in page: shows this branding. Anyone who can reach this server sees the name and logo there."
+      : "Sign-in page: shows the default name and colors. On a server with several organizations, the server setting PDM_SIGNIN_ORG chooses which one it shows.") + "</p>" +
+    "<h3 class='brand-h'>Name</h3>" +
+    "<div class='modal-field'><label for='brand-name'>Display name</label>" +
+    "<input id='brand-name' maxlength='60' placeholder='Foundry PDM' value='" + esc("name" in d ? d.name : (b.display_name || "")) + "' aria-describedby='brand-name-hint brand-name-err'>" +
+    "<p class='dim' id='brand-name-hint'>Replaces the product name in the sidebar, on the sign-in page and in the browser tab. Up to 60 characters; empty shows Foundry PDM.</p>" +
+    "<p class='errtext' id='brand-name-err' role='alert'></p></div>" +
+    "<div class='row'><button type='button' id='brand-name-save'>Save name</button><span class='dim' id='brand-name-status' role='status'></span></div>" +
+    "<h3 class='brand-h'>Logo</h3>" +
+    "<div class='brand-tiles'>" + BRAND_THEMES.map(([t, label]) =>
+      "<div class='brand-tile' data-theme='" + t + "'>" + (logo
+        ? "<img class='brand-logo' data-brand-tile alt='Logo on the " + esc(label) + " theme'>"
+        : "<span class='muted'>" + esc(label) + ": no logo, the mark and name are shown</span>") + "</div>").join("") + "</div>" +
+    "<p class='dim'>" + (logo ? esc(logo.width + " × " + logo.height + " px, " + (logo.mime === "image/webp" ? "WebP" : "PNG") + ", " + bytes(logo.bytes)) + ". " : "") +
+    "PNG or WebP up to 256 KB; an SVG is converted to PNG in your browser. The logo is shown up to 28 px tall in the sidebar and 40 px on the sign-in page, so upload at least twice that. " +
+    "The tiles show it on each theme's panels, with this organization's colors.</p>" +
+    "<div class='row'><input type='file' id='brand-file' accept='.png,.webp,.svg,image/png,image/webp,image/svg+xml' hidden>" +
+    "<button type='button' id='brand-upload'>" + (logo ? "Replace logo…" : "Upload logo…") + "</button>" +
+    (logo ? "<button type='button' class='danger' id='brand-logo-remove'>Remove logo</button>" : "") +
+    "<span class='dim' id='brand-logo-status' role='status'></span></div>" +
+    "<p class='errtext' id='brand-logo-err' role='alert'></p>" +
+    "<div class='row'><label><input type='checkbox' id='brand-showname'" + (showName ? " checked" : "") + "> Show the name next to the logo</label></div>" +
+    "<div class='row'><label><input type='checkbox' id='brand-favicon'" + (favicon ? " checked" : "") + "> Use the logo as the browser tab icon</label></div>" +
+    "<div class='row'><button type='button' id='brand-opts-save'>Save logo options</button><span class='dim' id='brand-opts-status' role='status'></span></div>" +
+    "<p class='errtext' id='brand-opts-err' role='alert'></p>" +
+    "<h3 class='brand-h'>Colors</h3><div id='brand-colors'></div>" +
+    "<h3 class='brand-h'>Reset</h3>" +
+    "<div class='row'><button type='button' class='danger' id='brand-reset'>Reset all branding</button></div>" +
+    "<p class='dim'>Removes the name, the logo and the color overrides of every theme. If the colors ever make the workspace hard to read, " +
+    "add <span class='mono brand-nowrap'>?nobrand</span> to the address, before the #, to turn them off for that visit.</p>";
+  if (logo) thumbUrl(logo.url).then(u => { if (u) card.querySelectorAll("[data-brand-tile]").forEach(img => { img.src = u; }); });
+
+  const input = card.querySelector("#brand-name");
+  input.oninput = () => { d.name = input.value; };
+  card.querySelector("#brand-showname").onchange = e => { d.show = e.target.checked; };
+  card.querySelector("#brand-favicon").onchange = e => { d.fav = e.target.checked; };
+  // Saves one part of the settings: busy, then "Saved." or the error under the part.
+  const saveButton = (id, label, statusId, errId, body, done) => {
+    const btn = card.querySelector(id);
+    btn.onclick = async () => {
+      if (btn.disabled) return;
+      const status = card.querySelector(statusId), err = card.querySelector(errId);
+      status.textContent = ""; err.textContent = "";
+      btn.disabled = true; btn.textContent = "Saving…";
+      try {
+        st.view = await api("PUT", "/settings/branding", body());
+        done();
+        await loadOrgBranding(st.view);
+        status.textContent = "Saved.";
+      } catch(e){ err.textContent = "Couldn't save: " + e.message; }
+      finally { btn.disabled = false; btn.textContent = label; }
+    };
+  };
+  saveButton("#brand-name-save", "Save name", "#brand-name-status", "#brand-name-err",
+    () => ({ display_name: input.value.trim() || null }), () => { delete d.name; });
+  saveButton("#brand-opts-save", "Save logo options", "#brand-opts-status", "#brand-opts-err",
+    () => ({ show_name_with_logo: card.querySelector("#brand-showname").checked,
+      favicon_from_logo: card.querySelector("#brand-favicon").checked }),
+    () => { delete d.show; delete d.fav; });
+
+  const file = card.querySelector("#brand-file"), up = card.querySelector("#brand-upload");
+  up.onclick = () => { if (!up.disabled) file.click(); };
+  file.onchange = async () => {
+    const f = file.files && file.files[0];
+    file.value = "";
+    if (!f || up.disabled) return;
+    const err = card.querySelector("#brand-logo-err"), label = up.textContent;
+    err.textContent = "";
+    up.disabled = true; up.textContent = "Uploading…";
+    try {
+      const blob = await prepareLogo(f);
+      st.view = await api("PUT", "/settings/branding/logo", undefined, blob);
+      await loadOrgBranding(st.view);
+      if (!card.isConnected) return;
+      renderBrandEditor(card, st);
+      card.querySelector("#brand-logo-status").textContent = "Logo saved.";
+      card.querySelector("#brand-upload").focus();
+    } catch(e){
+      err.textContent = "Couldn't upload the logo: " + e.message;
+      up.disabled = false; up.textContent = label; up.focus();
+    }
+  };
+  const rm = card.querySelector("#brand-logo-remove");
+  if (rm) rm.onclick = async () => {
+    const view = await openModal("Remove the logo?", [], { label:"Remove logo", busyLabel:"Removing…", danger:true,
+      onSubmit: () => api("DELETE", "/settings/branding/logo") },
+      "<p>The sidebar and the sign-in page go back to the mark and the name. To undo, upload the logo again.</p>");
+    if (!view) return;
+    st.view = view;
+    await loadOrgBranding(view);
+    if (!card.isConnected) return;
+    renderBrandEditor(card, st);
+    card.querySelector("#brand-logo-status").textContent = "Logo removed.";
+    card.querySelector("#brand-upload").focus();
+  };
+  card.querySelector("#brand-reset").onclick = async () => {
+    const view = await openModal("Reset all branding?", [], { label:"Reset branding", busyLabel:"Resetting…", danger:true,
+      onSubmit: () => api("DELETE", "/settings/branding") },
+      "<p>The display name, the logo and the color overrides of all four themes are removed for everyone in this organization.</p>");
+    if (!view) return;
+    st.view = view; st.colors = {}; st.draft = {};
+    await loadOrgBranding(view);
+    if (!card.isConnected) return;
+    renderBrandEditor(card, st);
+    card.querySelector("#brand-reset").focus();
+  };
+  renderBrandColors(card, st);
+}
+function brandEffective(st, theme){
+  return themeColors(theme, st.view.tokens, st.colors[theme], document);
+}
+function brandDirty(st){
+  return Object.keys(brandColorPatch(st.view.colors, st.colors)).length > 0;
+}
+// CSS that previews the pending colors: on the sample and logo tiles of every theme, and, with
+// pageToo, on the page itself. The page rules match only while the Branding card is on the page
+// (:has), so leaving Settings ends the preview, and their specificity beats the saved colors'
+// rules whatever the order. An override being removed shows what the token falls back to.
+// eff: theme -> token -> color with the pending overrides applied.
+function brandPreviewCss(saved, pending, eff, tokens, pageToo){
+  let css = "";
+  for (const t of ["dark", "light", "slate", "contrast"]){
+    const pend = (pending || {})[t] || {}, set = { ...pend };
+    for (const k of Object.keys((saved || {})[t] || {}))
+      if (!(k in pend) && eff && eff[t] && eff[t][k]) set[k] = eff[t][k];
+    const rule = brandCss({ [t]: set }, tokens);
+    if (!rule) continue;
+    const body = rule.slice(rule.indexOf("{"));
+    css += ".brand-sample[data-theme=\"" + t + "\"], .brand-tile[data-theme=\"" + t + "\"]" + body;
+    if (pageToo) css += "html[data-theme=\"" + t + "\"]:has(#brand-card)" + body;
+  }
+  return css;
+}
+function brandPreview(st){
+  const eff = {};
+  for (const [t] of BRAND_THEMES) eff[t] = brandEffective(st, t);
+  const css = brandPreviewCss(st.view.colors, st.colors, eff, st.view.tokens, !brandOff());
+  let el = $("brand-preview");
+  if (!css){ if (el) el.remove(); return; }
+  if (!el){ el = document.createElement("style"); el.id = "brand-preview"; document.head.appendChild(el); }
+  el.textContent = css;
+}
+function renderBrandColors(card, st){
+  const box = card.querySelector("#brand-colors");
+  if (!box) return;
+  const t = st.theme, tokens = st.view.tokens || [], pend = st.colors[t] || {};
+  const label = (BRAND_THEMES.find(([id]) => id === t) || [t, t])[1];
+  const eff = brandEffective(st, t), defs = st.defaults[t] || {};
+  box.innerHTML =
+    "<p class='dim'>Each theme keeps its own colors, high contrast included. Text that falls below WCAG AA is listed as you choose; saving still works.</p>" +
+    "<div class='row'><span class='dim' id='brand-theme-l'>Theme</span><div class='seg' role='group' aria-labelledby='brand-theme-l'>" +
+    BRAND_THEMES.map(([id, name]) => "<button type='button' data-brand-theme='" + id + "' aria-pressed='" + (id === t) + "'" +
+      (id === t ? " class='on'" : "") + ">" + esc(name) + "</button>").join("") + "</div></div>" +
+    "<div class='row'><label for='brand-accent'>Brand accent</label>" +
+    "<input type='color' class='brand-color' id='brand-accent' value='" + esc(eff.acc || "#000000") + "'>" +
+    "<label><input type='checkbox' id='brand-accent-hc'" + (st.accentHc ? " checked" : "") + "> Include high contrast</label>" +
+    "<button type='button' id='brand-accent-apply'>Apply to all themes</button></div>" +
+    "<p class='dim'>Sets each theme's accent from one color, lightened or darkened until it reads at 4.5:1 on that theme's panels, with black or white text on it. Save colors to keep it.</p>" +
+    "<div class='brand-samples' aria-hidden='true'>" + BRAND_THEMES.map(([id, name]) =>
+      "<div class='brand-sample' data-theme='" + id + "'><strong>" + esc(name) + "</strong>" +
+      "<span>Body text</span><span class='muted'>Muted text</span><span class='brand-s-acc'>Link text</span>" +
+      "<span><span class='brand-s-fill'>Selected</span> <span class='brand-s-btn'>Primary</span></span>" +
+      "<span><span class='brand-s-ok'>Released</span> · <span class='brand-s-warn'>Check</span> · <span class='brand-s-err'>Failed</span></span></div>").join("") +
+    "</div>" +
+    "<div id='brand-warn' role='status'></div>" +
+    "<details id='brand-all'" + (st.allOpen ? " open" : "") + "><summary>All colors: " + esc(label) + "</summary>" +
+    "<div class='brand-table-wrap'><table><thead><tr><th>Color</th><th>Default</th><th>This organization</th><th></th></tr></thead><tbody>" +
+    tokens.map(k => {
+      const changed = k in pend, name = BRAND_TOKEN_LABELS[k] || k;
+      return "<tr data-brand-token='" + esc(k) + "'><td><label for='bc-" + esc(k) + "'>" + esc(name) + "</label> <span class='dim mono'>--" + esc(k) + "</span></td>" +
+        "<td class='mono'>" + esc(defs[k] || "—") + "</td>" +
+        "<td><input type='color' class='brand-color' id='bc-" + esc(k) + "' value='" + esc(eff[k] || "#000000") + "'> <span class='mono' data-brand-value>" + (changed ? esc(pend[k]) : "") + "</span></td>" +
+        "<td><span class='brand-changed' data-brand-changed" + (changed ? "" : " hidden") + ">Changed</span> " +
+        "<button type='button' class='small' data-brand-token-reset='" + esc(k) + "'" + (changed ? "" : " disabled") +
+        " aria-label='Reset " + esc(name) + " to default'>Reset</button></td></tr>";
+    }).join("") +
+    "</tbody></table></div></details>" +
+    "<div class='row'><button type='button' id='brand-colors-save'>Save colors</button>" +
+    "<button type='button' id='brand-colors-discard'>Discard changes</button>" +
+    "<button type='button' id='brand-theme-reset'>Reset " + esc(label) + " to defaults</button>" +
+    "<span class='dim' id='brand-colors-status' role='status'>" + (brandDirty(st) ? "Unsaved changes" : "") + "</span></div>" +
+    "<p class='errtext' id='brand-colors-err' role='alert'></p>";
+  const again = focusId => { renderBrandColors(card, st); const el = card.querySelector(focusId); if (el) el.focus(); };
+  box.querySelectorAll("[data-brand-theme]").forEach(b => b.onclick = () => {
+    st.theme = b.dataset.brandTheme; again("[data-brand-theme='" + st.theme + "']");
+  });
+  box.querySelector("#brand-all").ontoggle = e => { st.allOpen = e.target.open; };
+  box.querySelector("#brand-accent-hc").onchange = e => { st.accentHc = e.target.checked; };
+  box.querySelector("#brand-accent-apply").onclick = () => {
+    // Measured on each theme's panel as this organization has it, pending changes included.
+    const panels = {};
+    for (const [id] of BRAND_THEMES) panels[id] = brandEffective(st, id);
+    const derived = deriveAccent(box.querySelector("#brand-accent").value, panels, st.accentHc);
+    for (const [theme, set] of Object.entries(derived)) st.colors[theme] = { ...(st.colors[theme] || {}), ...set };
+    again("#brand-accent-apply");
+  };
+  box.querySelectorAll("tr[data-brand-token]").forEach(tr => {
+    const k = tr.dataset.brandToken, inp = tr.querySelector("input[type=color]");
+    inp.oninput = () => {
+      st.colors[t] = st.colors[t] || {};
+      st.colors[t][k] = inp.value.toLowerCase();
+      tr.querySelector("[data-brand-value]").textContent = st.colors[t][k];
+      tr.querySelector("[data-brand-changed]").hidden = false;
+      tr.querySelector("[data-brand-token-reset]").disabled = false;
+      box.querySelector("#brand-colors-status").textContent = brandDirty(st) ? "Unsaved changes" : "";
+      brandPreview(st);
+    };
+    inp.onchange = () => refreshBrandWarnings(card, st);
+    tr.querySelector("[data-brand-token-reset]").onclick = () => {
+      if (st.colors[t]) delete st.colors[t][k];
+      st.allOpen = true;
+      again("#bc-" + k);
+    };
+  });
+  box.querySelector("#brand-colors-discard").onclick = () => { st.colors = brandCopy(st.view.colors); again("#brand-colors-discard"); };
+  box.querySelector("#brand-theme-reset").onclick = () => { delete st.colors[t]; again("#brand-theme-reset"); };
+  box.querySelector("#brand-colors-save").onclick = () => saveBrandColors(card, st);
+  refreshBrandWarnings(card, st);
+  brandPreview(st);
+}
+// Contrast warnings for the theme being edited (with a fix for text on fills) and a count for the
+// others. They never stop a save.
+function refreshBrandWarnings(card, st){
+  const box = card.querySelector("#brand-warn");
+  if (!box) return;
+  const all = BRAND_THEMES.map(([id, name]) => {
+    const eff = brandEffective(st, id);
+    return { id, name, eff, warn: brandingWarnings(eff, BRAND_PAIRS) };
+  });
+  const cur = all.find(x => x.id === st.theme);
+  const ink = bg => contrastRatio("#000000", bg) >= contrastRatio("#ffffff", bg) ? "#000000" : "#ffffff";
+  const others = all.filter(x => x.id !== st.theme && x.warn.length).map(x => x.name + ": " + x.warn.length);
+  box.innerHTML = (cur.warn.length
+    ? "<p class='brand-warn-h'>Contrast warnings, " + esc(cur.name) + ":</p><ul class='brand-warn'>" + cur.warn.map(w =>
+      "<li>" + esc(w.label) + ": " + (Math.floor(w.ratio * 100) / 100).toFixed(2) + ":1, needs " + w.min + ":1" +
+      ((w.fg === "on-acc" || w.fg === "primary-fg")
+        ? " <button type='button' class='small' data-brand-fix='" + w.fg + "' data-ink='" + ink(cur.eff[w.bg]) + "'>Use " +
+          (ink(cur.eff[w.bg]) === "#000000" ? "black" : "white") + " text</button>" : "") + "</li>").join("") + "</ul>"
+    : "<p class='dim'>No contrast warnings for " + esc(cur.name) + ".</p>") +
+    (others.length ? "<p class='dim'>Other themes with warnings: " + esc(others.join(", ")) + ".</p>" : "");
+  box.querySelectorAll("[data-brand-fix]").forEach(b => b.onclick = () => {
+    st.colors[st.theme] = { ...(st.colors[st.theme] || {}), [b.dataset.brandFix]: b.dataset.ink };
+    renderBrandColors(card, st);
+    const save = card.querySelector("#brand-colors-save"); if (save) save.focus();
+  });
+}
+// Saves the pending colors. With contrast warnings it asks first (it never refuses). While the
+// request runs the colors editor is inert, so nothing can be changed or sent twice.
+async function saveBrandColors(card, st){
+  const box = card.querySelector("#brand-colors");
+  if (!box || st.saving) return;
+  const patch = brandColorPatch(st.view.colors, st.colors);
+  if (!Object.keys(patch).length){ card.querySelector("#brand-colors-status").textContent = "No changes to save."; return; }
+  card.querySelector("#brand-colors-err").textContent = "";
+  const warned = BRAND_THEMES.map(([id, name]) => [name, brandingWarnings(brandEffective(st, id), BRAND_PAIRS).length])
+    .filter(([, n]) => n > 0).map(([name, n]) => name + ": " + n + (n === 1 ? " pair" : " pairs"));
+  const send = () => api("PUT", "/settings/branding", { colors: patch });
+  let view = null;
+  if (warned.length){
+    view = await openModal("Save colors with contrast warnings?", [], { label:"Save colors anyway", busyLabel:"Saving…", onSubmit: send },
+      "<p>Some text falls below WCAG AA (" + esc(warned.join(", ")) + "), so people may find it hard to read. You can change the colors again at any time.</p>");
+    if (!view) return;
+  } else {
+    const btn = card.querySelector("#brand-colors-save");
+    st.saving = true; box.inert = true; btn.textContent = "Saving…";
+    try { view = await send(); }
+    catch(e){
+      box.inert = false; btn.textContent = "Save colors";
+      const err = card.querySelector("#brand-colors-err");
+      if (err) err.textContent = "Couldn't save the colors: " + e.message;
+      return;
+    } finally { st.saving = false; }
+  }
+  st.view = view; st.colors = brandCopy(view.colors);
+  applyBrandColors(view.colors, view.tokens, document);
+  if (!card.isConnected) return;
+  box.inert = false;
+  renderBrandColors(card, st);
+  card.querySelector("#brand-colors-status").textContent = "Colors saved.";
+  card.querySelector("#brand-colors-save").focus();
+}
+
 // ── file kinds / badges ──────────────────────────────────────────────────
 function kindSvg(id){ return "<svg class='icon sm'><use href='#" + id + "'/></svg>"; }
 const CAD_EXTS = ["solidcraft","solvecraft","step","stp","igs","iges","stl","obj","3mf","glb","gltf",
@@ -533,6 +1132,7 @@ async function enterWorkspace(){
     const parts = [d.version ? "v" + d.version : null, d.build, d.commit].filter(Boolean);
     if (parts.length) $("buildinfo").textContent = parts.join(" · ");
   } catch(e){}
+  loadOrgBranding();
   syncNav();
   const r = routeFromHash();
   if (r){ ROUTE = r; syncNav(); render(true); }
@@ -5066,6 +5666,7 @@ async function viewSettings(v){
   if (cpBtn) cpBtn.onclick = () => changePassword();
   releaseApprovalCard($("release-approval"), canEdit);
   wireThemePicker(v);
+  if (canEdit) mountBrandingCard(v);
   wireGpuPicker(v, isHostAdmin());
   wirePrefixTable(v);
   wireDirty(v);
@@ -7041,8 +7642,10 @@ function startPolling(){
   api("GET", "/version").then(d => {
     const parts = [d.version ? "v" + d.version : null, d.build, d.commit,
       d.built_at ? "built " + d.built_at : null].filter(Boolean);
-    if (parts.length) $("authbuild").textContent = parts.join(" · ");
+    // The product name stays here when an organization brands the sign-in card.
+    if (parts.length) $("authbuild").textContent = "Foundry PDM " + parts.join(" · ");
   }).catch(() => {});
+  loadPublicBranding();
   startPolling();
   if (TOKEN) connectFromToken();
   else $("login-view").classList.remove("hidden");
