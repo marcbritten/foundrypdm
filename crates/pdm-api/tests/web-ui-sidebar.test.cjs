@@ -169,7 +169,8 @@ test("the current page link gets aria-current, and it is accent text, bold and u
   assert.deepEqual(links.map(a => a.getAttribute("aria-current")), [null, null, "page"]);
 
   const on = rule(".sb-link.on");
-  assert.equal(on.get("color"), "var(--acc)");
+  assert.equal(rule(".sb-head, .sb-link").get("color"), "var(--acc)", "links, icons and headers are accent text");
+  assert.equal(rule(".sb-ic").get("color"), "inherit");
   assert.equal(on.get("font-weight"), "700");
   assert.equal(on.get("background"), undefined, "no filled block");
   assert.match([...RULES].find(r => r.selector.includes(".sb-link.on .sb-tx")).decls.get("text-decoration"), /underline/);
@@ -182,7 +183,7 @@ test("the current page link gets aria-current, and it is accent text, bold and u
 
 test("accent text sits on the sidebar's own surface, a pair the theme and branding checks cover", () => {
   assert.equal(rule("#sidebar").get("background"), "var(--panel)");
-  assert.equal(rule(".sb-head").get("color"), "var(--acc)");
+  assert.equal(rule(".sb-head, .sb-link").get("color"), "var(--acc)");
   // Each theme's --acc on --panel is held to 4.5:1 by web-ui-tokens.test.cjs; an organization's
   // colors are checked against the same pair as they are chosen.
   const pairs = loadFunctions([], {});
@@ -193,9 +194,17 @@ test("accent text sits on the sidebar's own surface, a pair the theme and brandi
   assert.match(tokens, /SURFACES = \["--bg", "--panel"/);
 });
 
-test("rows are about 32px (44px for touch), spacing comes from the scale, and the fold motion is transform only", () => {
+test("sizes are in em of the label (rows 2.13em, 44px for touch), and the fold motion is transform only", () => {
   const row = rule(".sb-head, .sb-link");
-  assert.equal(row.get("min-height"), "var(--sp-6)");
+  assert.equal(row.get("min-height"), "2.13em");
+  assert.equal(rule("#sidebar").get("font-size"), "var(--fs-base)", "em in the sidebar is the label size");
+  assert.equal(rule("#sidebar .sb-ic .icon").get("height"), "1.07em");
+  assert.equal(rule(".sb-ic").get("width"), "1.33em");
+  assert.equal(rule(".sb-link").get("gap"), ".53em");
+  assert.equal(rule(".sb-head").get("gap"), ".67em");
+  assert.equal(rule(".sb-items").get("padding-left"), ".67em");
+  assert.equal(rule(".sb-items").get("border-left"), "1px solid var(--line)");
+  assert.equal(rule(".sb-nav").get("padding"), "0 1.33em .87em 1em");
   assert.equal(rule(".sb-head, .sb-link, .sb-userbtn").get("min-height"), "44px");
   assert.match(css, /@media \(pointer: coarse\) \{ \.sb-head, \.sb-link, \.sb-userbtn/);
   assert.equal(rule(".sb-chev").get("transition"), "transform .15s ease");

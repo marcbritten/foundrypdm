@@ -154,8 +154,8 @@ td.mono, td.dim { font-size:var(--fs-base); }
 
 /* ── Workspace shell ── */
 #ws { display:flex; min-height:100vh; }
-#sidebar { width:15rem; flex:0 0 auto; background:var(--panel); border-right:1px solid var(--line);
-  display:flex; flex-direction:column; position:sticky; top:0; height:100vh; }
+#sidebar { width:16.9em; flex:0 0 auto; background:var(--panel); border-right:1px solid var(--line);
+  display:flex; flex-direction:column; position:sticky; top:0; height:100vh; font-size:var(--fs-base); }
 .sb-brand { font-weight:700; font-size:var(--fs-lg); padding:16px 18px 12px; letter-spacing:.02em; }
 .sb-brand .mark { color:var(--acc); margin-right:6px; }
 /* Organization branding: the logo's box (28px in the sidebar, 40px on the sign-in card; widths
@@ -183,24 +183,28 @@ td.mono, td.dim { font-size:var(--fs-base); }
 .brand-warn-h { font-weight:600; margin:var(--sp-2) 0 0; }
 .brand-warn { margin:var(--sp-1) 0 var(--sp-2); padding-left:var(--sp-5); }
 /* Sidebar groups: a header button (icon, label, chevron) folds the group's links, and a guide line
-   runs along their left. The current page is accent text, bold and underlined, with no fill.
-   Pointer and keyboard focus underline a label; the focus ring is the shared one. */
-.sb-nav { flex:1; min-height:0; overflow-y:auto; padding:0 var(--sp-3) var(--sp-3); }
-.sb-section + .sb-section { margin-top:var(--sp-3); }
-.sb-head, .sb-link { display:flex; align-items:center; gap:var(--sp-2); min-height:var(--sp-6);
-  padding:var(--sp-1) var(--sp-2); font-size:var(--fs-base); line-height:var(--lh-tight); border-radius:var(--r-s); }
-.sb-head { width:100%; background:none; border:none; color:var(--acc); font-weight:700; text-align:left; cursor:pointer; }
+   runs along their left. Labels, icons and headers are accent text on the panel. The current page
+   is also bold and underlined, with no fill. Pointer and keyboard focus underline a label, and
+   keyboard focus shows the shared ring. Sizes are in em of the label (--fs-base), so they follow
+   the Text size setting: rows 2.13em, icons 1.07em tall in a 1.33em slot, label gap .53em
+   (.67em in headers), item icons .73em right of the header icon, the guide line 1em from the edge. */
+.sb-nav { flex:1; min-height:0; overflow-y:auto; padding:0 1.33em .87em 1em; }
+.sb-section + .sb-section { margin-top:.4em; }
+.sb-head, .sb-link { display:flex; align-items:center; min-height:2.13em; padding:0; color:var(--acc);
+  font-size:var(--fs-base); line-height:var(--lh-tight); border-radius:var(--r-s); }
+.sb-head { gap:.67em; width:100%; background:none; border:none; font-weight:700; text-align:left; cursor:pointer; }
 .sb-head:hover { background:none; }
-.sb-chev { margin-left:auto; flex:0 0 auto; color:var(--dim); transition:transform .15s ease; }
+.sb-ic { flex:0 0 auto; width:1.33em; display:inline-flex; justify-content:center; color:inherit; }
+#sidebar .sb-ic .icon { width:1.33em; height:1.07em; vertical-align:middle; }
+.sb-chev { margin-left:auto; flex:0 0 auto; color:var(--acc); transition:transform .15s ease; }
+#sidebar .icon.sb-chev { width:.8em; height:.92em; }
 .sb-section.folded .sb-head .sb-chev { transform:rotate(90deg); }
-.sb-items { margin-left:var(--sp-4); padding-left:var(--sp-1); border-left:1px solid var(--line); }
-.sb-link { color:var(--fg); text-decoration:none; cursor:pointer; user-select:none; }
+.sb-items { padding-left:.67em; border-left:1px solid var(--line); }
+.sb-link { gap:.53em; text-decoration:none; cursor:pointer; user-select:none; }
 .sb-link[hidden] { display:none; }
 .sb-head:hover .sb-tx, .sb-head:focus-visible .sb-tx, .sb-link:hover .sb-tx, .sb-link:focus-visible .sb-tx,
 .sb-link.on .sb-tx { text-decoration:underline; text-underline-offset:.2em; }
-.sb-link.on { color:var(--acc); font-weight:700; }
-.sb-ic { flex:0 0 auto; width:var(--sp-4); display:inline-flex; justify-content:center; color:var(--dim); }
-.sb-head .sb-ic, .sb-link.on .sb-ic { color:var(--acc); }
+.sb-link.on { font-weight:700; }
 .sb-tx { min-width:0; overflow-wrap:anywhere; }
 /* A folded group still shows the current page and a link with a count (such as approvals waiting). */
 .sb-section.folded .sb-link:not(.on):not(:has(.sb-count:not(:empty))) { display:none; }
@@ -209,28 +213,29 @@ td.mono, td.dim { font-size:var(--fs-base); }
   background:color-mix(in srgb, var(--acc) 18%, var(--panel));
   border:1px solid color-mix(in srgb, var(--acc) 35%, var(--line));
   border-radius:999px; padding:0 7px; min-width:18px; text-align:center; }
-/* The signed-in account at the foot: avatar, name and role. It opens the account menu above it. */
-.sb-foot { flex-shrink:0; padding:var(--sp-2) var(--sp-3); border-top:1px solid var(--line); }
-.sb-userbtn { display:flex; align-items:center; gap:var(--sp-2); width:100%; min-height:var(--sp-6);
-  padding:var(--sp-1) var(--sp-2); background:none; border:none; color:var(--fg); text-align:left; }
+/* The signed-in account at the foot, set like a group header: icon, name, role and a chevron. It
+   opens the account menu above it. The rule above it sits .87em under the last link. */
+.sb-foot { flex-shrink:0; padding:.57em 1.33em .57em 1em; border-top:1px solid var(--line); }
+.sb-userbtn { display:flex; align-items:center; gap:.67em; width:100%; min-height:2.13em;
+  padding:0; background:none; border:none; color:var(--acc); font-size:var(--fs-base); text-align:left; }
 .sb-userbtn:hover { background:none; }
 .sb-userbtn:hover .sb-tx, .sb-userbtn:focus-visible .sb-tx { text-decoration:underline; text-underline-offset:.2em; }
-.sb-userbtn .sb-chev { transform:rotate(180deg); }
-.sb-user { display:flex; align-items:center; gap:var(--sp-2); min-width:0; font-size:var(--fs-base); font-weight:600; }
+.sb-userbtn .sb-chev { transform:rotate(90deg); }
+.sb-user { display:flex; align-items:center; gap:.67em; min-width:0; font-weight:700; }
 .sb-user .sb-tx { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .sb-user .dim { font-weight:400; font-size:var(--fs-sm); }
 /* Wide screens: the menu button folds the sidebar to an icon rail. Labels are hidden from sight
    only (screen readers still read them) and show as tooltips. A folded group opens in the rail,
    so every page stays one click away. The account button in the sidebar replaces the top bar's. */
 @media (min-width: 901px) {
-  #sidebar.rail { width:calc(var(--sp-6) + var(--sp-5)); }
+  #sidebar.rail { width:3.75em; }
   #sidebar.rail .sb-brand { padding-inline:0; text-align:center; }
   #sidebar.rail .sb-brand [data-brand-name] { display:none; }
   #sidebar.rail .sb-brand .mark { margin-right:0; }
   #sidebar.rail .sb-brand .brand-logo { max-width:var(--sp-6); }
-  #sidebar.rail .sb-nav, #sidebar.rail .sb-foot { padding-inline:var(--sp-1); }
+  #sidebar.rail .sb-nav, #sidebar.rail .sb-foot { padding-inline:.27em; }
   #sidebar.rail .sb-head { display:none; }
-  #sidebar.rail .sb-section + .sb-section { margin-top:var(--sp-2); padding-top:var(--sp-2); border-top:1px solid var(--line); }
+  #sidebar.rail .sb-section + .sb-section { margin-top:.4em; padding-top:.4em; border-top:1px solid var(--line); }
   #sidebar.rail .sb-items { margin-left:0; padding-left:0; border-left:none; }
   #sidebar.rail .sb-section .sb-link:not([hidden]) { display:flex; justify-content:center; position:relative; }
   #sidebar.rail .sb-tx { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }

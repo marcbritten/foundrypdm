@@ -1122,9 +1122,9 @@ async function enterWorkspace(){
   $("ws").classList.remove("hidden");
   const u = ME.user;
   $("userchip").textContent = u ? (u.display_name || u.email) : "service account";
-  $("sb-user").innerHTML = u
-    ? userAv(u, false) + "<span class='sb-tx'>" + esc(u.display_name || u.email) + " <span class='dim'>" + esc(u.role) + "</span></span>"
-    : "<svg class='icon' aria-hidden='true'><use href='#ic-user'/></svg><span class='sb-tx'>service account</span>";
+  $("sb-user").innerHTML = "<span class='sb-ic'><svg class='icon' aria-hidden='true'><use href='#ic-user'/></svg></span>" + (u
+    ? "<span class='sb-tx'>" + esc(u.display_name || u.email) + " <span class='dim'>" + esc(u.role) + "</span></span>"
+    : "<span class='sb-tx'>service account</span>");
   if ($("sidebar").classList.contains("rail")) setNavRail(true, document, null);   // the tooltip follows the name
   $("userkebab").hidden = !u;
   document.querySelectorAll(".sb-admin").forEach(a => a.hidden = !(u && u.role === "admin"));
