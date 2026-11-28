@@ -5046,28 +5046,27 @@ function applyFont(setting, id){
   applyFonts();
 }
 // Text size for this browser: scales the root font size, so every --fs-* step grows with it.
-// index.html's <head> script applies it before first paint with the same key and ids.
+// index.html puts the default (112) on <html>, and its <head> script applies a stored choice before first
+// paint with the same key and ids. The ids are percents: 100, 112 (112.5) and 125.
 function textSizeOptions(){
-  return [{ id:"100", name:"Default (100%)" }, { id:"112", name:"Larger (112.5%)" }, { id:"125", name:"Largest (125%)" }];
+  return [{ id:"100", name:"Smaller (100%)" }, { id:"112", name:"Default (112.5%)" }, { id:"125", name:"Larger (125%)" }];
 }
 function currentTextSize(){
   const id = localStorage.getItem("pdm_text_size");
-  return textSizeOptions().some(o => o.id === id) ? id : "100";
+  return textSizeOptions().some(o => o.id === id) ? id : "112";
 }
+// Default keeps nothing in storage, so this browser follows a later change of the default.
 function applyTextSize(id){
-  if (id !== "100" && textSizeOptions().some(o => o.id === id)){
-    document.documentElement.setAttribute("data-text-size", id);
-    localStorage.setItem("pdm_text_size", id);
-  } else {
-    document.documentElement.removeAttribute("data-text-size");
-    localStorage.removeItem("pdm_text_size");
-  }
+  if (!textSizeOptions().some(o => o.id === id)) id = "112";
+  document.documentElement.setAttribute("data-text-size", id);
+  if (id === "112") localStorage.removeItem("pdm_text_size");
+  else localStorage.setItem("pdm_text_size", id);
 }
 function textSizeHTML(){
   const cur = currentTextSize();
   return "<div class='row'><label for='text-size'>Text size</label><select id='text-size' aria-describedby='text-size-hint'>" +
     textSizeOptions().map(o => "<option value='" + o.id + "'" + (o.id === cur ? " selected" : "") + ">" + esc(o.name) + "</option>").join("") +
-    "</select></div><p class='dim' id='text-size-hint'>Sets the size of all text in the workspace, and the default of 100% follows your browser's text size.</p>";
+    "</select></div><p class='dim' id='text-size-hint'>Sets the size of all text in the workspace, and the default is 112.5% of your browser's text size.</p>";
 }
 function fontPickerHTML(){
   const org = orgFont();
