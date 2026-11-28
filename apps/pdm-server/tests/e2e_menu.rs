@@ -90,10 +90,10 @@ async fn e2e_each_person_keeps_their_own_menu_and_access_does_not_change() {
     // A viewer stores a menu with their own groups, three levels deep, a hidden link and icons.
     let menu = json!([
         { "group": "Daily", "icon": "solid/star", "items": [
-            { "nav": "items" },
+            { "nav": "items", "hidden": true },
             { "group": "Shop", "items": [{ "group": "Laser", "items": [{ "nav": "laser-nests", "icon": "regular/bell" }] }] }
         ] },
-        { "group": "Workspace", "key": "workspace", "items": [{ "nav": "dashboard" }, { "nav": "admin", "hidden": true }] }
+        { "group": "Workspace", "key": "workspace", "items": [{ "nav": "dashboard" }, { "nav": "admin" }] }
     ]);
     let (s, v) = send(
         &c,
@@ -133,6 +133,7 @@ async fn e2e_each_person_keeps_their_own_menu_and_access_does_not_change() {
         json!({ "items": [{ "nav": "items", "icon": "solid/not-an-icon" }] }),
         json!({ "items": [{ "group": "1", "items": [{ "group": "2", "items": [{ "group": "3", "items": [{ "group": "4" }] }] }] }] }),
         json!({ "items": [], "theme": "dark" }),
+        json!({ "items": [{ "group": "Shop" }, { "group": "shop" }] }),
         json!({ "close_others": "yes" }),
         json!({}),
         json!([]),
@@ -169,7 +170,8 @@ async fn e2e_each_person_keeps_their_own_menu_and_access_does_not_change() {
         "unchanged after refusals"
     );
 
-    // Hiding a link removes no access, and a link in the menu grants none.
+    // Items is hidden in this viewer's menu: the viewer still opens Items. Administration shows in
+    // the menu: the viewer still cannot change an admin setting.
     let (s, _) = send(&c, Method::GET, "/items?limit=1", &viewer, None).await;
     assert_eq!(s, StatusCode::OK, "the viewer still opens Items");
     let (s, _) = send(

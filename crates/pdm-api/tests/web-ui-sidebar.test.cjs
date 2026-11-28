@@ -136,7 +136,7 @@ test("on wide screens the menu button folds the sidebar to an icon rail, with to
   assert.equal(d.ids.menubtn.title, "Show only icons in the sidebar");
   // The rail hides labels from sight only, and a folded group opens in the rail.
   assert.equal(rule("#sidebar.rail .sb-tx").get("clip-path"), "inset(50%)");
-  assert.equal(rule("#sidebar.rail .sb-section .sb-link:not([hidden])").get("display"), "flex");
+  assert.equal(rule("#sidebar.rail .sb-link:not([hidden])").get("display"), "flex");
   assert.match(app, /wireSidebar\(document, localStorage\);/);
 });
 

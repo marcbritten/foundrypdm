@@ -1393,7 +1393,7 @@ function wireSidebar(root, store){
 // sidebar: every screen keeps its own role checks.
 function navBase(root){
   if (root._navBase) return root._navBase;
-  const base = { groups: [], links: {}, icons: {} };
+  const base = { groups: [], links: Object.create(null), icons: Object.create(null) };
   root.querySelectorAll("#sidebar .sb-section[data-group]").forEach(sec => {
     const g = { key: sec.dataset.group, label: sec.querySelector(".sb-head .sb-tx").textContent.trim(),
       icon: sec.querySelector(".sb-head .sb-ic").innerHTML, items: [] };
@@ -1584,7 +1584,7 @@ function amNameProblem(name, items, except){
   const t = String(name || "").trim();
   if (!t) return "Type a name for the group.";
   if ([...t].length > 60) return "Use 60 characters or fewer.";
-  if (/[<>\u0000-\u001f\u007f]/.test(t)) return "Leave out < and >.";
+  if (/[<>\u0000-\u001f\u007f-\u009f]/.test(t)) return "Leave out < and > and control characters.";
   if (amGroups(items).some(g => g !== except && g.group.toLowerCase() === t.toLowerCase()))
     return "You have a group with this name. Pick another name.";
   return "";
@@ -1593,7 +1593,7 @@ function amNameProblem(name, items, except){
 function amRowsHtml(items, all, base, path){
   return items.map((node, i) => {
     const p = (path || []).concat(i), id = "am-n-" + p.join("-"), isG = node.group !== undefined;
-    const dis = op => amCan(all, p, op) ? "" : " disabled";
+    const dis = op => amCan(all, p, op) ? "" : " aria-disabled='true'";
     const btn = (act, label, extra, on) => "<button type='button' class='small" + (on ? " on" : "") + "' data-act='" + act +
       "' aria-describedby='" + id + "'" + (extra || "") + ">" + label + "</button>";
     const tags = [isG ? "Group" : "", node.hidden ? "Hidden" : "", node.nav === "admin" ? "Admins only" : ""].filter(Boolean);
@@ -1623,7 +1623,7 @@ async function viewArrangeMenu(v){
   }
   if (!NAV_MENU.loaded){
     v.innerHTML = "<p class='dim'>Loading your menu…</p>";
-    try { Object.assign(NAV_MENU, await api("GET", "/me/menu"), { loaded: true }); }
+    try { Object.assign(NAV_MENU, await api("GET", "/me/menu"), { loaded: true }); if (NAV_MENU.items) applyNavMenu(); }
     catch(e){
       v.innerHTML = "<h2>Arrange my menu</h2><div class='card' role='alert'><p>Your menu did not load: " + esc(e.message) +
         ". The sidebar shows the default menu.</p><button type='button' id='am-retry'>Retry</button></div>";
@@ -1654,16 +1654,21 @@ async function viewArrangeMenu(v){
   const draw = (focusPath, act) => {
     if (list._closePicker) list._closePicker();
     list.innerHTML = amRowsHtml(items, items, base);
-    const li = focusPath && rowOf(focusPath);
-    if (!li) return;
+    if (!focusPath) return;
+    let p = focusPath.slice(), li = rowOf(p);
+    while (!li && p.length){
+      if (p[p.length - 1] > 0) p[p.length - 1]--; else p = p.slice(0, -1);
+      li = p.length ? rowOf(p) : null;
+    }
+    if (!li){ const h = v.querySelector("h2"); h.tabIndex = -1; h.focus(); return; }
     const row = li.querySelector(":scope > .am-row");
-    const b = row.querySelector("button[data-act='" + act + "']:not([disabled])") || row.querySelector("button:not([disabled])");
+    const b = row.querySelector("button[data-act='" + act + "']") || row.querySelector("button");
     if (b) b.focus();
   };
   draw();
   list.onclick = async e => {
     const b = e.target.closest("button[data-act]");
-    if (!b || b.disabled) return;
+    if (!b || b.disabled || b.getAttribute("aria-disabled") === "true") return;
     const li = b.closest("li[data-path]"), path = li.dataset.path.split(".").map(Number), act = b.dataset.act;
     const node = amList(items, path)[path[path.length - 1]], name = navNodeName(node, base);
     if (["up", "down", "into", "out"].includes(act)){
@@ -1725,6 +1730,7 @@ async function viewArrangeMenu(v){
     dragFrom = null;
     const name = navNodeName(amList(items, from)[from[from.length - 1]], base);
     const toPath = to.dataset.path.split(".").map(Number);
+    if (toPath.join(".") === from.join(".") && !t.classList.contains("am-empty")){ draw(); return; }
     const p = t.classList.contains("am-empty") ? amMoveIntoEmpty(items, from, toPath) : amMoveBefore(items, from, toPath);
     if (!p){ draw(); fail(name + " cannot go there. Groups can go three levels deep, and a group cannot go into itself."); return; }
     draw(p, "up");
@@ -1763,6 +1769,7 @@ async function viewArrangeMenu(v){
     applyNavMenu();
     await viewArrangeMenu(v);
     $("am-live").textContent = "Your menu is the default menu again.";
+    $("am-reset").focus();
   };
   $("am-cancel").onclick = () => { if (history.length > 1) history.back(); else go("dashboard"); };
   $("am-close").onchange = async e => {
@@ -8375,7 +8382,7 @@ const LIVE_STALL_MS = 60000;   // silence longer than two heartbeats: the connec
 const LIVE_BATCH_MS = 500;     // one check-in brings several hints; refresh once
 const LIVE_HIDDEN_MS = 30000;
 const LIVE_GAP_MS = 3000;      // at most one live refresh this often, never two at once
-const LIVE_EDIT_PAGES = ["detail", "settings", "admin", "tool"];
+const LIVE_EDIT_PAGES = ["detail", "settings", "admin", "tool", "menu"];
 // Pages whose changes are in the activity log (liveConcerns); the rest keep the timed refresh.
 const LIVE_ROUTES = ["detail", "admin", "jobs", "laser-nests", "approvals", "activity", "dashboard",
   "projects", "explorer", "items", "search", "mfg"];

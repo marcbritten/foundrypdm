@@ -214,3 +214,26 @@ test("opening a group closes the others when the option is on, and keeps the gro
   c.head.onclick();
   assert.ok(!a.classList.contains("folded") && !c.classList.contains("folded"), "option off: others stay open");
 });
+
+test("review fixes: the draft survives refreshes, off moves keep focus, the rail shows every link", () => {
+  assert.match(app, /const LIVE_EDIT_PAGES = \[[^\]]*"menu"\]/, "timers and live updates leave the page's draft alone");
+  const rows = app.slice(app.indexOf("function amRowsHtml("), app.indexOf("async function viewArrangeMenu("));
+  assert.ok(rows.includes(`" aria-disabled='true'"`), "a move that is not possible is aria-disabled, so it keeps focus");
+  assert.ok(!rows.includes(`" disabled"`), "move buttons are never disabled outright");
+  const view = app.slice(app.indexOf("async function viewArrangeMenu("), app.indexOf("function amMoveIntoEmpty("));
+  assert.ok(view.includes(`b.getAttribute("aria-disabled") === "true") return;`), "a click on an off move does nothing");
+  assert.ok(view.includes(`$("am-reset").focus();`), "after Reset, focus is on the new Reset button");
+  assert.ok(view.includes("if (p[p.length - 1] > 0) p[p.length - 1]--; else p = p.slice(0, -1);"), "a removed row hands focus to the row before it or its group");
+  assert.ok(css.includes(".am-btns button[aria-disabled=\"true\"] { opacity:.45; cursor:default; }"));
+  assert.ok(css.includes("#sidebar:not(.rail) .sb-section.folded .sb-section:not(:has(.sb-link.on, .sb-count:not(:empty))) { display:none; }"),
+    "a folded group hides the groups inside it, but not in the rail");
+  assert.ok(css.includes("  #sidebar.rail .sb-link:not([hidden]) { display:flex;"), "a link outside any group is a rail link too");
+  assert.ok(css.includes(".am-btns button, .am-add button, .am-foot button, .ip-foot button { min-height:44px; }"), "44px buttons on touch");
+  const c = loadFunctions(["amGroups", "amNameProblem"], {});
+  assert.match(c.amNameProblem("A\u0085B", []), /control characters/, "C1 control characters too, as the server refuses them");
+  const b = loadFunctions(["navBase"], {});
+  const fake = { querySelectorAll: () => [] };
+  assert.equal(b.navBase(fake).links.constructor, undefined, "link ids are looked up in an object with no prototype");
+  assert.match(menuRs, /the group name \{name\} is in the menu twice/, "the server refuses a group name twice");
+  assert.match(menuRs, /pdm_db::set_user_menu\(&state\.pool, user\.id, items, close_others\)/, "both fields in one statement");
+});

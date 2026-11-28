@@ -136,11 +136,16 @@ pub async fn put_menu(
             Some(Some(v))
         }
     };
-    if let Some(items) = items {
-        pdm_db::set_user_menu_items(&state.pool, user.id, items).await?;
-    }
-    if let Some(close_others) = close_others {
-        pdm_db::set_user_menu_close_others(&state.pool, user.id, close_others).await?;
+    // One statement for each request, so a body with both fields stores both or neither.
+    match (items, close_others) {
+        (Some(items), Some(close_others)) => {
+            pdm_db::set_user_menu(&state.pool, user.id, items, close_others).await?
+        }
+        (Some(items), None) => pdm_db::set_user_menu_items(&state.pool, user.id, items).await?,
+        (None, Some(close_others)) => {
+            pdm_db::set_user_menu_close_others(&state.pool, user.id, close_others).await?
+        }
+        (None, None) => {}
     }
     stored(&state, user.id).await
 }
@@ -194,17 +199,27 @@ fn check_list(
                 if !NAV_IDS.contains(&nav) {
                     return Err(format!("unknown link {nav:?}"));
                 }
-                if !seen.insert(nav.to_string()) {
+                if !seen.insert(format!("nav:{nav}")) {
                     return Err(format!("the link {nav:?} is in the menu twice"));
                 }
             }
             (None, Some(name)) => {
                 only_fields(obj, &["group", "key", "hidden", "icon", "items"])?;
                 check_name(name)?;
+                // Group names are compared without case, at every level: each group folds on its own.
+                let lower = name.as_str().unwrap_or_default().to_lowercase();
+                if !seen.insert(format!("group:{lower}")) {
+                    return Err(format!("the group name {name} is in the menu twice"));
+                }
                 if let Some(key) = obj.get("key")
                     && !key.as_str().is_some_and(|k| GROUP_KEYS.contains(&k))
                 {
                     return Err(format!("unknown group key {key}"));
+                }
+                if let Some(key) = obj.get("key").and_then(Value::as_str)
+                    && !seen.insert(format!("key:{key}"))
+                {
+                    return Err(format!("the group key {key:?} is in the menu twice"));
                 }
                 if depth + 1 > MAX_DEPTH {
                     return Err(format!("groups can go {MAX_DEPTH} levels deep at most"));
@@ -287,6 +302,14 @@ mod tests {
             (json!([{ "group": " X" }]), "needs text"),
             (json!([{ "group": "x".repeat(61) }]), "60 characters"),
             (json!([{ "group": "<b>X</b>" }]), "cannot hold"),
+            (
+                json!([{ "group": "Shop" }, { "group": "A", "items": [{ "group": "shop" }] }]),
+                "twice",
+            ),
+            (
+                json!([{ "group": "A", "key": "data" }, { "group": "B", "key": "data" }]),
+                "twice",
+            ),
             (json!([{ "group": "A\u{7}" }]), "cannot hold"),
             (
                 json!([{ "group": "1", "items": [{ "group": "2", "items": [{ "group": "3", "items": [{ "group": "4" }] }] }] }]),

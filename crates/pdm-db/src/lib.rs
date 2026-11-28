@@ -5655,6 +5655,27 @@ pub async fn set_user_menu_items(
     Ok(())
 }
 
+/// Store a user's menu and the close option together, in one statement.
+pub async fn set_user_menu(
+    pool: &PgPool,
+    user_id: Uuid,
+    items: Option<&serde_json::Value>,
+    close_others: bool,
+) -> Result<(), PdmError> {
+    sqlx::query(
+        "INSERT INTO user_menu (user_id, items, close_others) VALUES ($1, $2, $3)
+         ON CONFLICT (user_id) DO UPDATE SET items = EXCLUDED.items,
+             close_others = EXCLUDED.close_others, updated_at = now()",
+    )
+    .bind(user_id)
+    .bind(items)
+    .bind(close_others)
+    .execute(pool)
+    .await
+    .map_err(PdmError::Db)?;
+    Ok(())
+}
+
 /// Store whether opening a group closes the user's other groups. The menu stays as it is.
 pub async fn set_user_menu_close_others(
     pool: &PgPool,

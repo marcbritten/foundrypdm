@@ -74,7 +74,7 @@ function liveContext(opts = {}){
   const reloads = [], badges = [], timers = [];
   const ctx = loadFunctions(["canRerender", "liveConcerns", "liveFlush", "liveRefresh", "liveDefer",
     "liveWho", "liveBar", "liveBarHide", "liveQueue", "myId"], {
-    LIVE:liveState(), LIVE_EDIT_PAGES:["detail", "settings", "admin", "tool"], LIVE_BATCH_MS:500,
+    LIVE:liveState(), LIVE_EDIT_PAGES:["detail", "settings", "admin", "tool", "menu"], LIVE_BATCH_MS:500,
     LIVE_GAP_MS:3000,
     ME:{ user:{ id:ME_ID } }, AUTH_BUSY:false, AUTO_REFRESH:!!opts.auto,
     ROUTE:{ name:opts.route || "items" }, DETAIL:{ id:ITEM, data:{ versions:[{ id:VERSION }] } },
@@ -301,7 +301,7 @@ test("the six-second refresh stays on pages live updates do not cover, and stops
   const p = page();
   const reloads = [], timers = [];
   const ctx = loadFunctions(["startPolling", "canRerender"], {
-    LIVE:{ ...liveState(), state:"live" }, LIVE_EDIT_PAGES:["detail", "settings", "admin", "tool"],
+    LIVE:{ ...liveState(), state:"live" }, LIVE_EDIT_PAGES:["detail", "settings", "admin", "tool", "menu"],
     LIVE_ROUTES:["items", "dashboard"], AUTO_REFRESH:true, ME:{ user:{} }, TOKEN:"t", AUTH_BUSY:false,
     POLL_MS:6000, ROUTE:{ name:"items" }, NC:{ active:false }, document:p.document,
     CUR_RELOAD:() => { reloads.push(ctx.ROUTE.name); return Promise.resolve(); },

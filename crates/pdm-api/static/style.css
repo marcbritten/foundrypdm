@@ -210,7 +210,7 @@ td.mono, td.dim { font-size:var(--fs-base); }
 .sb-section.folded .sb-link:not(.on):not(:has(.sb-count:not(:empty))) { display:none; }
 /* A group of a person's own menu can hold groups. A folded group hides the ones inside it, except
    one that holds the current page or a count. */
-.sb-section.folded .sb-section:not(:has(.sb-link.on, .sb-count:not(:empty))) { display:none; }
+#sidebar:not(.rail) .sb-section.folded .sb-section:not(:has(.sb-link.on, .sb-count:not(:empty))) { display:none; }
 /* Icons from the bundled Font Awesome sprites (static/icons) are filled shapes with no outline. */
 .icon.fa { stroke:none; }
 /* Arrange my menu: one row per entry. A group's entries sit in a nested list, indented about 1.7em, with a
@@ -229,6 +229,7 @@ td.mono, td.dim { font-size:var(--fs-base); }
 .am-group .am-name { font-weight:700; }
 .am-tag { font-size:var(--fs-sm); color:var(--dim); }
 .am-btns { display:flex; flex-wrap:wrap; gap:var(--sp-1); margin-left:auto; }
+.am-btns button[aria-disabled="true"] { opacity:.45; cursor:default; }
 .am-add { margin:var(--sp-4) 0 var(--sp-3); }
 .am-add label { display:block; font-size:var(--fs-sm); font-weight:700; margin-bottom:var(--sp-1); }
 .am-add-row { display:flex; flex-wrap:wrap; gap:var(--sp-2); }
@@ -251,7 +252,7 @@ td.mono, td.dim { font-size:var(--fs-base); }
 .ip-foot { display:flex; gap:var(--sp-2); }
 /* BX10: on a touch screen the page's text fields are 16px at least, so the phone does not zoom in. --fs-lg is
    1rem: 16px at the smallest text size. Touch also gets 44px icon buttons (A5). */
-@media (pointer: coarse) { .am-add input, .ip-panel input { font-size:var(--fs-lg); } .ip-grid { grid-template-columns:repeat(auto-fill, 44px); } .ip-icon { width:44px; height:44px; } }
+@media (pointer: coarse) { .am-add input, .ip-panel input { font-size:var(--fs-lg); } .am-btns button, .am-add button, .am-foot button, .ip-foot button { min-height:44px; } .ip-grid { grid-template-columns:repeat(auto-fill, 44px); } .ip-icon { width:44px; height:44px; } }
 @media (pointer: coarse) { .sb-head, .sb-link, .sb-userbtn { min-height:44px; } .menubtn { min-width:44px; min-height:44px; justify-content:center; } }
 .sb-count:empty { display:none; }
 .sb-count { margin-left:auto; font-size:var(--fs-xs); font-weight:700; color:var(--acc);
@@ -284,7 +285,7 @@ td.mono, td.dim { font-size:var(--fs-base); }
   #sidebar.rail .sb-head { display:none; }
   #sidebar.rail .sb-section + .sb-section { margin-top:.4em; padding-top:.4em; border-top:1px solid var(--line); }
   #sidebar.rail .sb-items { margin-left:0; padding-left:0; border-left:none; }
-  #sidebar.rail .sb-section .sb-link:not([hidden]) { display:flex; justify-content:center; position:relative; }
+  #sidebar.rail .sb-link:not([hidden]) { display:flex; justify-content:center; position:relative; }
   #sidebar.rail .sb-tx { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
   #sidebar.rail .sb-link:focus-visible .sb-tx, #sidebar.rail .sb-userbtn:focus-visible .sb-tx { position:fixed; left:4.25em;
     width:auto; height:auto; overflow:visible; clip-path:none; z-index:70; padding:.2em .5em; background:var(--panel2);
